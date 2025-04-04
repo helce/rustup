@@ -86,6 +86,8 @@ pub use windows::complete_windows_uninstall;
 pub(crate) struct InstallOpts<'a> {
     pub default_host_triple: Option<String>,
     pub default_toolchain: Option<MaybeOfficialToolchainName>,
+    pub client_cert: Option<String>,
+    pub client_key: Option<String>,
     pub profile: String,
     pub no_modify_path: bool,
     pub no_update_toolchain: bool,
@@ -472,6 +474,8 @@ pub(crate) fn install(
         maybe_install_rust(
             opts.default_toolchain,
             &opts.profile,
+            opts.client_cert.as_deref(),
+            opts.client_key.as_deref(),
             opts.default_host_triple.as_deref(),
             !opts.no_update_toolchain,
             opts.components,
@@ -690,6 +694,8 @@ fn current_install_opts(opts: &InstallOpts<'_>) -> String {
 - ` `default host triple: `{}`
 - `   `default toolchain: `{}`
 - `             `profile: `{}`
+- `         `client cert: `{}`
+- `          `client key: `{}`
 - modify PATH variable: `{}`
 ",
         opts.default_host_triple
@@ -701,6 +707,14 @@ fn current_install_opts(opts: &InstallOpts<'_>) -> String {
             .map(ToString::to_string)
             .unwrap_or("stable (default)".into()),
         opts.profile,
+        opts.client_cert
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or("no".into()),
+        opts.client_key
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or("no".into()),
         if !opts.no_modify_path { "yes" } else { "no" }
     )
 }
@@ -738,6 +752,16 @@ fn customize_install(mut opts: InstallOpts<'_>) -> Result<InstallOpts<'_>> {
         ),
         &opts.profile,
     )?;
+
+    opts.client_cert = Some(common::question_str(
+        "Specify client certificate? (Press enter to skip)",
+        "",
+    )?).filter(|s| !s.is_empty());
+
+    opts.client_key = Some(common::question_str(
+        "Specify client key? (Press enter to skip)",
+        "",
+    )?).filter(|s| !s.is_empty());
 
     opts.no_modify_path = !common::question_bool("Modify PATH variable?", !opts.no_modify_path)?;
 
@@ -842,6 +866,8 @@ pub(crate) fn install_proxies() -> Result<()> {
 fn maybe_install_rust(
     toolchain: Option<MaybeOfficialToolchainName>,
     profile_str: &str,
+    client_cert: Option<&str>,
+    client_key: Option<&str>,
     default_host_triple: Option<&str>,
     update_existing_toolchain: bool,
     components: &[&str],
@@ -860,6 +886,13 @@ fn maybe_install_rust(
         components,
         targets,
     )?;
+
+    // Setup certificate and key.
+    if let (Some(client_cert), Some(client_key)) = (client_cert, client_key) {
+        cfg.set_client_cert(client_cert)?;
+        cfg.set_client_key(client_key)?;
+    }
+
     if let Some(ref desc) = toolchain {
         let status = if Toolchain::exists(&cfg, &desc.into())? {
             warn!("Updating existing toolchain, profile choice will be ignored");
@@ -883,6 +916,7 @@ fn maybe_install_rust(
         };
 
         cfg.set_default(Some(&desc.into()))?;
+
         writeln!(process().stdout().lock())?;
         common::show_channel_update(&cfg, PackageUpdate::Toolchain(desc.clone()), Ok(status))?;
     }

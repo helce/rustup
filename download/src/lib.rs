@@ -39,10 +39,12 @@ fn download_with_backend(
     backend: Backend,
     url: &Url,
     resume_from: u64,
+    cert: Option<&Path>,
+    key: Option<&Path>,
     callback: &dyn Fn(Event<'_>) -> Result<()>,
 ) -> Result<()> {
     match backend {
-        Backend::Curl => curl::download(url, resume_from, callback),
+        Backend::Curl => curl::download(url, resume_from, cert, key, callback),
         Backend::Reqwest(tls) => reqwest_be::download(url, resume_from, callback, tls),
     }
 }
@@ -54,6 +56,8 @@ pub fn download_to_path_with_backend(
     url: &Url,
     path: &Path,
     resume_from_partial: bool,
+    cert: Option<&Path>,
+    key: Option<&Path>,
     callback: Option<DownloadCallback<'_>>,
 ) -> Result<()> {
     use std::cell::RefCell;
@@ -113,7 +117,7 @@ pub fn download_to_path_with_backend(
 
         let file = RefCell::new(file);
 
-        download_with_backend(backend, url, resume_from, &|event| {
+        download_with_backend(backend, url, resume_from, cert, key, &|event| {
             if let Event::DownloadDataReceived(data) = event {
                 file.borrow_mut()
                     .write_all(data)
@@ -151,6 +155,7 @@ pub mod curl {
     use std::cell::RefCell;
     use std::str;
     use std::time::Duration;
+    use std::path::Path;
 
     use anyhow::{Context, Result};
     use curl::easy::Easy;
@@ -162,6 +167,8 @@ pub mod curl {
     pub fn download(
         url: &Url,
         resume_from: u64,
+        cert: Option<&Path>,
+        key: Option<&Path>,
         callback: &dyn Fn(Event<'_>) -> Result<()>,
     ) -> Result<()> {
         // Fetch either a cached libcurl handle (which will preserve open
@@ -187,6 +194,12 @@ pub mod curl {
 
             // Take at most 30s to connect
             handle.connect_timeout(Duration::new(30, 0))?;
+
+            // Set ssl certificate and key
+            if let (Some(cert), Some(key)) = (cert, key) {
+                handle.ssl_cert(cert)?;
+                handle.ssl_key(key)?;
+            }
 
             {
                 let cberr = RefCell::new(None);
@@ -436,6 +449,8 @@ pub mod curl {
     pub fn download(
         _url: &Url,
         _resume_from: u64,
+        _cert: Option<&Path>,
+        _key: Option<&Path>,
         _callback: &dyn Fn(Event<'_>) -> Result<()>,
     ) -> Result<()> {
         Err(anyhow!(DownloadError::BackendUnavailable("curl")))

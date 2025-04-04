@@ -953,6 +953,30 @@ impl Cfg {
             LocalToolchainName::Path(p) => p.to_path_buf(),
         }
     }
+
+    pub(crate) fn set_client_cert(&self, cert: &str) -> Result<()> {
+        self.settings_file.with_mut(|s| {
+            s.client_cert = Some(cert.to_owned());
+            Ok(())
+        })
+    }
+
+    pub(crate) fn set_client_key(&self, key: &str) -> Result<()> {
+        self.settings_file.with_mut(|s| {
+            s.client_key = Some(key.to_owned());
+            Ok(())
+        })
+    }
+
+    /// The path to a client certificate, if exists
+    pub(crate) fn get_client_cert(&self) -> Result<Option<PathBuf>> {
+        self.settings_file.with(|s| Ok(s.client_cert.clone().map(PathBuf::from)))
+    }
+
+    /// The path to client key, if exists
+    pub(crate) fn get_client_key(&self) -> Result<Option<PathBuf>> {
+        self.settings_file.with(|s| Ok(s.client_key.clone().map(PathBuf::from)))
+    }
 }
 
 impl Debug for Cfg {

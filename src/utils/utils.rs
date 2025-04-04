@@ -10,6 +10,7 @@ use retry::{retry, OperationResult};
 use sha2::Sha256;
 use url::Url;
 
+use crate::cli::common;
 use crate::currentprocess::{cwdsource::CurrentDirSource, varsource::VarSource};
 use crate::errors::*;
 use crate::utils::notifications::Notification;
@@ -223,26 +224,36 @@ fn download_file_(
     // Keep the curl env var around for a bit
     let use_curl_backend = process().var_os("RUSTUP_USE_CURL").is_some();
     let use_rustls = process().var_os("RUSTUP_USE_RUSTLS").is_some();
-    let (backend, notification) = if use_curl_backend {
-        (Backend::Curl, Notification::UsingCurl)
+    // Use curl by default, there are some problems with certificates in rustls
+
+    let (backend, notification) = if use_rustls {
+        #[cfg(all(feature = "reqwest-rustls-tls", not(feature = "reqwest-rustls-default")))]
+        {
+            (Backend::Reqwest(TlsBackend::Rustls), Notification::UsingReqwest)
+        }
+        #[cfg(all(not(feature = "reqwest-rustls-tls"), feature = "reqwest-rustls-default"))]
+        {
+            (Backend::Reqwest(TlsBackend::Default), Notification::UsingReqwest)
+        }
     } else {
-        let tls_backend = if use_rustls {
-            TlsBackend::Rustls
-        } else {
-            #[cfg(feature = "reqwest-default-tls")]
-            {
-                TlsBackend::Default
-            }
-            #[cfg(not(feature = "reqwest-default-tls"))]
-            {
-                TlsBackend::Rustls
-            }
-        };
-        (Backend::Reqwest(tls_backend), Notification::UsingReqwest)
+        (Backend::Curl, Notification::UsingCurl)
     };
     notify_handler(notification);
-    let res =
-        download_to_path_with_backend(backend, url, path, resume_from_partial, Some(callback));
+
+    // Get client certificate and key
+    let cfg = common::set_globals(false, false)?;
+    let cert = cfg.get_client_cert()?;
+    let key = cfg.get_client_key()?;
+
+    let res = download_to_path_with_backend(
+        backend,
+        url,
+        path,
+        resume_from_partial,
+        cert.as_deref(),
+        key.as_deref(),
+        Some(callback),
+    );
 
     notify_handler(Notification::DownloadFinished);
 

@@ -105,6 +105,18 @@ pub fn main() -> Result<utils::ExitCode> {
                 .long("no-modify-path")
                 .help("Don't configure the PATH environment variable")
                 .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("client-cert")
+                .long("client-cert")
+                .num_args(1)
+                .help("Specify client ssl certificate"),
+        )
+        .arg(
+            Arg::new("client-key")
+                .long("client-key")
+                .num_args(1)
+                .help("Specify client ssl key"),
         );
 
     let matches = match cli.try_get_matches_from(process().args_os()) {
@@ -129,6 +141,12 @@ pub fn main() -> Result<utils::ExitCode> {
         .expect("Unreachable: Clap should supply a default");
     let no_modify_path = matches.get_flag("no-modify-path");
     let no_update_toolchain = matches.get_flag("no-update-default-toolchain");
+    let client_cert = matches
+        .get_one::<String>("client-cert")
+        .map(ToOwned::to_owned);
+    let client_key = matches
+        .get_one::<String>("client-key")
+        .map(ToOwned::to_owned);
 
     let components: Vec<_> = matches
         .get_many::<String>("components")
@@ -143,6 +161,8 @@ pub fn main() -> Result<utils::ExitCode> {
     let opts = InstallOpts {
         default_host_triple: default_host,
         default_toolchain,
+        client_cert,
+        client_key,
         profile: profile.to_owned(),
         no_modify_path,
         no_update_toolchain,
