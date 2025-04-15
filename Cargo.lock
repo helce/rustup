@@ -283,12 +283,12 @@ checksum = "514de17de45fdb8dc022b1a7975556c53c86f9f0aa5f534b98977b171857c2c9"
 
 [[package]]
 name = "cc"
-version = "1.0.95"
-source = "git+https://github.com/helce/cc-rs?tag=1.0.95#4743e1c67571929bb2123ab0f9a9dd2ef7a5f37a"
+version = "1.1.19"
+source = "git+https://github.com/helce/cc-rs?tag=cc-v1.1.19#7977aab526c66d6dbfc0496532d1ec4196751cf2"
 dependencies = [
  "jobserver",
  "libc",
- "once_cell",
+ "shlex",
 ]
 
 [[package]]
@@ -1809,7 +1809,7 @@ dependencies = [
 [[package]]
 name = "ring"
 version = "0.17.8"
-source = "git+https://github.com/helce/ring?tag=0.17.8#06856e11e7c0342ebdf473da137e8c12cdc700c3"
+source = "git+https://github.com/helce/ring?tag=0.17.8#e7ac1fc45fa226b92f5fa91ef166d85dca04041c"
 dependencies = [
  "cc",
  "cfg-if 1.0.0",
