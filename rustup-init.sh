@@ -26,7 +26,7 @@ is_zsh() {
 set -u
 
 # If RUSTUP_UPDATE_ROOT is unset or empty, default it.
-RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://static.rust-lang.org/rustup}"
+RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://setwd.ws/rust/rustup}"
 
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
@@ -232,6 +232,38 @@ get_endianness() {
         echo "${cputype}${suffix_eb}"
     else
         err "unknown platform endianness"
+    fi
+}
+
+get_e2k_cpu() {
+    need_cmd head
+    need_cmd tail
+    # ELF e_flags to check cpu and set corrensponding target
+    # without dependencies beyond coreutils.
+    local _curent_eflags
+    _curent_eflags=$(head -c 52 /proc/self/exe | tail -c 4)
+    if [ "$_curent_eflags" = "$(printf '\004')" ] ; then
+        echo "e2kv4"
+    elif [ "$_curent_eflags" = "$(printf '\005')" ] ; then
+        echo "e2kv5"
+    elif [ "$_curent_eflags" = "$(printf '\020\005')" ] ; then
+        echo "e2k8c2"
+    elif [ "$_curent_eflags" = "$(printf '\006')" ] ; then
+        echo "e2kv6"
+    elif [ "$_curent_eflags" = "$(printf '\007')" ] ; then
+        echo "e2kv7"
+    elif [ "$_curent_eflags" = "$(printf '\020\023')" ] ; then
+        echo "e2k8c"
+    elif [ "$_curent_eflags" = "$(printf '\020\024')" ] ; then
+        echo "e2k1cplus"
+    elif [ "$_curent_eflags" = "$(printf '\020\025')" ] ; then
+        echo "e2k12c"
+    elif [ "$_curent_eflags" = "$(printf '\020\026')" ] ; then
+        echo "e2k16c"
+    elif [ "$_curent_eflags" = "$(printf '\020\027')" ] ; then
+        echo "e2k2c3"
+    else
+        err "unknown e2k e_flags"
     fi
 }
 
@@ -470,6 +502,9 @@ get_architecture() {
         loongarch64)
             _cputype=loongarch64
             ensure_loongarch_uapi
+            ;;
+        e2k)
+            _cputype=$(get_e2k_cpu)
             ;;
         *)
             err "unknown CPU type: $_cputype"
