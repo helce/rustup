@@ -27,10 +27,10 @@ use crate::{
     toolchain::names::ToolchainName,
     utils::utils,
 };
-pub static DEFAULT_DIST_SERVER: &str = "https://static.rust-lang.org";
+pub static DEFAULT_DIST_SERVER: &str = "https://setwd.ws/rust";
 
 // Deprecated
-pub(crate) static DEFAULT_DIST_ROOT: &str = "https://static.rust-lang.org/dist";
+pub(crate) static DEFAULT_DIST_ROOT: &str = "https://setwd.ws/rust/dist";
 
 const TOOLSTATE_MSG: &str =
     "If you require these components, please install and use the latest successful build version,\n\
