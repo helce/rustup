@@ -331,7 +331,7 @@ These components can be acquired through a Visual Studio installer.
 
 "#;
 
-static DEFAULT_UPDATE_ROOT: &str = "https://setwd.ws/rust/rustup";
+static DEFAULT_UPDATE_ROOT: &str = "https://dev.mcst.ru/rust/rustup";
 
 fn update_root() -> String {
     process()

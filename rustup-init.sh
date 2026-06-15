@@ -26,7 +26,7 @@ is_zsh() {
 set -u
 
 # If RUSTUP_UPDATE_ROOT is unset or empty, default it.
-RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://setwd.ws/rust/rustup}"
+RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://dev.mcst.ru/rust/rustup}"
 
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
