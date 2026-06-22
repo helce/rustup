@@ -3,7 +3,7 @@ use std::io::Write;
 
 use pulldown_cmark::{Event, Tag, TagEnd};
 
-use crate::currentprocess::terminalsource::{Attr, Color, ColorableTerminal};
+use crate::process::terminalsource::{Attr, Color, ColorableTerminal};
 
 // Handles the wrapping of text written to the console
 struct LineWrapper<'a> {
@@ -131,7 +131,12 @@ impl<'a> LineFormatter<'a> {
             Tag::TableHead => {}
             Tag::TableRow => {}
             Tag::TableCell => {}
-            Tag::BlockQuote => {}
+            Tag::BlockQuote(_) => {}
+            Tag::DefinitionList => {
+                self.wrapper.write_line();
+                self.wrapper.indent += 2;
+            }
+            Tag::DefinitionListTitle | Tag::DefinitionListDefinition => {}
             Tag::CodeBlock(_) | Tag::HtmlBlock { .. } => {
                 self.wrapper.write_line();
                 self.wrapper.indent += 2;
@@ -152,6 +157,8 @@ impl<'a> LineFormatter<'a> {
             Tag::Link { .. } => {}
             Tag::Image { .. } => {}
             Tag::FootnoteDefinition(_name) => {}
+            Tag::Superscript => {}
+            Tag::Subscript => {}
         }
     }
 
@@ -168,7 +175,12 @@ impl<'a> LineFormatter<'a> {
             TagEnd::TableHead => {}
             TagEnd::TableRow => {}
             TagEnd::TableCell => {}
-            TagEnd::BlockQuote => {}
+            TagEnd::BlockQuote(_) => {}
+            TagEnd::DefinitionList => {
+                self.wrapper.indent -= 2;
+                self.wrapper.write_line();
+            }
+            TagEnd::DefinitionListTitle | TagEnd::DefinitionListDefinition => {}
             TagEnd::CodeBlock | TagEnd::HtmlBlock => {
                 self.is_code_block = false;
                 self.wrapper.indent -= 2;
@@ -183,10 +195,12 @@ impl<'a> LineFormatter<'a> {
             }
             TagEnd::Strong => {}
             TagEnd::Strikethrough => {}
-            TagEnd::Link { .. } => {}
-            TagEnd::Image { .. } => {} // shouldn't happen, handled in start
+            TagEnd::Link => {}
+            TagEnd::Image => {} // shouldn't happen, handled in start
             TagEnd::FootnoteDefinition => {}
             TagEnd::MetadataBlock(_) => {}
+            TagEnd::Superscript => {}
+            TagEnd::Subscript => {}
         }
     }
 
@@ -219,6 +233,8 @@ impl<'a> LineFormatter<'a> {
             TaskListMarker(true) => {}
             TaskListMarker(false) => {}
             InlineHtml(_) => {}
+            InlineMath(_) => {}
+            DisplayMath(_) => {}
         }
     }
 }

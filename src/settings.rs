@@ -1,19 +1,17 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::cli::self_update::SelfUpdateMode;
-use crate::dist::dist::Profile;
+use crate::dist::Profile;
 use crate::errors::*;
 use crate::notifications::*;
-use crate::toml_utils::*;
-use crate::utils::utils;
-
-pub(crate) const SUPPORTED_METADATA_VERSIONS: [&str; 2] = ["2", "12"];
-pub(crate) const DEFAULT_METADATA_VERSION: &str = "12";
+use crate::utils;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsFile {
@@ -30,19 +28,27 @@ impl SettingsFile {
     }
 
     fn write_settings(&self) -> Result<()> {
-        let s = self.cache.borrow().as_ref().unwrap().clone();
-        utils::write_file("settings", &self.path, &s.stringify())?;
+        let settings = self.cache.borrow();
+        utils::write_file(
+            "settings",
+            &self.path,
+            &settings.as_ref().unwrap().stringify()?,
+        )?;
         Ok(())
     }
 
     fn read_settings(&self) -> Result<()> {
         let mut needs_save = false;
         {
-            let mut b = self.cache.borrow_mut();
+            let b = self.cache.borrow();
             if b.is_none() {
-                *b = Some(if utils::is_file(&self.path) {
+                drop(b);
+                *self.cache.borrow_mut() = Some(if utils::is_file(&self.path) {
                     let content = utils::read_file("settings", &self.path)?;
-                    Settings::parse(&content)?
+                    Settings::parse(&content).with_context(|| RustupError::ParsingFile {
+                        name: "settings",
+                        path: self.path.clone(),
+                    })?
                 } else {
                     needs_save = true;
                     Default::default()
@@ -72,29 +78,21 @@ impl SettingsFile {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Settings {
-    pub version: String,
+    pub version: MetadataVersion,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_host_triple: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub default_toolchain: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<Profile>,
+    #[serde(default)]
     pub overrides: BTreeMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pgp_keys: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_self_update: Option<SelfUpdateMode>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            version: DEFAULT_METADATA_VERSION.to_owned(),
-            default_host_triple: None,
-            default_toolchain: None,
-            profile: Some(Profile::Default),
-            overrides: BTreeMap::new(),
-            pgp_keys: None,
-            auto_self_update: None,
-        }
-    }
 }
 
 impl Settings {
@@ -138,88 +136,102 @@ impl Settings {
     }
 
     pub(crate) fn parse(data: &str) -> Result<Self> {
-        let value = toml::from_str(data).context("error parsing settings")?;
-        Self::from_toml(value, "")
+        toml::from_str(data).context("error parsing settings")
     }
 
-    pub(crate) fn stringify(self) -> String {
-        self.into_toml().to_string()
+    fn stringify(&self) -> Result<String> {
+        Ok(toml::to_string(self)?)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum MetadataVersion {
+    #[serde(rename = "2")]
+    V2,
+    #[serde(rename = "12")]
+    #[default]
+    V12,
+}
+
+impl MetadataVersion {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::V2 => "2",
+            Self::V12 => "12",
+        }
+    }
+}
+
+impl FromStr for MetadataVersion {
+    type Err = RustupError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "2" => Ok(Self::V2),
+            "12" => Ok(Self::V12),
+            _ => Err(RustupError::UnknownMetadataVersion(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for MetadataVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serialize_default() {
+        let settings = Settings::default();
+        let toml = settings.stringify().unwrap();
+        assert_eq!(
+            toml,
+            r#"version = "12"
+
+[overrides]
+"#
+        );
     }
 
-    pub(crate) fn from_toml(mut table: toml::value::Table, path: &str) -> Result<Self> {
-        let version = get_string(&mut table, "version", path)?;
-        if !SUPPORTED_METADATA_VERSIONS.contains(&&*version) {
-            return Err(RustupError::UnknownMetadataVersion(version).into());
-        }
-        let auto_self_update = get_opt_string(&mut table, "auto_self_update", path)?
-            .and_then(|mode| SelfUpdateMode::from_str(mode.as_str()).ok());
-        let profile = get_opt_string(&mut table, "profile", path)?
-            .and_then(|p| Profile::from_str(p.as_str()).ok());
-        Ok(Self {
-            version,
-            default_host_triple: get_opt_string(&mut table, "default_host_triple", path)?,
-            default_toolchain: get_opt_string(&mut table, "default_toolchain", path)?,
-            profile,
-            overrides: Self::table_to_overrides(&mut table, path)?,
-            pgp_keys: get_opt_string(&mut table, "pgp_keys", path)?,
-            auto_self_update,
-        })
-    }
-    pub(crate) fn into_toml(self) -> toml::value::Table {
-        let mut result = toml::value::Table::new();
-
-        result.insert("version".to_owned(), toml::Value::String(self.version));
-
-        if let Some(v) = self.default_host_triple {
-            result.insert("default_host_triple".to_owned(), toml::Value::String(v));
-        }
-
-        if let Some(v) = self.default_toolchain {
-            result.insert("default_toolchain".to_owned(), toml::Value::String(v));
-        }
-
-        if let Some(v) = self.profile {
-            result.insert("profile".to_owned(), toml::Value::String(v.to_string()));
-        }
-
-        if let Some(v) = self.pgp_keys {
-            result.insert("pgp_keys".to_owned(), toml::Value::String(v));
-        }
-
-        if let Some(v) = self.auto_self_update {
-            result.insert(
-                "auto_self_update".to_owned(),
-                toml::Value::String(v.to_string()),
-            );
-        }
-
-        let overrides = Self::overrides_to_table(self.overrides);
-        result.insert("overrides".to_owned(), toml::Value::Table(overrides));
-
-        result
+    #[test]
+    fn deserialize_default() {
+        let toml = r#"version = "12""#;
+        let settings = Settings::parse(toml).unwrap();
+        assert_eq!(settings.version, MetadataVersion::V12);
     }
 
-    fn table_to_overrides(
-        table: &mut toml::value::Table,
-        path: &str,
-    ) -> Result<BTreeMap<String, String>> {
-        let mut result = BTreeMap::new();
-        let pkg_table = get_table(table, "overrides", path)?;
+    #[test]
+    fn serialize_basic() {
+        let settings = Settings {
+            version: MetadataVersion::V12,
+            default_toolchain: Some("stable-aarch64-apple-darwin".to_owned()),
+            profile: Some(Profile::Default),
+            ..Default::default()
+        };
 
-        for (k, v) in pkg_table {
-            if let toml::Value::String(t) = v {
-                result.insert(k, t);
-            }
-        }
-
-        Ok(result)
+        let toml = settings.stringify().unwrap();
+        assert_eq!(toml, BASIC);
     }
 
-    fn overrides_to_table(overrides: BTreeMap<String, String>) -> toml::value::Table {
-        let mut result = toml::value::Table::new();
-        for (k, v) in overrides {
-            result.insert(k, toml::Value::String(v));
-        }
-        result
+    #[test]
+    fn deserialize_basic() {
+        let settings = Settings::parse(BASIC).unwrap();
+        assert_eq!(settings.version, MetadataVersion::V12);
+        assert_eq!(
+            settings.default_toolchain,
+            Some("stable-aarch64-apple-darwin".to_owned())
+        );
+        assert_eq!(settings.profile, Some(Profile::Default));
     }
+
+    const BASIC: &str = r#"version = "12"
+default_toolchain = "stable-aarch64-apple-darwin"
+profile = "default"
+
+[overrides]
+"#;
 }

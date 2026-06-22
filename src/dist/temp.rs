@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 pub(crate) use anyhow::{Context as _, Result};
 use thiserror::Error as ThisError;
 
-use crate::utils::notify::NotificationLevel;
-use crate::utils::raw;
-use crate::utils::utils;
+use crate::utils::{self, notify::NotificationLevel, raw};
 
 #[derive(Debug, ThisError)]
 pub(crate) enum CreatingError {
@@ -27,7 +25,7 @@ pub(crate) struct Dir<'a> {
     path: PathBuf,
 }
 
-impl<'a> ops::Deref for Dir<'a> {
+impl ops::Deref for Dir<'_> {
     type Target = Path;
 
     fn deref(&self) -> &Path {
@@ -35,7 +33,7 @@ impl<'a> ops::Deref for Dir<'a> {
     }
 }
 
-impl<'a> Drop for Dir<'a> {
+impl Drop for Dir<'_> {
     fn drop(&mut self) {
         if raw::is_directory(&self.path) {
             let n = Notification::DirectoryDeletion(
@@ -53,7 +51,7 @@ pub struct File<'a> {
     path: PathBuf,
 }
 
-impl<'a> ops::Deref for File<'a> {
+impl ops::Deref for File<'_> {
     type Target = Path;
 
     fn deref(&self) -> &Path {
@@ -61,7 +59,7 @@ impl<'a> ops::Deref for File<'a> {
     }
 }
 
-impl<'a> Drop for File<'a> {
+impl Drop for File<'_> {
     fn drop(&mut self) {
         if raw::is_file(&self.path) {
             let n = Notification::FileDeletion(&self.path, fs::remove_file(&self.path));
@@ -79,14 +77,14 @@ pub enum Notification<'a> {
     DirectoryDeletion(&'a Path, io::Result<()>),
 }
 
-impl<'a> Notification<'a> {
+impl Notification<'_> {
     pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
-            CreatingRoot(_) | CreatingFile(_) | CreatingDirectory(_) => NotificationLevel::Verbose,
+            CreatingRoot(_) | CreatingFile(_) | CreatingDirectory(_) => NotificationLevel::Debug,
             FileDeletion(_, result) | DirectoryDeletion(_, result) => {
                 if result.is_ok() {
-                    NotificationLevel::Verbose
+                    NotificationLevel::Debug
                 } else {
                     NotificationLevel::Warn
                 }
@@ -95,7 +93,7 @@ impl<'a> Notification<'a> {
     }
 }
 
-impl<'a> Display for Notification<'a> {
+impl Display for Notification<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         use self::Notification::*;
         match self {

@@ -42,11 +42,11 @@ pub enum Notification<'a> {
     RenameInUse(&'a Path, &'a Path),
 }
 
-impl<'a> Notification<'a> {
+impl Notification<'_> {
     pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
-            SetDefaultBufferSize(_) => NotificationLevel::Debug,
+            SetDefaultBufferSize(_) => NotificationLevel::Trace,
             CreatingDirectory(_, _)
             | RemovingDirectory(_, _)
             | LinkingDirectory(_, _)
@@ -59,7 +59,7 @@ impl<'a> Notification<'a> {
             | DownloadFinished
             | ResumingPartialDownload
             | UsingCurl
-            | UsingReqwest => NotificationLevel::Verbose,
+            | UsingReqwest => NotificationLevel::Debug,
             RenameInUse(_, _) => NotificationLevel::Info,
             NoCanonicalPath(_) => NotificationLevel::Warn,
             Error(_) => NotificationLevel::Error,
@@ -67,7 +67,7 @@ impl<'a> Notification<'a> {
     }
 }
 
-impl<'a> Display for Notification<'a> {
+impl Display for Notification<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         use self::Notification::*;
         match self {

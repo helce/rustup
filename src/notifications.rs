@@ -1,9 +1,10 @@
 use std::fmt::{self, Display};
 use std::path::{Path, PathBuf};
 
+use crate::settings::MetadataVersion;
 use crate::{
-    dist::{dist::ToolchainDesc, temp},
-    toolchain::names::ToolchainName,
+    dist::{ToolchainDesc, temp},
+    toolchain::ToolchainName,
     utils::notify::NotificationLevel,
 };
 
@@ -26,12 +27,11 @@ pub(crate) enum Notification<'a> {
     UninstallingToolchain(&'a ToolchainName),
     UninstalledToolchain(&'a ToolchainName),
     UpdateHashMatches,
-    UpgradingMetadata(&'a str, &'a str),
-    MetadataUpgradeNotNeeded(&'a str),
-    ReadMetadataVersion(&'a str),
+    UpgradingMetadata(MetadataVersion, MetadataVersion),
+    MetadataUpgradeNotNeeded(MetadataVersion),
+    ReadMetadataVersion(MetadataVersion),
     NonFatalError(&'a anyhow::Error),
     UpgradeRemovesToolchains,
-    PlainVerboseMessage(&'a str),
     /// Both `rust-toolchain` and `rust-toolchain.toml` exist within a directory
     DuplicateToolchainFile {
         rust_toolchain: &'a Path,
@@ -55,7 +55,7 @@ impl<'a> From<temp::Notification<'a>> for Notification<'a> {
     }
 }
 
-impl<'a> Notification<'a> {
+impl Notification<'_> {
     pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
@@ -68,8 +68,7 @@ impl<'a> Notification<'a> {
             | UpdatingToolchain(_)
             | ReadMetadataVersion(_)
             | InstalledToolchain(_)
-            | PlainVerboseMessage(_)
-            | UpdateHashMatches => NotificationLevel::Verbose,
+            | UpdateHashMatches => NotificationLevel::Debug,
             SetDefaultToolchain(_)
             | SetOverrideToolchain(_, _)
             | SetProfile(_)
@@ -85,7 +84,7 @@ impl<'a> Notification<'a> {
     }
 }
 
-impl<'a> Display for Notification<'a> {
+impl Display for Notification<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         use self::Notification::*;
         match self {
@@ -124,7 +123,6 @@ impl<'a> Display for Notification<'a> {
                 f,
                 "this upgrade will remove all existing toolchains. you will need to reinstall them"
             ),
-            PlainVerboseMessage(r) => write!(f, "{r}"),
             DuplicateToolchainFile {
                 rust_toolchain,
                 rust_toolchain_toml,

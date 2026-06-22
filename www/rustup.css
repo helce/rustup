@@ -31,6 +31,15 @@
     src: local('Work Sans Medium'), url("fonts/WorkSans-Medium.ttf") format('truetype');
 }
 
+@font-face {
+    font-family: 'Alfa Slab One';
+    font-style: normal;
+    font-weight: 400;
+    src: local('Alfa Slab One'),
+        url("fonts/AlfaSlabOne-Regular.woff2") format('woff2'),
+        url("fonts/AlfaSlabOne-Regular.woff") format('woff');
+}
+
 body {
     margin-top: 2em;
     background-color: white;
@@ -45,34 +54,45 @@ pre {
     font-weight: 400;
 }
 
-body#idx #pitch > a {
-    font-weight: 500;
-    line-height: 2em;
+header > div {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+}
+
+header > div > h1 {
+    font-family: "Alfa Slab One", serif;
+    color: black;
+    font-size: 4rem;
+    margin-bottom: 0;
+    margin-top: 1rem;
+    line-height: 1;
+    font-weight: 300;
+    letter-spacing: 1px;
+}
+
+header > div > h2 {
+    color: black;
+    font-size: 2rem;
+    font-weight: 300;
 }
 
 a {
-    color: #428bca;
-    text-decoration: none;
+    color: #0b7261;
+    text-decoration: underline;
 }
 
 a:hover {
-    color: rgb(42, 100, 150);
+    color: #0d8b75;
+    text-decoration: underline;
 }
 
-body#idx > * {
+main {
+    width: 80%;
+    max-width: 1200px;
+    padding: 0 20px;
     margin-left: auto;
     margin-right: auto;
-    text-align: center;
-    width: 35em;
-}
-
-body#idx > #pitch {
-    width: 35rem;
-}
-
-#pitch em {
-    font-style: normal;
-    font-weight: 400;
 }
 
 body#idx p {
@@ -85,7 +105,6 @@ body#idx p.other-platforms-help {
 }
 
 .instructions {
-    background-color: rgb(250, 250, 250);
     margin-left: auto;
     margin-right: auto;
     text-align: center;
@@ -95,12 +114,12 @@ body#idx p.other-platforms-help {
 }
 
 .instructions > * {
-    width: 45rem;
     margin-left: auto;
     margin-right: auto;
 }
 
 hr {
+    border-color: #0b7261;
     margin-top: 2em;
     margin-bottom: 2em;
 }
@@ -108,45 +127,49 @@ hr {
 #platform-instructions-unix > p,
 #platform-instructions-win32 > p,
 #platform-instructions-win64 > p,
+#platform-instructions-win-arm64 > p,
 #platform-instructions-default > p,
 #platform-instructions-unknown > p {
-    width: 40rem;
+    width: 80%;
 }
 
 .rustup-command::before {
-    color: #999;
+    color: black;
     content: " $ ";
 	margin-left: 15px;
 }
 
 .rustup-command {
-    background-color: #515151;
-    color: white;
+    color: black;
     padding: 1rem 1rem 1rem 0;
-    width: 45rem;
     height: auto;
     text-align: center;
     border-radius: 3px 0 0 3px;
-    box-shadow: inset 0px 0px 20px 0px #333333;
+    box-shadow: inset 0px 0px 20px 0px #f1eeee;
     overflow: hidden;
     font-size: 0.6em;
     white-space: nowrap;
     height: 26px;
     line-height: 26px;
+    overflow-x: auto;
 }
 
 #platform-instructions-unix div.copy-container,
 #platform-instructions-win32 div.copy-container,
 #platform-instructions-win64 div.copy-container,
+#platform-instructions-win-arm64 div.copy-container,
 #platform-instructions-default div.copy-container,
 #platform-instructions-unknown div.copy-container {
     display: flex;
     align-items: center;
+    width: 90%;
+    justify-content: center;
 }
 
 #platform-instructions-unix button.copy-button,
 #platform-instructions-win32 button.copy-button,
 #platform-instructions-win64 button.copy-button,
+#platform-instructions-win-arm64 button.copy-button,
 #platform-instructions-default button.copy-button,
 #platform-instructions-unknown button.copy-button {
     height: 58px;
@@ -160,6 +183,7 @@ hr {
 #platform-instructions-unix div.copy-icon,
 #platform-instructions-win32 div.copy-icon,
 #platform-instructions-win64 div.copy-icon,
+#platform-instructions-win-arm64 div.copy-icon,
 #platform-instructions-default div.copy-icon,
 #platform-instructions-unknown div.copy-icon {
     position: relative;
@@ -173,12 +197,13 @@ hr {
 #platform-instructions-unix div.copy-button-text,
 #platform-instructions-win32 div.copy-button-text,
 #platform-instructions-win64 div.copy-button-text,
+#platform-instructions-win-arm64 div.copy-button-text,
 #platform-instructions-default div.copy-button-text,
 #platform-instructions-unknown div.copy-button-text {
     transition: opacity 0.2s ease-in-out;
     opacity: 0;
     font-size: 10px;
-    color: green;
+    color: #0b7261;
     width: 41px;
     height: 15px;
     position: relative;
@@ -187,6 +212,7 @@ hr {
 
 #platform-instructions-win32 a.windows-download,
 #platform-instructions-win64 a.windows-download,
+#platform-instructions-win-arm64 a.windows-download,
 #platform-instructions-default a.windows-download,
 #platform-instructions-unknown a.windows-download {
     display: block;
@@ -203,9 +229,15 @@ hr {
     line-height: 2rem;
 }
 
+#help {
+    font-size: 20px;
+    text-align: center;
+}
+
 #about {
     font-size: 16px;
     line-height: 2em;
+    text-align: center;
 }
 
 #about > img {

@@ -1,66 +1,8 @@
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
+
 use regex::Regex;
 
-// These lists contain the targets known to rustup, and used to build
-// the PartialTargetTriple.
-
-static LIST_ARCHS: &[&str] = &[
-    "i386",
-    "i586",
-    "i686",
-    "x86_64",
-    "arm",
-    "armv7",
-    "armv7s",
-    "aarch64",
-    "mips",
-    "mipsel",
-    "mips64",
-    "mips64el",
-    "powerpc",
-    "powerpc64",
-    "powerpc64le",
-    "riscv64gc",
-    "s390x",
-    "loongarch64",
-    "e2k",
-    "e2k12c",
-    "e2k16c",
-    "e2k1cplus",
-    "e2k2c3",
-    "e2k48c",
-    "e2k4c",
-    "e2k8c",
-    "e2k8c2",
-    "e2k8v7",
-    "e2kv3",
-    "e2kv4",
-    "e2kv5",
-    "e2kv6",
-    "e2kv7",
-];
-static LIST_OSES: &[&str] = &[
-    "pc-windows",
-    "unknown-linux",
-    "apple-darwin",
-    "unknown-netbsd",
-    "apple-ios",
-    "linux",
-    "rumprun-netbsd",
-    "unknown-freebsd",
-    "unknown-illumos",
-];
-static LIST_ENVS: &[&str] = &[
-    "gnu",
-    "gnux32",
-    "msvc",
-    "gnueabi",
-    "gnueabihf",
-    "gnuabi64",
-    "androideabi",
-    "android",
-    "musl",
-];
+pub mod known;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PartialTargetTriple {
@@ -83,12 +25,12 @@ impl PartialTargetTriple {
         // we can count  on all triple components being
         // delineated by it.
         let name = format!("-{name}");
-        static RE: Lazy<Regex> = Lazy::new(|| {
+        static RE: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(&format!(
                 r"^(?:-({}))?(?:-({}))?(?:-({}))?$",
-                LIST_ARCHS.join("|"),
-                LIST_OSES.join("|"),
-                LIST_ENVS.join("|")
+                known::LIST_ARCHS.join("|"),
+                known::LIST_OSES.join("|"),
+                known::LIST_ENVS.join("|")
             ))
             .unwrap()
         });
@@ -113,8 +55,6 @@ impl PartialTargetTriple {
 
 #[cfg(test)]
 mod test {
-    use rustup_macros::unit_test as test;
-
     use super::*;
 
     #[test]

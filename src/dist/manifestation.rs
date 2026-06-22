@@ -6,24 +6,22 @@ mod tests;
 
 use std::path::Path;
 
-use anyhow::{anyhow, bail, Context, Result};
-use retry::delay::NoDelay;
-use retry::{retry, OperationResult};
+use anyhow::{Context, Result, anyhow, bail};
+use tokio_retry::{RetryIf, strategy::FixedInterval};
 
-use crate::currentprocess::varsource::VarSource;
 use crate::dist::component::{
     Components, Package, TarGzPackage, TarXzPackage, TarZStdPackage, Transaction,
 };
 use crate::dist::config::Config;
-use crate::dist::dist::{Profile, TargetTriple, DEFAULT_DIST_SERVER};
 use crate::dist::download::{DownloadCfg, File};
 use crate::dist::manifest::{Component, CompressionKind, Manifest, TargetedPackage};
 use crate::dist::notifications::*;
 use crate::dist::prefix::InstallPrefix;
 use crate::dist::temp;
-use crate::errors::{OperationError, RustupError};
-use crate::process;
-use crate::utils::utils;
+use crate::dist::{DEFAULT_DIST_SERVER, Profile, TargetTriple};
+use crate::errors::RustupError;
+use crate::process::Process;
+use crate::utils;
 
 pub(crate) const DIST_MANIFEST: &str = "multirust-channel-manifest.toml";
 pub(crate) const CONFIG_FILE: &str = "multirust-config.toml";
@@ -92,7 +90,7 @@ impl Manifestation {
     /// may be either a freshly-downloaded one, or the same one used
     /// for the previous install), as well as lists of extension
     /// components to add and remove.
-
+    ///
     /// From that it schedules a list of components to install and
     /// to uninstall to bring the installation up to date.  It
     /// downloads the components' packages. Then in a Transaction
@@ -100,7 +98,10 @@ impl Manifestation {
     /// distribution manifest to "rustlib/rustup-dist.toml" and a
     /// configuration containing the component name-target pairs to
     /// "rustlib/rustup-config.toml".
-    pub fn update(
+    ///
+    /// It is *not* safe to run two updates concurrently. See
+    /// https://github.com/rust-lang/rustup/issues/988 for the details.
+    pub async fn update(
         &self,
         new_manifest: &Manifest,
         changes: Changes,
@@ -154,7 +155,8 @@ impl Manifestation {
         let components = update.components_urls_and_hashes(new_manifest)?;
 
         const DEFAULT_MAX_RETRIES: usize = 3;
-        let max_retries: usize = process()
+        let max_retries: usize = download_cfg
+            .process
             .var("RUSTUP_MAX_RETRIES")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -174,26 +176,22 @@ impl Manifestation {
 
             let url_url = utils::parse_url(&url)?;
 
-            let downloaded_file = retry(NoDelay.take(max_retries), || {
-                match download_cfg.download(&url_url, &hash) {
-                    Ok(f) => OperationResult::Ok(f),
-                    Err(e) => {
-                        match e.downcast_ref::<RustupError>() {
-                            Some(RustupError::BrokenPartialFile) => {
-                                (download_cfg.notify_handler)(Notification::RetryingDownload(&url));
-                                return OperationResult::Retry(OperationError(e));
-                            }
-                            Some(RustupError::DownloadingFile { .. }) => {
-                                (download_cfg.notify_handler)(Notification::RetryingDownload(&url));
-                                return OperationResult::Retry(OperationError(e));
-                            }
-                            Some(_) => return OperationResult::Err(OperationError(e)),
-                            None => (),
-                        };
-                        OperationResult::Err(OperationError(e))
+            let downloaded_file = RetryIf::spawn(
+                FixedInterval::from_millis(0).take(max_retries),
+                || download_cfg.download(&url_url, &hash),
+                |e: &anyhow::Error| {
+                    // retry only known retriable cases
+                    match e.downcast_ref::<RustupError>() {
+                        Some(RustupError::BrokenPartialFile)
+                        | Some(RustupError::DownloadingFile { .. }) => {
+                            (download_cfg.notify_handler)(Notification::RetryingDownload(&url));
+                            true
+                        }
+                        _ => false,
                     }
-                }
-            })
+                },
+            )
+            .await
             .with_context(|| RustupError::ComponentDownloadFailed(component.name(new_manifest)))?;
 
             things_downloaded.push(hash);
@@ -202,11 +200,16 @@ impl Manifestation {
         }
 
         // Begin transaction
-        let mut tx = Transaction::new(prefix.clone(), tmp_cx, download_cfg.notify_handler);
+        let mut tx = Transaction::new(
+            prefix.clone(),
+            tmp_cx,
+            download_cfg.notify_handler,
+            download_cfg.process,
+        );
 
         // If the previous installation was from a v1 manifest we need
         // to uninstall it first.
-        tx = self.maybe_handle_v2_upgrade(&config, tx)?;
+        tx = self.maybe_handle_v2_upgrade(&config, tx, download_cfg.process)?;
 
         // Uninstall components
         for component in &update.components_to_uninstall {
@@ -226,6 +229,7 @@ impl Manifestation {
                 new_manifest,
                 tx,
                 &download_cfg.notify_handler,
+                download_cfg.process,
             )?;
         }
 
@@ -255,15 +259,30 @@ impl Manifestation {
                 utils::FileReaderWithProgress::new_file(&installer_file, &notification_converter)?;
             let package: &dyn Package = match format {
                 CompressionKind::GZip => {
-                    gz = TarGzPackage::new(reader, tmp_cx, Some(&notification_converter))?;
+                    gz = TarGzPackage::new(
+                        reader,
+                        tmp_cx,
+                        Some(&notification_converter),
+                        download_cfg.process,
+                    )?;
                     &gz
                 }
                 CompressionKind::XZ => {
-                    xz = TarXzPackage::new(reader, tmp_cx, Some(&notification_converter))?;
+                    xz = TarXzPackage::new(
+                        reader,
+                        tmp_cx,
+                        Some(&notification_converter),
+                        download_cfg.process,
+                    )?;
                     &xz
                 }
                 CompressionKind::ZStd => {
-                    zst = TarZStdPackage::new(reader, tmp_cx, Some(&notification_converter))?;
+                    zst = TarZStdPackage::new(
+                        reader,
+                        tmp_cx,
+                        Some(&notification_converter),
+                        download_cfg.process,
+                    )?;
                     &zst
                 }
             };
@@ -278,7 +297,7 @@ impl Manifestation {
         }
 
         // Install new distribution manifest
-        let new_manifest_str = new_manifest.clone().stringify();
+        let new_manifest_str = new_manifest.clone().stringify()?;
         tx.modify_file(rel_installed_manifest_path)?;
         utils::write_file("manifest", &installed_manifest_path, &new_manifest_str)?;
 
@@ -288,9 +307,11 @@ impl Manifestation {
         // that identify installed components. The rust-installer metadata maintained by
         // `Components` *also* tracks what is installed, but it only tracks names, not
         // name/target. Needs to be fixed in rust-installer.
-        let mut new_config = Config::new();
-        new_config.components = update.final_component_list;
-        let config_str = new_config.stringify();
+        let new_config = Config {
+            components: update.final_component_list,
+            ..Config::default()
+        };
+        let config_str = new_config.stringify()?;
         let rel_config_path = prefix.rel_manifest_file(CONFIG_FILE);
         let config_path = prefix.path().join(&rel_config_path);
         tx.modify_file(rel_config_path)?;
@@ -304,24 +325,30 @@ impl Manifestation {
         Ok(UpdateStatus::Changed)
     }
 
+    #[cfg(test)]
     pub fn uninstall(
         &self,
         manifest: &Manifest,
         tmp_cx: &temp::Context,
         notify_handler: &dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<()> {
         let prefix = self.installation.prefix();
 
-        let mut tx = Transaction::new(prefix.clone(), tmp_cx, notify_handler);
+        let mut tx = Transaction::new(prefix.clone(), tmp_cx, notify_handler, process);
 
         // Read configuration and delete it
         let rel_config_path = prefix.rel_manifest_file(CONFIG_FILE);
-        let config_str = utils::read_file("dist config", &prefix.path().join(&rel_config_path))?;
-        let config = Config::parse(&config_str)?;
+        let abs_config_path = prefix.path().join(&rel_config_path);
+        let config_str = utils::read_file("dist config", &abs_config_path)?;
+        let config = Config::parse(&config_str).with_context(|| RustupError::ParsingFile {
+            name: "config",
+            path: abs_config_path,
+        })?;
         tx.remove_file("dist config", rel_config_path)?;
 
         for component in config.components {
-            tx = self.uninstall_component(&component, manifest, tx, notify_handler)?;
+            tx = self.uninstall_component(&component, manifest, tx, notify_handler, process)?;
         }
         tx.commit();
 
@@ -334,6 +361,7 @@ impl Manifestation {
         manifest: &Manifest,
         mut tx: Transaction<'a>,
         notify_handler: &dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Transaction<'a>> {
         // For historical reasons, the rust-installer component
         // names are not the same as the dist manifest component
@@ -342,9 +370,9 @@ impl Manifestation {
         let name = component.name_in_manifest();
         let short_name = component.short_name_in_manifest();
         if let Some(c) = self.installation.find(&name)? {
-            tx = c.uninstall(tx)?;
+            tx = c.uninstall(tx, process)?;
         } else if let Some(c) = self.installation.find(short_name)? {
-            tx = c.uninstall(tx)?;
+            tx = c.uninstall(tx, process)?;
         } else {
             notify_handler(Notification::MissingInstalledComponent(
                 &component.short_name(manifest),
@@ -362,31 +390,42 @@ impl Manifestation {
         let config_path = prefix.path().join(rel_config_path);
         if utils::path_exists(&config_path) {
             let config_str = utils::read_file("dist config", &config_path)?;
-            Ok(Some(Config::parse(&config_str)?))
+            Ok(Some(Config::parse(&config_str).with_context(|| {
+                RustupError::ParsingFile {
+                    name: "Config",
+                    path: config_path,
+                }
+            })?))
         } else {
             Ok(None)
         }
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument)]
+    #[tracing::instrument(level = "trace")]
     pub fn load_manifest(&self) -> Result<Option<Manifest>> {
         let prefix = self.installation.prefix();
         let old_manifest_path = prefix.manifest_file(DIST_MANIFEST);
         if utils::path_exists(&old_manifest_path) {
             let manifest_str = utils::read_file("installed manifest", &old_manifest_path)?;
-            Ok(Some(Manifest::parse(&manifest_str)?))
+            Ok(Some(Manifest::parse(&manifest_str).with_context(|| {
+                RustupError::ParsingFile {
+                    name: "manifest",
+                    path: old_manifest_path,
+                }
+            })?))
         } else {
             Ok(None)
         }
     }
 
     /// Installation using the legacy v1 manifest format
-    pub(crate) fn update_v1(
+    pub(crate) async fn update_v1(
         &self,
         new_manifest: &[String],
         update_hash: Option<&Path>,
         tmp_cx: &temp::Context,
         notify_handler: &dyn Fn(Notification<'_>),
+        process: &Process,
     ) -> Result<Option<String>> {
         // If there's already a v2 installation then something has gone wrong
         if self.read_config()?.is_some() {
@@ -422,9 +461,12 @@ impl Manifestation {
             download_dir: &dld_dir,
             tmp_cx,
             notify_handler,
+            process,
         };
 
-        let dl = dlcfg.download_and_check(&url, update_hash, ".tar.gz")?;
+        let dl = dlcfg
+            .download_and_check(&url, update_hash, ".tar.gz")
+            .await?;
         if dl.is_none() {
             return Ok(None);
         };
@@ -439,12 +481,12 @@ impl Manifestation {
         ));
 
         // Begin transaction
-        let mut tx = Transaction::new(prefix, tmp_cx, notify_handler);
+        let mut tx = Transaction::new(prefix, tmp_cx, notify_handler, process);
 
         // Uninstall components
         let components = self.installation.list()?;
         for component in components {
-            tx = component.uninstall(tx)?;
+            tx = component.uninstall(tx, process)?;
         }
 
         // Install all the components in the installer
@@ -454,7 +496,7 @@ impl Manifestation {
         let reader =
             utils::FileReaderWithProgress::new_file(&installer_file, &notification_converter)?;
         let package: &dyn Package =
-            &TarGzPackage::new(reader, tmp_cx, Some(&notification_converter))?;
+            &TarGzPackage::new(reader, tmp_cx, Some(&notification_converter), process)?;
 
         for component in package.components() {
             tx = package.install(&self.installation, &component, None, tx)?;
@@ -474,6 +516,7 @@ impl Manifestation {
         &self,
         config: &Option<Config>,
         mut tx: Transaction<'a>,
+        process: &Process,
     ) -> Result<Transaction<'a>> {
         let installed_components = self.installation.list()?;
         let looks_like_v1 = config.is_none() && !installed_components.is_empty();
@@ -483,7 +526,7 @@ impl Manifestation {
         }
 
         for component in installed_components {
-            tx = component.uninstall(tx)?;
+            tx = component.uninstall(tx, process)?;
         }
 
         Ok(tx)
@@ -696,9 +739,9 @@ impl Update {
             // manifest leaves us with the files/hash pairs in preference order.
             components_urls_and_hashes.push((
                 component.clone(),
-                target_package.bins[0].0,
-                target_package.bins[0].1.url.clone(),
-                target_package.bins[0].1.hash.clone(),
+                target_package.bins[0].compression,
+                target_package.bins[0].url.clone(),
+                target_package.bins[0].hash.clone(),
             ));
         }
 

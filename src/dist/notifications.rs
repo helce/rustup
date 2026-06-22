@@ -1,6 +1,6 @@
-use crate::dist::dist::{TargetTriple, ToolchainDesc};
 use crate::dist::manifest::Component;
 use crate::dist::temp;
+use crate::dist::{TargetTriple, ToolchainDesc};
 use crate::utils::notify::NotificationLevel;
 use std::fmt::{self, Display};
 use std::path::Path;
@@ -32,7 +32,6 @@ pub enum Notification<'a> {
     DownloadingLegacyManifest,
     SkippingNightlyMissingComponent(&'a ToolchainDesc, &'a Manifest, &'a [Component]),
     ForcingUnavailableComponent(&'a str),
-    ManifestChecksumFailedHack,
     ComponentUnavailable(&'a str, Option<&'a TargetTriple>),
     StrayHash(&'a Path),
     SignatureInvalid(&'a str),
@@ -51,7 +50,7 @@ impl<'a> From<temp::Notification<'a>> for Notification<'a> {
     }
 }
 
-impl<'a> Notification<'a> {
+impl Notification<'_> {
     pub(crate) fn level(&self) -> NotificationLevel {
         use self::Notification::*;
         match self {
@@ -60,14 +59,13 @@ impl<'a> Notification<'a> {
             ChecksumValid(_)
             | NoUpdateHash(_)
             | FileAlreadyDownloaded
-            | DownloadingLegacyManifest => NotificationLevel::Verbose,
+            | DownloadingLegacyManifest => NotificationLevel::Debug,
             Extracting(_, _)
             | DownloadingComponent(_, _, _)
             | InstallingComponent(_, _, _)
             | RemovingComponent(_, _, _)
             | RemovingOldComponent(_, _, _)
             | ComponentAlreadyInstalled(_)
-            | ManifestChecksumFailedHack
             | RollingBack
             | DownloadingManifest(_)
             | SkippingNightlyMissingComponent(_, _, _)
@@ -86,7 +84,7 @@ impl<'a> Notification<'a> {
     }
 }
 
-impl<'a> Display for Notification<'a> {
+impl Display for Notification<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
         use self::Notification::*;
         match self {
@@ -150,9 +148,6 @@ impl<'a> Display for Notification<'a> {
                 write!(f, "latest update on {date}, no rust version")
             }
             DownloadingLegacyManifest => write!(f, "manifest not found. trying legacy manifest"),
-            ManifestChecksumFailedHack => {
-                write!(f, "update not yet available, sorry! try again later")
-            }
             ComponentUnavailable(pkg, toolchain) => {
                 if let Some(tc) = toolchain {
                     write!(f, "component '{pkg}' is not available on target '{tc}'")

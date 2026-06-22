@@ -30,67 +30,216 @@
 //! Deleting the running binary during uninstall is tricky
 //! and racy on Windows.
 
-#[cfg(unix)]
-mod shell;
-#[cfg(feature = "test")]
-pub(crate) mod test;
-#[cfg(unix)]
-mod unix;
-#[cfg(windows)]
-mod windows;
-mod os {
-    #[cfg(unix)]
-    pub(crate) use super::unix::*;
-    #[cfg(windows)]
-    pub(crate) use super::windows::*;
-}
-
 use std::borrow::Cow;
-use std::env;
 use std::env::consts::EXE_SUFFIX;
 use std::fs;
 use std::io::Write;
-use std::path::{Component, Path, PathBuf, MAIN_SEPARATOR};
+use std::path::{Component, MAIN_SEPARATOR, Path, PathBuf};
 use std::process::Command;
 use std::str::FromStr;
+use std::{env, fmt};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use cfg_if::cfg_if;
+use clap::ValueEnum;
+use clap::builder::PossibleValue;
+use itertools::Itertools;
 use same_file::Handle;
+use serde::{Deserialize, Serialize};
+use tracing::{error, info, trace, warn};
 
-use crate::currentprocess::terminalsource;
 use crate::{
+    DUP_TOOLS, TOOLS,
     cli::{
-        common::{self, ignorable_error, report_error, Confirm, PackageUpdate},
+        common::{self, Confirm, PackageUpdate, ignorable_error, report_error},
         errors::*,
         markdown::md,
     },
-    currentprocess::{filesource::StdoutSource, varsource::VarSource},
-    dist::dist::{self, PartialToolchainDesc, Profile, TargetTriple, ToolchainDesc},
+    config::Cfg,
+    dist::{self, PartialToolchainDesc, Profile, TargetTriple, ToolchainDesc},
+    errors::RustupError,
     install::UpdateStatus,
-    process,
+    process::{Process, terminalsource},
     toolchain::{
-        distributable::DistributableToolchain,
-        names::{MaybeOfficialToolchainName, ResolvableToolchainName, ToolchainName},
-        toolchain::Toolchain,
+        DistributableToolchain, MaybeOfficialToolchainName, ResolvableToolchainName, Toolchain,
+        ToolchainName,
     },
-    utils::{utils, Notification},
-    Cfg, DUP_TOOLS, TOOLS,
+    utils::{self, Notification},
 };
 
-use os::*;
-pub(crate) use os::{run_update, self_replace};
+#[cfg(unix)]
+mod shell;
+
+#[cfg(unix)]
+mod unix;
+#[cfg(unix)]
+use unix::{delete_rustup_and_cargo_home, do_add_to_path, do_remove_from_path};
+#[cfg(unix)]
+pub(crate) use unix::{run_update, self_replace};
+
+#[cfg(windows)]
+mod windows;
 #[cfg(windows)]
 pub use windows::complete_windows_uninstall;
+#[cfg(all(windows, feature = "test"))]
+pub use windows::{RegistryGuard, RegistryValueId, USER_PATH, get_path};
+#[cfg(windows)]
+use windows::{delete_rustup_and_cargo_home, do_add_to_path, do_remove_from_path};
+#[cfg(windows)]
+pub(crate) use windows::{run_update, self_replace};
 
 pub(crate) struct InstallOpts<'a> {
     pub default_host_triple: Option<String>,
     pub default_toolchain: Option<MaybeOfficialToolchainName>,
-    pub profile: String,
+    pub profile: Profile,
     pub no_modify_path: bool,
     pub no_update_toolchain: bool,
     pub components: &'a [&'a str],
     pub targets: &'a [&'a str],
+}
+
+impl InstallOpts<'_> {
+    fn install(self, cfg: &mut Cfg<'_>) -> Result<Option<ToolchainDesc>> {
+        let Self {
+            default_host_triple,
+            default_toolchain,
+            profile,
+            no_modify_path: _no_modify_path,
+            no_update_toolchain,
+            components,
+            targets,
+        } = self;
+
+        cfg.set_profile(profile)?;
+
+        if let Some(default_host_triple) = &default_host_triple {
+            // Set host triple now as it will affect resolution of toolchain_str
+            info!("setting default host triple to {}", default_host_triple);
+            cfg.set_default_host_triple(default_host_triple.to_owned())?;
+        } else {
+            info!("default host triple is {}", cfg.get_default_host_triple()?);
+        }
+
+        let user_specified_something = default_toolchain.is_some()
+            || !targets.is_empty()
+            || !components.is_empty()
+            || !no_update_toolchain;
+
+        // If the user specified they want no toolchain, we skip this, otherwise
+        // if they specify something directly, or we have no default, then we install
+        // a toolchain (updating if it's already present) and then if neither of
+        // those are true, we have a user who doesn't mind, and already has an
+        // install, so we leave their setup alone.
+        if matches!(default_toolchain, Some(MaybeOfficialToolchainName::None)) {
+            info!("skipping toolchain installation");
+            if !components.is_empty() {
+                warn!(
+                    "ignoring requested component{}: {}",
+                    if components.len() == 1 { "" } else { "s" },
+                    components.join(", ")
+                );
+            }
+            if !targets.is_empty() {
+                warn!(
+                    "ignoring requested target{}: {}",
+                    if targets.len() == 1 { "" } else { "s" },
+                    targets.join(", ")
+                );
+            }
+            writeln!(cfg.process.stdout().lock())?;
+            Ok(None)
+        } else if user_specified_something
+            || (!no_update_toolchain && cfg.find_default()?.is_none())
+        {
+            Ok(match default_toolchain {
+                Some(s) => {
+                    let toolchain_name = match s {
+                        MaybeOfficialToolchainName::None => unreachable!(),
+                        MaybeOfficialToolchainName::Some(n) => n,
+                    };
+                    Some(toolchain_name.resolve(&cfg.get_default_host_triple()?)?)
+                }
+                None => match cfg.get_default()? {
+                    // Default is installable
+                    Some(ToolchainName::Official(t)) => Some(t),
+                    // Default is custom, presumably from a prior install. Do nothing.
+                    Some(ToolchainName::Custom(_)) => None,
+                    None => Some(
+                        "stable"
+                            .parse::<PartialToolchainDesc>()?
+                            .resolve(&cfg.get_default_host_triple()?)?,
+                    ),
+                },
+            })
+        } else {
+            info!("updating existing rustup installation - leaving toolchains alone");
+            writeln!(cfg.process.stdout().lock())?;
+            Ok(None)
+        }
+    }
+
+    // Interactive editing of the install options
+    fn customize(&mut self, process: &Process) -> Result<()> {
+        writeln!(
+            process.stdout().lock(),
+            "I'm going to ask you the value of each of these installation options.\n\
+         You may simply press the Enter key to leave unchanged."
+        )?;
+
+        writeln!(process.stdout().lock())?;
+
+        self.default_host_triple = Some(common::question_str(
+            "Default host triple?",
+            &self
+                .default_host_triple
+                .take()
+                .unwrap_or_else(|| TargetTriple::from_host_or_build(process).to_string()),
+            process,
+        )?);
+
+        self.default_toolchain = Some(MaybeOfficialToolchainName::try_from(common::question_str(
+            "Default toolchain? (stable/beta/nightly/none)",
+            &self
+                .default_toolchain
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or("stable".into()),
+            process,
+        )?)?);
+
+        self.profile = <Profile as FromStr>::from_str(&common::question_str(
+            &format!(
+                "Profile (which tools and data to install)? ({})",
+                Profile::value_variants().iter().join("/"),
+            ),
+            self.profile.as_str(),
+            process,
+        )?)?;
+
+        self.no_modify_path =
+            !common::question_bool("Modify PATH variable?", !self.no_modify_path, process)?;
+
+        Ok(())
+    }
+
+    fn validate(&self, process: &Process) -> Result<()> {
+        common::warn_if_host_is_emulated(process);
+
+        let host_triple = self
+            .default_host_triple
+            .as_ref()
+            .map(dist::TargetTriple::new)
+            .unwrap_or_else(|| TargetTriple::from_host_or_build(process));
+        let partial_channel = match &self.default_toolchain {
+            None | Some(MaybeOfficialToolchainName::None) => {
+                ResolvableToolchainName::try_from("stable")?
+            }
+            Some(MaybeOfficialToolchainName::Some(s)) => s.into(),
+        };
+        let resolved = partial_channel.resolve(&host_triple)?;
+        trace!("Successfully resolved installation toolchain as: {resolved}");
+        Ok(())
+    }
 }
 
 #[cfg(feature = "no-self-update")]
@@ -98,20 +247,36 @@ pub(crate) const NEVER_SELF_UPDATE: bool = true;
 #[cfg(not(feature = "no-self-update"))]
 pub(crate) const NEVER_SELF_UPDATE: bool = false;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SelfUpdateMode {
+    #[default]
     Enable,
     Disable,
     CheckOnly,
 }
 
 impl SelfUpdateMode {
-    pub(crate) fn modes() -> &'static [&'static str] {
-        &["enable", "disable", "check-only"]
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+            Self::CheckOnly => "check-only",
+        }
+    }
+}
+
+impl ValueEnum for SelfUpdateMode {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Enable, Self::Disable, Self::CheckOnly]
     }
 
-    pub(crate) fn default_mode() -> &'static str {
-        "enable"
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(PossibleValue::new(self.as_str()))
+    }
+
+    fn from_str(input: &str, _: bool) -> Result<Self, String> {
+        <Self as FromStr>::from_str(input).map_err(|e| e.to_string())
     }
 }
 
@@ -126,7 +291,7 @@ impl FromStr for SelfUpdateMode {
             _ => Err(anyhow!(format!(
                 "unknown self update mode: '{}'; valid modes are {}",
                 mode,
-                valid_self_update_modes(),
+                Self::value_variants().iter().join(", ")
             ))),
         }
     }
@@ -134,11 +299,7 @@ impl FromStr for SelfUpdateMode {
 
 impl std::fmt::Display for SelfUpdateMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            SelfUpdateMode::Enable => "enable",
-            SelfUpdateMode::Disable => "disable",
-            SelfUpdateMode::CheckOnly => "check-only",
-        })
+        f.write_str(self.as_str())
     }
 }
 
@@ -223,6 +384,7 @@ the corresponding `env` file under {cargo_home}.
 This is usually done by running one of the following (note the leading DOT):
     . "{cargo_home}/env"            # For sh/bash/zsh/ash/dash/pdksh
     source "{cargo_home}/env.fish"  # For fish
+    source "{cargo_home}/env.nu"    # For nushell
 "#
     };
 }
@@ -293,59 +455,22 @@ This will uninstall all Rust toolchains and data, and remove
     };
 }
 
-#[cfg(windows)]
-static MSVC_MESSAGE: &str = r#"# Rust Visual C++ prerequisites
-
-Rust requires the Microsoft C++ build tools for Visual Studio 2013 or
-later, but they don't seem to be installed.
-
-"#;
-
-#[cfg(windows)]
-static MSVC_MANUAL_INSTALL_MESSAGE: &str = r#"
-You can acquire the build tools by installing Microsoft Visual Studio.
-
-    https://visualstudio.microsoft.com/downloads/
-
-Check the box for "Desktop development with C++" which will ensure that the
-needed components are installed. If your locale language is not English,
-then additionally check the box for English under Language packs.
-
-For more details see:
-
-    https://rust-lang.github.io/rustup/installation/windows-msvc.html
-
-_Install the C++ build tools before proceeding_.
-
-If you will be targeting the GNU ABI or otherwise know what you are
-doing then it is fine to continue installation without the build
-tools, but otherwise, install the C++ build tools before proceeding.
-"#;
-
-#[cfg(windows)]
-static MSVC_AUTO_INSTALL_MESSAGE: &str = r#"# Rust Visual C++ prerequisites
-
-Rust requires a linker and Windows API libraries but they don't seem to be available.
-
-These components can be acquired through a Visual Studio installer.
-
-"#;
-
 static DEFAULT_UPDATE_ROOT: &str = "https://dev.mcst.ru/rust/rustup";
 
-fn update_root() -> String {
-    process()
+fn update_root(process: &Process) -> String {
+    process
         .var("RUSTUP_UPDATE_ROOT")
-        .inspect(|url| debug!("`RUSTUP_UPDATE_ROOT` has been set to `{url}`"))
+        .inspect(|url| trace!("`RUSTUP_UPDATE_ROOT` has been set to `{url}`"))
         .unwrap_or_else(|_| String::from(DEFAULT_UPDATE_ROOT))
 }
 
 /// `CARGO_HOME` suitable for display, possibly with $HOME
 /// substituted for the directory prefix
-fn canonical_cargo_home() -> Result<Cow<'static, str>> {
-    let path = utils::cargo_home()?;
+fn canonical_cargo_home(process: &Process) -> Result<Cow<'static, str>> {
+    let path = process.cargo_home()?;
 
-    let default_cargo_home = utils::home_dir()
+    let default_cargo_home = process
+        .home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cargo");
     Ok(if default_cargo_home == path {
@@ -364,85 +489,51 @@ fn canonical_cargo_home() -> Result<Cow<'static, str>> {
 /// Installing is a simple matter of copying the running binary to
 /// `CARGO_HOME`/bin, hard-linking the various Rust tools to it,
 /// and adding `CARGO_HOME`/bin to PATH.
-pub(crate) fn install(
+pub(crate) async fn install(
+    current_dir: PathBuf,
     no_prompt: bool,
-    verbose: bool,
     quiet: bool,
     mut opts: InstallOpts<'_>,
+    process: &Process,
 ) -> Result<utils::ExitCode> {
-    if !process()
-        .var_os("RUSTUP_INIT_SKIP_EXISTENCE_CHECKS")
-        .map_or(false, |s| s == "yes")
-    {
-        do_pre_install_sanity_checks(no_prompt)?;
-    }
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut exit_code = utils::ExitCode(0);
 
-    do_pre_install_options_sanity_checks(&opts)?;
+    opts.validate(process).map_err(|e| {
+        anyhow!(
+            "Pre-checks for host and toolchain failed: {e}\n\
+            If you are unsure of suitable values, the 'stable' toolchain is the default.\n\
+            Valid host triples look something like: {}",
+            TargetTriple::from_host_or_build(process)
+        )
+    })?;
 
-    if !process()
+    if process
         .var_os("RUSTUP_INIT_SKIP_EXISTENCE_CHECKS")
-        .map_or(false, |s| s == "yes")
+        .is_none_or(|s| s != "yes")
     {
-        check_existence_of_rustc_or_cargo_in_path(no_prompt)?;
+        check_existence_of_rustc_or_cargo_in_path(no_prompt, process)?;
+        check_existence_of_settings_file(process)?;
     }
 
     #[cfg(unix)]
-    do_anti_sudo_check(no_prompt)?;
-
-    let mut term = process().stdout().terminal();
-
-    #[cfg(windows)]
-    if let Some(plan) = do_msvc_check(&opts) {
-        if no_prompt {
-            warn!("installing msvc toolchain without its prerequisites");
-        } else if !quiet && plan == VsInstallPlan::Automatic {
-            md(&mut term, MSVC_AUTO_INSTALL_MESSAGE);
-            match windows::choose_vs_install()? {
-                Some(VsInstallPlan::Automatic) => {
-                    match try_install_msvc(&opts) {
-                        Err(e) => {
-                            // Make sure the console doesn't exit before the user can
-                            // see the error and give the option to continue anyway.
-                            report_error(&e);
-                            if !common::question_bool("\nContinue?", false)? {
-                                info!("aborting installation");
-                                return Ok(utils::ExitCode(0));
-                            }
-                        }
-                        Ok(ContinueInstall::No) => {
-                            ensure_prompt()?;
-                            return Ok(utils::ExitCode(0));
-                        }
-                        _ => {}
-                    }
-                }
-                Some(VsInstallPlan::Manual) => {
-                    md(&mut term, MSVC_MANUAL_INSTALL_MESSAGE);
-                    if !common::question_bool("\nContinue?", false)? {
-                        info!("aborting installation");
-                        return Ok(utils::ExitCode(0));
-                    }
-                }
-                None => {}
-            }
-        } else {
-            md(&mut term, MSVC_MESSAGE);
-            md(&mut term, MSVC_MANUAL_INSTALL_MESSAGE);
-            if !common::question_bool("\nContinue?", false)? {
-                info!("aborting installation");
-                return Ok(utils::ExitCode(0));
-            }
-        }
+    {
+        exit_code &= unix::do_anti_sudo_check(no_prompt, process)?;
     }
 
+    let mut term = process.stdout().terminal(process);
+
+    #[cfg(windows)]
+    windows::maybe_install_msvc(&mut term, no_prompt, quiet, &opts, process).await?;
+
     if !no_prompt {
-        let msg = pre_install_msg(opts.no_modify_path)?;
+        let msg = pre_install_msg(opts.no_modify_path, process)?;
 
         md(&mut term, msg);
         let mut customized_install = false;
         loop {
-            md(&mut term, current_install_opts(&opts));
-            match common::confirm_advanced(customized_install)? {
+            md(&mut term, current_install_opts(&opts, process));
+            match common::confirm_advanced(customized_install, process)? {
                 Confirm::No => {
                     info!("aborting installation");
                     return Ok(utils::ExitCode(0));
@@ -452,39 +543,15 @@ pub(crate) fn install(
                 }
                 Confirm::Advanced => {
                     customized_install = true;
-                    opts = customize_install(opts)?;
+                    opts.customize(process)?;
                 }
             }
         }
     }
 
-    let install_res: Result<utils::ExitCode> = (|| {
-        install_bins()?;
-
-        #[cfg(unix)]
-        do_write_env_files()?;
-
-        if !opts.no_modify_path {
-            do_add_to_programs()?;
-            do_add_to_path()?;
-        }
-        utils::create_rustup_home()?;
-        maybe_install_rust(
-            opts.default_toolchain,
-            &opts.profile,
-            opts.default_host_triple.as_deref(),
-            !opts.no_update_toolchain,
-            opts.components,
-            opts.targets,
-            verbose,
-            quiet,
-        )?;
-
-        Ok(utils::ExitCode(0))
-    })();
-
-    if let Err(e) = install_res {
-        report_error(&e);
+    let no_modify_path = opts.no_modify_path;
+    if let Err(e) = maybe_install_rust(current_dir, quiet, opts, process).await {
+        report_error(&e, process);
 
         // On windows, where installation happens in a console
         // that may have opened just for this purpose, give
@@ -492,17 +559,17 @@ pub(crate) fn install(
         // window closes.
         #[cfg(windows)]
         if !no_prompt {
-            ensure_prompt()?;
+            windows::ensure_prompt(process)?;
         }
 
         return Ok(utils::ExitCode(1));
     }
 
-    let cargo_home = canonical_cargo_home()?;
+    let cargo_home = canonical_cargo_home(process)?;
     #[cfg(windows)]
     let cargo_home = cargo_home.replace('\\', r"\\");
     #[cfg(windows)]
-    let msg = if opts.no_modify_path {
+    let msg = if no_modify_path {
         format!(
             post_install_msg_win_no_modify_path!(),
             cargo_home = cargo_home
@@ -511,7 +578,7 @@ pub(crate) fn install(
         format!(post_install_msg_win!(), cargo_home = cargo_home)
     };
     #[cfg(not(windows))]
-    let msg = if opts.no_modify_path {
+    let msg = if no_modify_path {
         format!(
             post_install_msg_unix_no_modify_path!(),
             cargo_home = cargo_home
@@ -526,13 +593,13 @@ pub(crate) fn install(
         // On windows, where installation happens in a console
         // that may have opened just for this purpose, require
         // the user to press a key to continue.
-        ensure_prompt()?;
+        windows::ensure_prompt(process)?;
     }
 
-    Ok(utils::ExitCode(0))
+    Ok(exit_code)
 }
 
-fn rustc_or_cargo_exists_in_path() -> Result<()> {
+fn rustc_or_cargo_exists_in_path(process: &Process) -> Result<()> {
     // Ignore rustc and cargo if present in $HOME/.cargo/bin or a few other directories
     #[allow(clippy::ptr_arg)]
     fn ignore_paths(path: &PathBuf) -> bool {
@@ -541,7 +608,7 @@ fn rustc_or_cargo_exists_in_path() -> Result<()> {
             .any(|c| c == Component::Normal(".cargo".as_ref()))
     }
 
-    if let Some(paths) = process().var_os("PATH") {
+    if let Some(paths) = process.var_os("PATH") {
         let paths = env::split_paths(&paths).filter(ignore_paths);
 
         for path in paths {
@@ -556,94 +623,42 @@ fn rustc_or_cargo_exists_in_path() -> Result<()> {
     Ok(())
 }
 
-fn check_existence_of_rustc_or_cargo_in_path(no_prompt: bool) -> Result<()> {
+fn check_existence_of_rustc_or_cargo_in_path(no_prompt: bool, process: &Process) -> Result<()> {
     // Only the test runner should set this
-    let skip_check = process().var_os("RUSTUP_INIT_SKIP_PATH_CHECK");
+    let skip_check = process.var_os("RUSTUP_INIT_SKIP_PATH_CHECK");
 
     // Skip this if the environment variable is set
     if skip_check == Some("yes".into()) {
         return Ok(());
     }
 
-    if let Err(path) = rustc_or_cargo_exists_in_path() {
-        warn!("it looks like you have an existing installation of Rust at:");
+    if let Err(path) = rustc_or_cargo_exists_in_path(process) {
+        warn!("It looks like you have an existing installation of Rust at:");
         warn!("{}", path);
         warn!("It is recommended that rustup be the primary Rust installation.");
-        warn!("Otherwise you may have confusion unless you are careful with your PATH");
+        warn!("Otherwise you may have confusion unless you are careful with your PATH.");
         warn!("If you are sure that you want both rustup and your already installed Rust");
         warn!("then please reply `y' or `yes' or set RUSTUP_INIT_SKIP_PATH_CHECK to yes");
         warn!("or pass `-y' to ignore all ignorable checks.");
-        ignorable_error("cannot install while Rust is installed", no_prompt)?;
+        ignorable_error("cannot install while Rust is installed", no_prompt, process)?;
     }
     Ok(())
 }
 
-fn do_pre_install_sanity_checks(no_prompt: bool) -> Result<()> {
-    let rustc_manifest_path = PathBuf::from("/usr/local/lib/rustlib/manifest-rustc");
-    let uninstaller_path = PathBuf::from("/usr/local/lib/rustlib/uninstall.sh");
-    let rustup_sh_path = utils::home_dir().unwrap().join(".rustup");
-    let rustup_sh_version_path = rustup_sh_path.join("rustup-version");
-
-    let rustc_exists = rustc_manifest_path.exists() && uninstaller_path.exists();
-    let rustup_sh_exists = rustup_sh_version_path.exists();
-
-    if rustc_exists {
-        warn!("it looks like you have an existing installation of Rust");
-        warn!("rustup cannot be installed alongside Rust. Please uninstall first");
-        warn!(
-            "run `{}` as root to uninstall Rust",
-            uninstaller_path.display()
-        );
-        ignorable_error("cannot install while Rust is installed", no_prompt)?;
+fn check_existence_of_settings_file(process: &Process) -> Result<()> {
+    let rustup_dir = process.rustup_home()?;
+    let settings_file_path = rustup_dir.join("settings.toml");
+    if utils::path_exists(&settings_file_path) {
+        warn!("It looks like you have an existing rustup settings file at:");
+        warn!("{}", settings_file_path.display());
+        warn!("Rustup will install the default toolchain as specified in the settings file,");
+        warn!("instead of the one inferred from the default host triple.");
     }
-
-    if rustup_sh_exists {
-        warn!("it looks like you have existing rustup.sh metadata");
-        warn!("rustup cannot be installed while rustup.sh metadata exists");
-        warn!("delete `{}` to remove rustup.sh", rustup_sh_path.display());
-        warn!("or, if you already have rustup installed, you can run");
-        warn!("`rustup self update` and `rustup toolchain list` to upgrade");
-        warn!("your directory structure");
-        ignorable_error("cannot install while rustup.sh is installed", no_prompt)?;
-    }
-
     Ok(())
 }
 
-fn do_pre_install_options_sanity_checks(opts: &InstallOpts<'_>) -> Result<()> {
-    common::warn_if_host_is_emulated();
-
-    // Verify that the installation options are vaguely sane
-    (|| {
-        let host_triple = opts
-            .default_host_triple
-            .as_ref()
-            .map(|s| dist::TargetTriple::new(s))
-            .unwrap_or_else(TargetTriple::from_host_or_build);
-        let partial_channel = match &opts.default_toolchain {
-            None | Some(MaybeOfficialToolchainName::None) => {
-                ResolvableToolchainName::try_from("stable")?
-            }
-            Some(MaybeOfficialToolchainName::Some(s)) => s.into(),
-        };
-        let resolved = partial_channel.resolve(&host_triple)?;
-        debug!("Successfully resolved installation toolchain as: {resolved}");
-        Ok(())
-    })()
-    .map_err(|e: Box<dyn std::error::Error>| {
-        anyhow!(
-            "Pre-checks for host and toolchain failed: {}\n\
-             If you are unsure of suitable values, the 'stable' toolchain is the default.\n\
-             Valid host triples look something like: {}",
-            e,
-            TargetTriple::from_host_or_build()
-        )
-    })?;
-    Ok(())
-}
-
-fn pre_install_msg(no_modify_path: bool) -> Result<String> {
-    let cargo_home = utils::cargo_home()?;
+fn pre_install_msg(no_modify_path: bool, process: &Process) -> Result<String> {
+    let cargo_home = process.cargo_home()?;
     let cargo_home_bin = cargo_home.join("bin");
     let rustup_home = home::rustup_home()?;
 
@@ -651,8 +666,8 @@ fn pre_install_msg(no_modify_path: bool) -> Result<String> {
         // Brittle code warning: some duplication in unix::do_add_to_path
         #[cfg(not(windows))]
         {
-            let rcfiles = shell::get_available_shells()
-                .flat_map(|sh| sh.update_rcs().into_iter())
+            let rcfiles = shell::get_available_shells(process)
+                .flat_map(|sh| sh.update_rcs(process).into_iter())
                 .map(|rc| format!("    {}", rc.display()))
                 .collect::<Vec<_>>();
             let plural = if rcfiles.len() > 1 { "s" } else { "" };
@@ -683,7 +698,7 @@ fn pre_install_msg(no_modify_path: bool) -> Result<String> {
     }
 }
 
-fn current_install_opts(opts: &InstallOpts<'_>) -> String {
+fn current_install_opts(opts: &InstallOpts<'_>, process: &Process) -> String {
     format!(
         r"Current installation options:
 
@@ -694,8 +709,8 @@ fn current_install_opts(opts: &InstallOpts<'_>) -> String {
 ",
         opts.default_host_triple
             .as_ref()
-            .map(|s| TargetTriple::new(s))
-            .unwrap_or_else(TargetTriple::from_host_or_build),
+            .map(TargetTriple::new)
+            .unwrap_or_else(|| TargetTriple::from_host_or_build(process)),
         opts.default_toolchain
             .as_ref()
             .map(ToString::to_string)
@@ -705,47 +720,8 @@ fn current_install_opts(opts: &InstallOpts<'_>) -> String {
     )
 }
 
-// Interactive editing of the install options
-fn customize_install(mut opts: InstallOpts<'_>) -> Result<InstallOpts<'_>> {
-    writeln!(
-        process().stdout().lock(),
-        "I'm going to ask you the value of each of these installation options.\n\
-         You may simply press the Enter key to leave unchanged."
-    )?;
-
-    writeln!(process().stdout().lock())?;
-
-    opts.default_host_triple = Some(common::question_str(
-        "Default host triple?",
-        &opts
-            .default_host_triple
-            .unwrap_or_else(|| TargetTriple::from_host_or_build().to_string()),
-    )?);
-
-    opts.default_toolchain = Some(MaybeOfficialToolchainName::try_from(common::question_str(
-        "Default toolchain? (stable/beta/nightly/none)",
-        &opts
-            .default_toolchain
-            .as_ref()
-            .map(ToString::to_string)
-            .unwrap_or("stable".into()),
-    )?)?);
-
-    opts.profile = common::question_str(
-        &format!(
-            "Profile (which tools and data to install)? ({})",
-            Profile::names().join("/")
-        ),
-        &opts.profile,
-    )?;
-
-    opts.no_modify_path = !common::question_bool("Modify PATH variable?", !opts.no_modify_path)?;
-
-    Ok(opts)
-}
-
-fn install_bins() -> Result<()> {
-    let bin_path = utils::cargo_home()?.join("bin");
+fn install_bins(process: &Process) -> Result<()> {
+    let bin_path = process.cargo_home()?.join("bin");
     let this_exe_path = utils::current_exe()?;
     let rustup_path = bin_path.join(format!("rustup{EXE_SUFFIX}"));
 
@@ -757,11 +733,11 @@ fn install_bins() -> Result<()> {
     }
     utils::copy_file(&this_exe_path, &rustup_path)?;
     utils::make_executable(&rustup_path)?;
-    install_proxies()
+    install_proxies(process)
 }
 
-pub(crate) fn install_proxies() -> Result<()> {
-    let bin_path = utils::cargo_home()?.join("bin");
+pub(crate) fn install_proxies(process: &Process) -> Result<()> {
+    let bin_path = process.cargo_home()?.join("bin");
     let rustup_path = bin_path.join(format!("rustup{EXE_SUFFIX}"));
 
     let rustup = Handle::from_path(&rustup_path)?;
@@ -769,8 +745,8 @@ pub(crate) fn install_proxies() -> Result<()> {
     let mut tool_handles = Vec::new();
     let mut link_afterwards = Vec::new();
 
-    // Try to hardlink all the Rust exes to the rustup exe. Some systems,
-    // like Android, does not support hardlinks, so we fallback to symlinks.
+    // Try to symlink all the Rust exes to the rustup exe. Some systems,
+    // like Windows, do not always support symlinks, so we fallback to hard links.
     //
     // Note that this function may not be running in the context of a fresh
     // self update but rather as part of a normal update to fill in missing
@@ -789,9 +765,9 @@ pub(crate) fn install_proxies() -> Result<()> {
     // actually delete files (they'll say they're deleted but they won't
     // actually be on Windows). As a result we manually drop all the
     // `tool_handles` later on. This'll allow us, afterwards, to actually
-    // overwrite all the previous hard links with new ones.
+    // overwrite all the previous soft or hard links with new ones.
     for tool in TOOLS {
-        let tool_path = bin_path.join(&format!("{tool}{EXE_SUFFIX}"));
+        let tool_path = bin_path.join(format!("{tool}{EXE_SUFFIX}"));
         if let Ok(handle) = Handle::from_path(&tool_path) {
             tool_handles.push(handle);
             if rustup == *tool_handles.last().unwrap() {
@@ -802,9 +778,9 @@ pub(crate) fn install_proxies() -> Result<()> {
     }
 
     for tool in DUP_TOOLS {
-        let tool_path = bin_path.join(&format!("{tool}{EXE_SUFFIX}"));
+        let tool_path = bin_path.join(format!("{tool}{EXE_SUFFIX}"));
         if let Ok(handle) = Handle::from_path(&tool_path) {
-            // Like above, don't clobber anything that's already hardlinked to
+            // Like above, don't clobber anything that's already linked to
             // avoid extraneous errors from being returned.
             if rustup == handle {
                 continue;
@@ -822,44 +798,55 @@ pub(crate) fn install_proxies() -> Result<()> {
             // previous file, and if it's not equivalent to anything then it's
             // pretty likely that it needs to be dealt with manually.
             if tool_handles.iter().all(|h| *h != handle) {
-                warn!("tool `{}` is already installed, remove it from `{}`, then run `rustup update` \
+                warn!(
+                    "tool `{}` is already installed, remove it from `{}`, then run `rustup update` \
                        to have rustup manage this tool.",
-                      tool, bin_path.display());
+                    tool,
+                    bin_path.display()
+                );
                 continue;
             }
         }
-        utils::hard_or_symlink_file(&rustup_path, &tool_path)?;
+        utils::symlink_or_hardlink_file(&rustup_path, &tool_path)?;
     }
 
     drop(tool_handles);
     for path in link_afterwards {
-        utils::hard_or_symlink_file(&rustup_path, &path)?;
+        utils::symlink_or_hardlink_file(&rustup_path, &path)?;
     }
 
     Ok(())
 }
 
-fn maybe_install_rust(
-    toolchain: Option<MaybeOfficialToolchainName>,
-    profile_str: &str,
-    default_host_triple: Option<&str>,
-    update_existing_toolchain: bool,
-    components: &[&str],
-    targets: &[&str],
-    verbose: bool,
+async fn maybe_install_rust(
+    current_dir: PathBuf,
     quiet: bool,
+    opts: InstallOpts<'_>,
+    process: &Process,
 ) -> Result<()> {
-    let mut cfg = common::set_globals(verbose, quiet)?;
+    install_bins(process)?;
 
-    let toolchain = _install_selection(
-        &mut cfg,
-        toolchain,
-        profile_str,
-        default_host_triple,
-        update_existing_toolchain,
-        components,
-        targets,
-    )?;
+    #[cfg(unix)]
+    unix::do_write_env_files(process)?;
+
+    if !opts.no_modify_path {
+        do_add_to_path(process)?;
+    }
+
+    // If RUSTUP_HOME is not set, make sure it exists
+    if process.var_os("RUSTUP_HOME").is_none() {
+        let home = process
+            .home_dir()
+            .map(|p| p.join(".rustup"))
+            .ok_or_else(|| anyhow::anyhow!("could not find home dir to put .rustup in"))?;
+
+        fs::create_dir_all(home).context("unable to create ~/.rustup")?;
+    }
+
+    let mut cfg = common::set_globals(current_dir, quiet, process)?;
+
+    let (components, targets) = (opts.components, opts.targets);
+    let toolchain = opts.install(&mut cfg)?;
     if let Some(ref desc) = toolchain {
         let status = if Toolchain::exists(&cfg, &desc.into())? {
             warn!("Updating existing toolchain, profile choice will be ignored");
@@ -869,7 +856,9 @@ fn maybe_install_rust(
             // - delete the partial install and start over
             // For now, we error.
             let mut toolchain = DistributableToolchain::new(&cfg, desc.clone())?;
-            toolchain.update(components, targets, cfg.get_profile()?)?
+            toolchain
+                .update(components, targets, cfg.get_profile()?)
+                .await?
         } else {
             DistributableToolchain::install(
                 &cfg,
@@ -878,114 +867,39 @@ fn maybe_install_rust(
                 targets,
                 cfg.get_profile()?,
                 true,
-            )?
+            )
+            .await?
             .0
         };
 
         cfg.set_default(Some(&desc.into()))?;
-        writeln!(process().stdout().lock())?;
+        writeln!(process.stdout().lock())?;
         common::show_channel_update(&cfg, PackageUpdate::Toolchain(desc.clone()), Ok(status))?;
     }
     Ok(())
 }
 
-fn _install_selection(
-    cfg: &mut Cfg,
-    toolchain_opt: Option<MaybeOfficialToolchainName>,
-    profile_str: &str,
-    default_host_triple: Option<&str>,
-    update_existing_toolchain: bool,
-    components: &[&str],
-    targets: &[&str],
-) -> Result<Option<ToolchainDesc>> {
-    cfg.set_profile(profile_str)?;
-
-    if let Some(default_host_triple) = default_host_triple {
-        // Set host triple now as it will affect resolution of toolchain_str
-        info!("setting default host triple to {}", default_host_triple);
-        cfg.set_default_host_triple(default_host_triple)?;
-    } else {
-        info!("default host triple is {}", cfg.get_default_host_triple()?);
-    }
-
-    let user_specified_something = toolchain_opt.is_some()
-        || !targets.is_empty()
-        || !components.is_empty()
-        || update_existing_toolchain;
-
-    // If the user specified they want no toolchain, we skip this, otherwise
-    // if they specify something directly, or we have no default, then we install
-    // a toolchain (updating if it's already present) and then if neither of
-    // those are true, we have a user who doesn't mind, and already has an
-    // install, so we leave their setup alone.
-    Ok(
-        if matches!(toolchain_opt, Some(MaybeOfficialToolchainName::None)) {
-            info!("skipping toolchain installation");
-            if !components.is_empty() {
-                warn!(
-                    "ignoring requested component{}: {}",
-                    if components.len() == 1 { "" } else { "s" },
-                    components.join(", ")
-                );
-            }
-            if !targets.is_empty() {
-                warn!(
-                    "ignoring requested target{}: {}",
-                    if targets.len() == 1 { "" } else { "s" },
-                    targets.join(", ")
-                );
-            }
-            writeln!(process().stdout().lock())?;
-            None
-        } else if user_specified_something
-            || (update_existing_toolchain && cfg.find_default()?.is_none())
-        {
-            match toolchain_opt {
-                Some(s) => {
-                    let toolchain_name = match s {
-                        MaybeOfficialToolchainName::None => unreachable!(),
-                        MaybeOfficialToolchainName::Some(n) => n,
-                    };
-                    Some(toolchain_name.resolve(&cfg.get_default_host_triple()?)?)
-                }
-                None => match cfg.get_default()? {
-                    // Default is installable
-                    Some(ToolchainName::Official(t)) => Some(t),
-                    // Default is custom, presumably from a prior install. Do nothing.
-                    Some(ToolchainName::Custom(_)) => None,
-                    None => Some(
-                        "stable"
-                            .parse::<PartialToolchainDesc>()?
-                            .resolve(&cfg.get_default_host_triple()?)?,
-                    ),
-                },
-            }
-        } else {
-            info!("updating existing rustup installation - leaving toolchains alone");
-            writeln!(process().stdout().lock())?;
-            None
-        },
-    )
-}
-
-pub(crate) fn uninstall(no_prompt: bool) -> Result<utils::ExitCode> {
+pub(crate) fn uninstall(no_prompt: bool, process: &Process) -> Result<utils::ExitCode> {
     if NEVER_SELF_UPDATE {
-        err!("self-uninstall is disabled for this build of rustup");
-        err!("you should probably use your system package manager to uninstall rustup");
+        error!("self-uninstall is disabled for this build of rustup");
+        error!("you should probably use your system package manager to uninstall rustup");
         return Ok(utils::ExitCode(1));
     }
 
-    let cargo_home = utils::cargo_home()?;
+    let cargo_home = process.cargo_home()?;
 
     if !cargo_home.join(format!("bin/rustup{EXE_SUFFIX}")).exists() {
         return Err(CLIError::NotSelfInstalled { p: cargo_home }.into());
     }
 
     if !no_prompt {
-        writeln!(process().stdout().lock())?;
-        let msg = format!(pre_uninstall_msg!(), cargo_home = canonical_cargo_home()?);
-        md(&mut process().stdout().terminal(), msg);
-        if !common::confirm("\nContinue? (y/N)", false)? {
+        writeln!(process.stdout().lock())?;
+        let msg = format!(
+            pre_uninstall_msg!(),
+            cargo_home = canonical_cargo_home(process)?
+        );
+        md(&mut process.stdout().terminal(process), msg);
+        if !common::confirm("\nContinue? (y/N)", false, process)? {
             info!("aborting uninstallation");
             return Ok(utils::ExitCode(0));
         }
@@ -1002,8 +916,7 @@ pub(crate) fn uninstall(no_prompt: bool) -> Result<utils::ExitCode> {
     info!("removing cargo home");
 
     // Remove CARGO_HOME/bin from PATH
-    do_remove_from_path()?;
-    do_remove_from_programs()?;
+    do_remove_from_path(process)?;
 
     // Delete everything in CARGO_HOME *except* the rustup bin
 
@@ -1059,7 +972,7 @@ pub(crate) fn uninstall(no_prompt: bool) -> Result<utils::ExitCode> {
     // Delete rustup. This is tricky because this is *probably*
     // the running executable and on Windows can't be unlinked until
     // the process exits.
-    delete_rustup_and_cargo_home()?;
+    delete_rustup_and_cargo_home(process)?;
 
     info!("rustup is uninstalled");
 
@@ -1081,8 +994,8 @@ pub(crate) fn uninstall(no_prompt: bool) -> Result<utils::ExitCode> {
 /// (and on windows this process will not be running to do it),
 /// rustup-init is stored in `CARGO_HOME`/bin, and then deleted next
 /// time rustup runs.
-pub(crate) fn update(cfg: &Cfg) -> Result<utils::ExitCode> {
-    common::warn_if_host_is_emulated();
+pub(crate) async fn update(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
+    common::warn_if_host_is_emulated(cfg.process);
 
     use common::SelfUpdatePermission::*;
     let update_permitted = if NEVER_SELF_UPDATE {
@@ -1093,10 +1006,11 @@ pub(crate) fn update(cfg: &Cfg) -> Result<utils::ExitCode> {
     match update_permitted {
         HardFail => {
             // TODO: Detect which package manager and be more useful.
-            err!("self-update is disabled for this build of rustup");
-            err!("you should probably use your system package manager to update rustup");
+            error!("self-update is disabled for this build of rustup");
+            error!("you should probably use your system package manager to update rustup");
             return Ok(utils::ExitCode(1));
         }
+        #[cfg(not(windows))]
         Skip => {
             info!("Skipping self-update at this time");
             return Ok(utils::ExitCode(0));
@@ -1104,10 +1018,10 @@ pub(crate) fn update(cfg: &Cfg) -> Result<utils::ExitCode> {
         Permit => {}
     }
 
-    match prepare_update()? {
+    match prepare_update(cfg.process).await? {
         Some(setup_path) => {
             let Some(version) = get_and_parse_new_rustup_version(&setup_path) else {
-                err!("failed to get rustup version");
+                error!("failed to get rustup version");
                 return Ok(utils::ExitCode(1));
             };
 
@@ -1125,7 +1039,7 @@ pub(crate) fn update(cfg: &Cfg) -> Result<utils::ExitCode> {
                 Ok(UpdateStatus::Unchanged),
             );
             // Try again in case we emitted "tool `{}` is already installed" last time.
-            install_proxies()?
+            install_proxies(cfg.process)?
         }
     }
 
@@ -1137,20 +1051,17 @@ fn get_and_parse_new_rustup_version(path: &Path) -> Option<String> {
 }
 
 fn get_new_rustup_version(path: &Path) -> Option<String> {
-    match Command::new(path).arg("--version").output() {
-        Err(_) => None,
-        Ok(output) => match String::from_utf8(output.stdout) {
-            Ok(version) => Some(version),
-            Err(_) => None,
-        },
-    }
+    let output = Command::new(path).arg("--version").output().ok()?;
+    String::from_utf8(output.stdout).ok()
 }
 
 fn parse_new_rustup_version(version: String) -> String {
-    use once_cell::sync::Lazy;
+    use std::sync::LazyLock;
+
     use regex::Regex;
 
-    static RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\d+.\d+.\d+[0-9a-zA-Z-]*").unwrap());
+    static RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"[0-9]+.[0-9]+.[0-9]+[0-9a-zA-Z-]*").unwrap());
 
     let capture = RE.captures(&version);
     let matched_version = match capture {
@@ -1160,8 +1071,8 @@ fn parse_new_rustup_version(version: String) -> String {
     String::from(matched_version)
 }
 
-pub(crate) fn prepare_update() -> Result<Option<PathBuf>> {
-    let cargo_home = utils::cargo_home()?;
+pub(crate) async fn prepare_update(process: &Process) -> Result<Option<PathBuf>> {
+    let cargo_home = process.cargo_home()?;
     let rustup_path = cargo_home.join(format!("bin{MAIN_SEPARATOR}rustup{EXE_SUFFIX}"));
     let setup_path = cargo_home.join(format!("bin{MAIN_SEPARATOR}rustup-init{EXE_SUFFIX}"));
 
@@ -1183,17 +1094,17 @@ pub(crate) fn prepare_update() -> Result<Option<PathBuf>> {
     // If someone really wants to use another version, they still can enforce
     // that using the environment variable RUSTUP_OVERRIDE_HOST_TRIPLE.
     #[cfg(windows)]
-    let triple = dist::TargetTriple::from_host().unwrap_or(triple);
+    let triple = dist::TargetTriple::from_host(process).unwrap_or(triple);
 
     // Get update root.
-    let update_root = update_root();
+    let update_root = update_root(process);
 
     // Get current version
     let current_version = env!("CARGO_PKG_VERSION");
 
     // Get available version
     info!("checking for self-update");
-    let available_version = get_available_rustup_version()?;
+    let available_version = get_available_rustup_version(process).await?;
 
     // If up-to-date
     if available_version == current_version {
@@ -1208,7 +1119,7 @@ pub(crate) fn prepare_update() -> Result<Option<PathBuf>> {
 
     // Download new version
     info!("downloading self-update");
-    utils::download_file(&download_url, &setup_path, None, &|_| ())?;
+    utils::download_file(&download_url, &setup_path, None, &|_| (), process).await?;
 
     // Mark as executable
     utils::make_executable(&setup_path)?;
@@ -1216,8 +1127,8 @@ pub(crate) fn prepare_update() -> Result<Option<PathBuf>> {
     Ok(Some(setup_path))
 }
 
-pub(crate) fn get_available_rustup_version() -> Result<String> {
-    let update_root = update_root();
+async fn get_available_rustup_version(process: &Process) -> Result<String> {
+    let update_root = update_root(process);
     let tempdir = tempfile::Builder::new()
         .prefix("rustup-update")
         .tempdir()
@@ -1227,40 +1138,60 @@ pub(crate) fn get_available_rustup_version() -> Result<String> {
     let release_file_url = format!("{update_root}/release-stable.toml");
     let release_file_url = utils::parse_url(&release_file_url)?;
     let release_file = tempdir.path().join("release-stable.toml");
-    utils::download_file(&release_file_url, &release_file, None, &|_| ())?;
+    utils::download_file(&release_file_url, &release_file, None, &|_| (), process).await?;
     let release_toml_str = utils::read_file("rustup release", &release_file)?;
-    let release_toml: toml::Value =
-        toml::from_str(&release_toml_str).context("unable to parse rustup release file")?;
+    let release_toml = toml::from_str::<RustupManifest>(&release_toml_str)
+        .context("unable to parse rustup release file")?;
 
-    // Check the release file schema.
-    let schema = release_toml
-        .get("schema-version")
-        .ok_or_else(|| anyhow!("no schema key in rustup release file"))?
-        .as_str()
-        .ok_or_else(|| anyhow!("invalid schema key in rustup release file"))?;
-    if schema != "1" {
-        return Err(anyhow!(format!(
-            "unknown schema version '{schema}' in rustup release file"
-        )));
-    }
-
-    // Get the version.
-    let available_version = release_toml
-        .get("version")
-        .ok_or_else(|| anyhow!("no version key in rustup release file"))?
-        .as_str()
-        .ok_or_else(|| anyhow!("invalid version key in rustup release file"))?;
-
-    Ok(String::from(available_version))
+    Ok(release_toml.version)
 }
 
-pub(crate) fn check_rustup_update() -> Result<()> {
-    let mut t = process().stdout().terminal();
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct RustupManifest {
+    schema_version: SchemaVersion,
+    version: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) enum SchemaVersion {
+    #[serde(rename = "1")]
+    #[default]
+    V1,
+}
+
+impl SchemaVersion {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::V1 => "1",
+        }
+    }
+}
+
+impl FromStr for SchemaVersion {
+    type Err = RustupError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "1" => Ok(Self::V1),
+            _ => Err(RustupError::UnsupportedVersion(s.to_owned())),
+        }
+    }
+}
+
+impl fmt::Display for SchemaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+pub(crate) async fn check_rustup_update(process: &Process) -> Result<()> {
+    let mut t = process.stdout().terminal(process);
     // Get current rustup version
     let current_version = env!("CARGO_PKG_VERSION");
 
     // Get available rustup version
-    let available_version = get_available_rustup_version()?;
+    let available_version = get_available_rustup_version(process).await?;
 
     let _ = t.attr(terminalsource::Attr::Bold);
     write!(t.lock(), "rustup - ")?;
@@ -1280,9 +1211,9 @@ pub(crate) fn check_rustup_update() -> Result<()> {
     Ok(())
 }
 
-#[cfg_attr(feature = "otel", tracing::instrument)]
-pub(crate) fn cleanup_self_updater() -> Result<()> {
-    let cargo_home = utils::cargo_home()?;
+#[tracing::instrument(level = "trace")]
+pub(crate) fn cleanup_self_updater(process: &Process) -> Result<()> {
+    let cargo_home = process.cargo_home()?;
     let setup = cargo_home.join(format!("bin/rustup-init{EXE_SUFFIX}"));
 
     if setup.exists() {
@@ -1292,67 +1223,52 @@ pub(crate) fn cleanup_self_updater() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn valid_self_update_modes() -> String {
-    SelfUpdateMode::modes()
-        .iter()
-        .map(|s| format!("'{s}'"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
 
-    use anyhow::Result;
-
-    use rustup_macros::unit_test as test;
-
     use crate::cli::common;
-    use crate::dist::dist::PartialToolchainDesc;
-    use crate::test::{test_dir, with_rustup_home, Env};
-    use crate::{currentprocess, for_host};
+    use crate::cli::self_update::InstallOpts;
+    use crate::dist::{PartialToolchainDesc, Profile};
+    use crate::test::{Env, test_dir, with_rustup_home};
+    use crate::{for_host, process::TestProcess};
 
     #[test]
     fn default_toolchain_is_stable() {
         with_rustup_home(|home| {
             let mut vars = HashMap::new();
             home.apply(&mut vars);
-            let tp = currentprocess::TestProcess {
-                vars,
-                ..Default::default()
+            let tp = TestProcess::with_vars(vars);
+            let mut cfg =
+                common::set_globals(tp.process.current_dir().unwrap(), false, &tp.process).unwrap();
+
+            let opts = InstallOpts {
+                default_host_triple: None,
+                default_toolchain: None,   // No toolchain specified
+                profile: Profile::Default, // default profile
+                no_modify_path: false,
+                components: &[],
+                targets: &[],
+                no_update_toolchain: false,
             };
-            currentprocess::with(tp.clone().into(), || -> Result<()> {
-                // TODO: we could pass in a custom cfg to get notification
-                // callbacks rather than output to the tp sink.
-                let mut cfg = common::set_globals(false, false).unwrap();
-                assert_eq!(
-                    "stable"
-                        .parse::<PartialToolchainDesc>()
-                        .unwrap()
-                        .resolve(&cfg.get_default_host_triple().unwrap())
-                        .unwrap(),
-                    super::_install_selection(
-                        &mut cfg,
-                        None,      // No toolchain specified
-                        "default", // default profile
-                        None,
-                        true,
-                        &[],
-                        &[],
-                    )
+
+            assert_eq!(
+                "stable"
+                    .parse::<PartialToolchainDesc>()
+                    .unwrap()
+                    .resolve(&cfg.get_default_host_triple().unwrap())
+                    .unwrap(),
+                opts.install(&mut cfg)
                     .unwrap() // result
                     .unwrap() // option
-                );
-                Ok(())
-            })?;
+            );
             assert_eq!(
                 for_host!(
                     r"info: profile set to 'default'
 info: default host triple is {0}
 "
                 ),
-                &String::from_utf8(tp.get_stderr()).unwrap()
+                &String::from_utf8(tp.stderr()).unwrap()
             );
             Ok(())
         })
@@ -1365,15 +1281,8 @@ info: default host triple is {0}
         let cargo_home = root_dir.path().join("cargo");
         let mut vars = HashMap::new();
         vars.env("CARGO_HOME", cargo_home.to_string_lossy().to_string());
-        let tp = currentprocess::TestProcess {
-            vars,
-            ..Default::default()
-        };
-        currentprocess::with(tp.into(), || -> Result<()> {
-            super::install_bins().unwrap();
-            Ok(())
-        })
-        .unwrap();
+        let tp = TestProcess::with_vars(vars);
+        super::install_bins(&tp.process).unwrap();
         assert!(cargo_home.exists());
     }
 }

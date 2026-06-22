@@ -55,7 +55,9 @@ pub(crate) static TOOLCHAIN_HELP: &str = r"Discussion:
 
         <channel>[-<date>][-<host>]
 
-        <channel>       = stable|beta|nightly|<major.minor>|<major.minor.patch>
+        <channel>       = stable|beta|nightly|<versioned>[-<prerelease>]
+        <versioned>     = <major.minor>|<major.minor.patch>
+        <prerelease>    = beta[.<number>]
         <date>          = YYYY-MM-DD
         <host>          = <target-triple>
 
@@ -276,8 +278,7 @@ pub(crate) static COMPLETIONS_HELP: &str = r"Discussion:
 
         $ rustup completions zsh cargo > ~/.zfunc/_cargo";
 
-pub(crate) static OFFICIAL_TOOLCHAIN_ARG_HELP: &str =
-    "Toolchain name, such as 'stable', 'nightly', \
+pub(crate) static OFFICIAL_TOOLCHAIN_ARG_HELP: &str = "Toolchain name, such as 'stable', 'nightly', \
                                        or '1.8.0'. For more information see `rustup \
                                        help toolchain`";
 pub(crate) static RESOLVABLE_LOCAL_TOOLCHAIN_ARG_HELP: &str = "Toolchain name, such as 'stable', 'nightly', \

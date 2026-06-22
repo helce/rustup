@@ -66,8 +66,7 @@ use std::{fmt::Debug, fs::OpenOptions};
 
 use anyhow::{Context, Result};
 
-use crate::currentprocess::varsource::VarSource;
-use crate::process;
+use crate::process::Process;
 use crate::utils::notifications::Notification;
 use threaded::PoolReference;
 
@@ -82,14 +81,14 @@ pub(crate) enum FileBuffer {
 impl FileBuffer {
     /// All the buffers space to be re-used when the last reference to it is dropped.
     pub(crate) fn clear(&mut self) {
-        if let FileBuffer::Threaded(ref mut contents) = self {
+        if let FileBuffer::Threaded(contents) = self {
             contents.clear()
         }
     }
 
     pub(crate) fn len(&self) -> usize {
         match self {
-            FileBuffer::Immediate(ref vec) => vec.len(),
+            FileBuffer::Immediate(vec) => vec.len(),
             FileBuffer::Threaded(PoolReference::Owned(owned, _)) => owned.len(),
             FileBuffer::Threaded(PoolReference::Mut(mutable, _)) => mutable.len(),
         }
@@ -110,7 +109,7 @@ impl Deref for FileBuffer {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            FileBuffer::Immediate(ref vec) => vec,
+            FileBuffer::Immediate(vec) => vec,
             FileBuffer::Threaded(PoolReference::Owned(owned, _)) => owned,
             FileBuffer::Threaded(PoolReference::Mut(mutable, _)) => mutable,
         }
@@ -120,7 +119,7 @@ impl Deref for FileBuffer {
 impl DerefMut for FileBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            FileBuffer::Immediate(ref mut vec) => vec,
+            FileBuffer::Immediate(vec) => vec,
             FileBuffer::Threaded(PoolReference::Owned(_, _)) => {
                 unimplemented!()
             }
@@ -338,15 +337,11 @@ pub(crate) fn perform<F: Fn(usize)>(item: &mut Item, chunk_complete_callback: F)
     // Files, write them.
     item.result = match &mut item.kind {
         Kind::Directory => create_dir(&item.full_path),
-        Kind::File(ref mut contents) => {
+        Kind::File(contents) => {
             contents.clear();
             match contents {
-                FileBuffer::Immediate(ref contents) => {
-                    write_file(&item.full_path, contents, item.mode)
-                }
-                FileBuffer::Threaded(ref mut contents) => {
-                    write_file(&item.full_path, contents, item.mode)
-                }
+                FileBuffer::Immediate(contents) => write_file(&item.full_path, contents, item.mode),
+                FileBuffer::Threaded(contents) => write_file(&item.full_path, contents, item.mode),
             }
         }
         Kind::IncrementalFile(incremental_file) => write_file_incremental(
@@ -451,9 +446,10 @@ pub(crate) fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 pub(crate) fn get_executor<'a>(
     notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
     ram_budget: usize,
+    process: &Process,
 ) -> Result<Box<dyn Executor + 'a>> {
     // If this gets lots of use, consider exposing via the config file.
-    let thread_count = match process().var("RUSTUP_IO_THREADS") {
+    let thread_count = match process.var("RUSTUP_IO_THREADS") {
         Err(_) => available_parallelism().map(|p| p.get()).unwrap_or(1),
         Ok(n) => n
             .parse::<usize>()

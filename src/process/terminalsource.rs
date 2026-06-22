@@ -9,9 +9,9 @@ use std::{
 pub(crate) use termcolor::Color;
 use termcolor::{ColorChoice, ColorSpec, StandardStream, StandardStreamLock, WriteColor};
 
+use super::Process;
 #[cfg(feature = "test")]
 use super::filesource::{TestWriter, TestWriterLock};
-use super::{process, varsource::VarSource};
 
 /// Select what stream to make a terminal on
 pub(super) enum StreamSelector {
@@ -24,17 +24,17 @@ pub(super) enum StreamSelector {
 }
 
 impl StreamSelector {
-    fn is_a_tty(&self) -> bool {
+    fn is_a_tty(&self, process: &Process) -> bool {
         match self {
-            StreamSelector::Stdout => match process() {
-                super::Process::OSProcess(p) => p.stdout_is_a_tty,
+            StreamSelector::Stdout => match process {
+                Process::OsProcess(p) => p.stdout_is_a_tty,
                 #[cfg(feature = "test")]
-                super::Process::TestProcess(_) => unreachable!(),
+                Process::TestProcess(_) => unreachable!(),
             },
-            StreamSelector::Stderr => match process() {
-                super::Process::OSProcess(p) => p.stderr_is_a_tty,
+            StreamSelector::Stderr => match process {
+                Process::OsProcess(p) => p.stderr_is_a_tty,
                 #[cfg(feature = "test")]
-                super::Process::TestProcess(_) => unreachable!(),
+                Process::TestProcess(_) => unreachable!(),
             },
             #[cfg(feature = "test")]
             StreamSelector::TestWriter(_) => false,
@@ -83,14 +83,11 @@ impl ColorableTerminal {
     /// `RUSTUP_TERM_COLOR` either unset or set to `auto`,
     /// then color commands will be sent to the stream.
     /// Otherwise color commands are discarded.
-    pub(super) fn new(stream: StreamSelector) -> Self {
-        let env_override = process()
-            .var("RUSTUP_TERM_COLOR")
-            .map(|it| it.to_lowercase());
-        let choice = match env_override.as_deref() {
-            Ok("always") => ColorChoice::Always,
-            Ok("never") => ColorChoice::Never,
-            _ if stream.is_a_tty() => ColorChoice::Auto,
+    pub(super) fn new(stream: StreamSelector, process: &Process) -> Self {
+        let choice = match process.var("RUSTUP_TERM_COLOR") {
+            Ok(s) if s.eq_ignore_ascii_case("always") => ColorChoice::Always,
+            Ok(s) if s.eq_ignore_ascii_case("never") => ColorChoice::Never,
+            _ if stream.is_a_tty(process) => ColorChoice::Auto,
             _ => ColorChoice::Never,
         };
         let inner = match stream {
@@ -142,17 +139,6 @@ impl ColorableTerminal {
         match self.inner.lock().unwrap().deref_mut() {
             TerminalInner::StandardStream(s, spec) => {
                 spec.set_fg(Some(color));
-                s.set_color(spec)
-            }
-            #[cfg(feature = "test")]
-            TerminalInner::TestWriter(_, _) => Ok(()),
-        }
-    }
-
-    pub fn bg(&mut self, color: Color) -> io::Result<()> {
-        match self.inner.lock().unwrap().deref_mut() {
-            TerminalInner::StandardStream(s, spec) => {
-                spec.set_bg(Some(color));
                 s.set_color(spec)
             }
             #[cfg(feature = "test")]
@@ -241,28 +227,23 @@ impl io::Write for ColorableTerminalLocked {
 mod tests {
     use std::collections::HashMap;
 
-    use rustup_macros::unit_test as test;
-
     use super::*;
-    use crate::{currentprocess, test::Env};
+    use crate::process::TestProcess;
+    use crate::test::Env;
 
     #[test]
     fn term_color_choice() {
         fn assert_color_choice(env_val: &str, stream: StreamSelector, color_choice: ColorChoice) {
             let mut vars = HashMap::new();
             vars.env("RUSTUP_TERM_COLOR", env_val);
-            let tp = currentprocess::TestProcess {
-                vars,
-                ..Default::default()
-            };
-            currentprocess::with(tp.into(), || {
-                let term = ColorableTerminal::new(stream);
-                let inner = term.inner.lock().unwrap();
-                assert!(matches!(
-                    &*inner,
-                    &TerminalInner::TestWriter(_, choice) if choice == color_choice
-                ));
-            });
+            let tp = TestProcess::with_vars(vars);
+
+            let term = ColorableTerminal::new(stream, &tp.process);
+            let inner = term.inner.lock().unwrap();
+            assert!(matches!(
+                &*inner,
+                &TerminalInner::TestWriter(_, choice) if choice == color_choice
+            ));
         }
 
         assert_color_choice(

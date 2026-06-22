@@ -7,20 +7,32 @@ export RUST_BACKTRACE=1
 rustc -vV
 cargo -vV
 
+if [ -n "$INSTALL_BINDGEN" ]; then
+  if ! curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rust-lang/rust-bindgen/releases/latest/download/bindgen-cli-installer.sh | sh -s -- --no-modify-path \
+    | grep "everything's installed!";
+    # Ignoring exit code since the script might fail to write the receipt after a successful installation.
+  then
+    cargo install --force --locked bindgen-cli
+  fi
+  mkdir "$CARGO_HOME"/bin/bindgen-cli
+  mv "$CARGO_HOME"/bin/bindgen "$CARGO_HOME"/bin/bindgen-cli/
+  export PATH="$CARGO_HOME/bin/bindgen-cli:$PATH"
+fi
 
-FEATURES=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-default-tls')
+
+FEATURES=('--no-default-features' '--features' 'curl-backend,reqwest-native-tls')
 case "$(uname -s)" in
   *NT* ) ;; # Windows NT
   * ) FEATURES+=('--features' 'vendored-openssl') ;;
 esac
 
 case "$TARGET" in
-  # these platforms aren't supported by ring:
-  powerpc* ) ;;
+  # these platforms aren't supported by aws-lc-rs:
+  powerpc64* ) ;;
   mips* ) ;;
-  riscv* ) ;;
-  s390x* ) ;;
-  aarch64-pc-windows-msvc ) ;;
+  loongarch* ) ;;
+  *netbsd* ) ;;
+  *illumos* ) ;;
   # default case, build with rustls enabled
   * ) FEATURES+=('--features' 'reqwest-rustls-tls') ;;
 esac
@@ -39,14 +51,13 @@ target_cargo() {
 target_cargo build
 
 download_pkg_test() {
-  features=('--no-default-features' '--features' 'curl-backend,reqwest-backend,reqwest-default-tls')
+  features=('--no-default-features' '--features' 'curl-backend,reqwest-native-tls')
   case "$TARGET" in
     # these platforms aren't supported by ring:
     powerpc* ) ;;
     mips* ) ;;
     riscv* ) ;;
     s390x* ) ;;
-    aarch64-pc-windows-msvc ) ;;
     # default case, build with rustls enabled
     * ) features+=('--features' 'reqwest-rustls-tls') ;;
   esac
@@ -66,18 +77,13 @@ build_test() {
   if [ "build" = "${cmd}" ]; then
     target_cargo "${cmd}" --workspace --all-targets --features test
   else
-    #  free runners have 2 or 3(mac) cores
-    target_cargo "${cmd}" --workspace --features test --tests -- --test-threads 2
-  fi
-
-  if [ "build" != "${cmd}" ]; then
+    target_cargo "${cmd}" --workspace --features test --tests
     target_cargo "${cmd}" --doc --workspace --features test
   fi
-
 }
 
 if [ -z "$SKIP_TESTS" ]; then
-  cargo run --locked --profile "$BUILD_PROFILE" --features test --target "$TARGET" "${FEATURES[@]}" -- --dump-testament
+  target_cargo run --features test -- --dump-testament
   build_test build
-  build_test test
+  RUSTUP_CI=1 build_test test
 fi

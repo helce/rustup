@@ -5,10 +5,13 @@ jobs: # skip-master skip-pr skip-stable
   build-linux-pr: # job-name skip-master skip-stable
   build-linux-master: # job-name skip-pr skip-stable
   build-linux-stable: # job-name skip-master skip-pr
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-master skip-stable
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') || github.event_name == 'schedule' }} # skip-pr skip-stable
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' }} # skip-pr skip-master
+    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') }} # skip-pr skip-stable
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-master
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -19,33 +22,37 @@ jobs: # skip-master skip-pr skip-stable
           - x86_64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - aarch64-linux-android
-          - aarch64-unknown-linux-gnu     # skip-pr
-          - aarch64-unknown-linux-musl    # skip-pr skip-master
-          - powerpc64-unknown-linux-gnu   # skip-pr
-          - x86_64-unknown-linux-musl     # skip-pr
-          - i686-unknown-linux-gnu        # skip-pr skip-master
-          - arm-unknown-linux-gnueabi     # skip-pr skip-master
-          - arm-unknown-linux-gnueabihf   # skip-pr skip-master
-          - x86_64-unknown-freebsd        # skip-pr skip-master
-          - x86_64-unknown-netbsd         # skip-pr skip-master
-          - x86_64-unknown-illumos        # skip-pr skip-master
-          - powerpc-unknown-linux-gnu     # skip-pr skip-master
-          - powerpc64le-unknown-linux-gnu # skip-pr skip-master
-          - s390x-unknown-linux-gnu       # skip-pr skip-master
-          - arm-linux-androideabi         # skip-pr skip-master
-          - armv7-linux-androideabi       # skip-pr skip-master
-          - i686-linux-android            # skip-pr skip-master
-          - x86_64-linux-android          # skip-pr skip-master
-          - riscv64gc-unknown-linux-gnu   # skip-pr skip-master
-          - loongarch64-unknown-linux-gnu # skip-pr skip-master
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl     # skip-pr skip-master
+          - powerpc64-unknown-linux-gnu    # skip-pr
+          - x86_64-unknown-linux-musl      # skip-pr
+          - i686-unknown-linux-gnu         # skip-pr skip-master
+          - arm-unknown-linux-gnueabi      # skip-pr skip-master
+          - arm-unknown-linux-gnueabihf    # skip-pr skip-master
+          - x86_64-unknown-freebsd         # skip-pr skip-master
+          - x86_64-unknown-netbsd          # skip-pr skip-master
+          - x86_64-unknown-illumos         # skip-pr skip-master
+          - powerpc-unknown-linux-gnu      # skip-pr skip-master
+          - powerpc64le-unknown-linux-gnu  # skip-pr skip-master
+          - s390x-unknown-linux-gnu        # skip-pr skip-master
+          - arm-linux-androideabi          # skip-pr skip-master
+          - armv7-linux-androideabi        # skip-pr skip-master
+          - x86_64-linux-android           # skip-pr skip-master
+          - riscv64gc-unknown-linux-gnu    # skip-pr skip-master
+          - loongarch64-unknown-linux-gnu  # skip-pr skip-master
+          - loongarch64-unknown-linux-musl # skip-pr skip-master
         include:
           - target: x86_64-unknown-linux-gnu
             run_tests: YES
             #snap_arch: amd64
           - target: i686-unknown-linux-gnu # skip-pr skip-master
             #snap_arch: i386  # skip-pr skip-master
-          - target: aarch64-unknown-linux-gnu # skip-pr
-            #snap_arch: arm64 # skip-pr
+            # We add an ARM-based host to the following target.
+            # We need to do that because rust's CI uses ARM-based runners
+            # to generate their Dockerfiles.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            run_tests: YES
           - target: armv7-unknown-linux-gnueabihf
             #snap_arch: armhf
           - target: powerpc64le-unknown-linux-gnu # skip-pr skip-master
@@ -134,6 +141,7 @@ jobs: # skip-master skip-pr skip-stable
             --env LIBZ_SYS_STATIC=1 \
             --env SKIP_TESTS="${SKIP_TESTS}" \
             --env TARGET="${TARGET}" \
+            --env INSTALL_BINDGEN=1 \
             --init \
             --rm \
             --tty \
@@ -154,12 +162,12 @@ jobs: # skip-master skip-pr skip-stable
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -170,6 +178,18 @@ jobs: # skip-master skip-pr skip-stable
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean

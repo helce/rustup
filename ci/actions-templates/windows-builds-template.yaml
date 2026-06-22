@@ -7,10 +7,14 @@ jobs: # skip-master skip-pr skip-stable
   build-windows-stable: # job-name skip-master skip-pr
     runs-on: windows-latest
     if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-master skip-stable
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') || github.event_name == 'schedule' }} # skip-pr skip-stable
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' }} # skip-pr skip-master
+    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') }} # skip-pr skip-stable
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-master
     env:
       RUSTFLAGS: -Ctarget-feature=+crt-static
+      RUST_MIN_STACK: 16777216
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -20,18 +24,20 @@ jobs: # skip-master skip-pr skip-stable
         target:
           - x86_64-pc-windows-msvc
           - i686-pc-windows-msvc # skip-pr skip-master
-          - aarch64-pc-windows-msvc # skip-pr
-          - x86_64-pc-windows-gnu # skip-pr
+          - aarch64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
           - i686-pc-windows-gnu # skip-pr skip-master
         include:
           - target: x86_64-pc-windows-msvc
             run_tests: YES
-          - target: x86_64-pc-windows-gnu # skip-pr
-            mingw: https://ci-mirrors.rust-lang.org/rustc/x86_64-6.3.0-release-posix-seh-rt_v5-rev2.7z # skip-pr
-            mingwdir: mingw64 # skip-pr
+          - target: x86_64-pc-windows-gnu
+            arch: x86_64
+            mingwdir: mingw64
+            gcc: x86_64-w64-mingw32-gcc
           - target: i686-pc-windows-gnu # skip-pr skip-master
+            arch: i686 # skip-pr skip-master
             mingwdir: mingw32 # skip-pr skip-master
-            mingw: https://ci-mirrors.rust-lang.org/rustc/i686-6.3.0-release-posix-dwarf-rt_v5-rev2.7z # skip-pr skip-master
+            gcc: i686-w64-mingw32-gcc # skip-pr skip-master
     steps:
       - uses: actions/checkout@v4
         # v2 defaults to a shallow checkout, but we need at least to the previous tag
@@ -49,18 +55,22 @@ jobs: # skip-master skip-pr skip-stable
           New-Item "${env:USERPROFILE}\.cargo\registry" -ItemType Directory -Force
           New-Item "${env:USERPROFILE}\.cargo\git" -ItemType Directory -Force
         shell: powershell
+      - name: Install NASM
+        # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
+        # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
+        uses: ilammy/setup-nasm@v1
+        if: matrix.mingwdir == ''
       - name: Install mingw
-        run: |
-          # We retrieve mingw from the Rust CI buckets
-          # Disable the download progress bar which can cause perf issues
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest ${{ matrix.mingw }} -OutFile mingw.7z
-          7z x -y mingw.7z -oC:\msys64 | Out-Null
-          del mingw.7z
-          echo "C:\msys64\usr\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          echo "C:\msys64\${{ matrix.mingwdir }}\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+        uses: bwoodsend/setup-winlibs-action@v1
+        if: matrix.mingwdir != ''
+        with:
+          architecture: ${{ matrix.arch }}
+      - name: Verify mingw gcc installation
         shell: powershell
-        if: matrix.mingw != ''
+        if: matrix.mingwdir != ''
+        run: |
+          Get-Command ${{ matrix.gcc }}
+          ${{ matrix.gcc }} --version
       - name: Set PATH
         run: |
           echo "%USERPROFILE%\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
@@ -116,7 +126,7 @@ jobs: # skip-master skip-pr skip-stable
           cargo check --all --all-targets --features test
           git ls-files -- '*.rs' | xargs touch
       - name: Run cargo clippy
-        if: matrix.mode != 'release' && matrix.mingw == ''
+        if: matrix.mode != 'release' && matrix.mingwdir == ''
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -129,12 +139,13 @@ jobs: # skip-master skip-pr skip-stable
           path: |
             target/${{ matrix.target }}/release/rustup-init.exe
           retention-days: 7
-      - name: Acquire the AWS tooling
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+      - name: Ensure that awscli is installed
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
-          choco upgrade awscli
+          Get-Command aws
+          aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           .\ci\prepare-deploy.ps1
         shell: powershell
@@ -146,6 +157,18 @@ jobs: # skip-master skip-pr skip-stable
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive dist s3://rustup-builds/${{ github.sha }}/dist
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean

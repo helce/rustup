@@ -1,18 +1,20 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
     "extends": [
-        "config:base"
+        "config:recommended",
+        "customManagers:githubActionsVersions"
     ],
     "labels": [
         "dependencies"
     ],
     "lockFileMaintenance": {
         "enabled": true,
-        "automerge": true
+        "automerge": false,
+        "schedule": "before 4am on Monday"
     },
-    "prCreation": "not-pending",
+    "prCreation": "immediate",
     "rangeStrategy": "update-lockfile",
-    "stabilityDays": 3,
+    "minimumReleaseAge": "3 days",
     "github-actions": {
         "fileMatch": [
             "^ci\\/.*/[^/]+\\.ya?ml$"
@@ -20,21 +22,29 @@
     },
     "packageRules": [
         {
-            "matchManagers": ["cargo"],
-            "matchUpdateTypes": ["patch"],
+            "matchManagers": [
+                "cargo"
+            ],
+            "matchUpdateTypes": [
+                "patch"
+            ],
             "enabled": false
         },
         {
-            "matchManagers": ["cargo"],
-            "matchUpdateTypes": ["minor"],
+            "matchManagers": [
+                "cargo"
+            ],
+            "matchUpdateTypes": [
+                "minor"
+            ],
             "matchCurrentVersion": "!/^0/",
             "enabled": false
         },
         {
-            "matchPackagePatterns": [
-                "opentelemetry"
-            ],
-            "groupName": "opentelemetry"
+            "groupName": "opentelemetry",
+            "matchPackageNames": [
+                "/opentelemetry/"
+            ]
         }
     ]
 }

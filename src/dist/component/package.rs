@@ -8,18 +8,17 @@ use std::io::{self, ErrorKind as IOErrorKind, Read};
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tar::EntryType;
+use tracing::warn;
 
-use crate::currentprocess::{filesource::StderrSource, varsource::VarSource};
-use crate::diskio::{get_executor, CompletedIo, Executor, FileBuffer, Item, Kind, IO_CHUNK_SIZE};
+use crate::diskio::{CompletedIo, Executor, FileBuffer, IO_CHUNK_SIZE, Item, Kind, get_executor};
 use crate::dist::component::components::*;
 use crate::dist::component::transaction::*;
 use crate::dist::temp;
 use crate::errors::*;
-use crate::process;
-use crate::utils::notifications::Notification;
-use crate::utils::utils;
+use crate::process::Process;
+use crate::utils::{self, Notification};
 
 /// The current metadata revision used by rust-installer
 pub(crate) const INSTALLER_VERSION: &str = "3";
@@ -104,18 +103,18 @@ impl Package for DirectoryPackage {
             let part = ComponentPart::decode(l)
                 .ok_or_else(|| RustupError::CorruptComponent(name.to_owned()))?;
 
-            let path = part.1;
+            let path = part.path;
             let src_path = root.join(&path);
 
-            match &*part.0 {
-                "file" => {
+            match part.kind {
+                ComponentPartKind::File => {
                     if self.copy {
                         builder.copy_file(path.clone(), &src_path)?
                     } else {
                         builder.move_file(path.clone(), &src_path)?
                     }
                 }
-                "dir" => {
+                ComponentPartKind::Dir => {
                     if self.copy {
                         builder.copy_dir(path.clone(), &src_path)?
                     } else {
@@ -145,13 +144,14 @@ impl<'a> TarPackage<'a> {
         stream: R,
         tmp_cx: &'a temp::Context,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+        process: &Process,
     ) -> Result<Self> {
         let temp_dir = tmp_cx.new_directory()?;
         let mut archive = tar::Archive::new(stream);
         // The rust-installer packages unpack to a directory called
         // $pkgname-$version-$target. Skip that directory when
         // unpacking.
-        unpack_without_first_dir(&mut archive, &temp_dir, notify_handler)
+        unpack_without_first_dir(&mut archive, &temp_dir, notify_handler, process)
             .context("failed to extract package")?;
 
         Ok(TarPackage(
@@ -166,6 +166,7 @@ fn unpack_ram(
     io_chunk_size: usize,
     effective_max_ram: Option<usize>,
     notify_handler: Option<&dyn Fn(Notification<'_>)>,
+    process: &Process,
 ) -> usize {
     const RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS: usize = 200 * 1024 * 1024;
     let minimum_ram = io_chunk_size * 2;
@@ -179,7 +180,7 @@ fn unpack_ram(
         // Rustup does not know how much RAM the machine has: use the minimum
         minimum_ram
     };
-    let unpack_ram = match process()
+    let unpack_ram = match process
         .var("RUSTUP_UNPACK_RAM")
         .ok()
         .and_then(|budget_str| budget_str.parse::<usize>().ok())
@@ -228,10 +229,9 @@ fn filter_result(op: &mut CompletedIo) -> io::Result<()> {
                     // mkdir of e.g. ~/.rustup already existing is just fine;
                     // for others it would be better to know whether it is
                     // expected to exist or not -so put a flag in the state.
-                    if let Kind::Directory = op.kind {
-                        Ok(())
-                    } else {
-                        Err(e)
+                    match op.kind {
+                        Kind::Directory => Ok(()),
+                        _ => Err(e),
                     }
                 }
                 _ => Err(e),
@@ -290,6 +290,7 @@ fn unpack_without_first_dir<R: Read>(
     archive: &mut tar::Archive<R>,
     path: &Path,
     notify_handler: Option<&dyn Fn(Notification<'_>)>,
+    process: &Process,
 ) -> Result<()> {
     let entries = archive.entries()?;
     let effective_max_ram = match effective_limits::memory_limit() {
@@ -301,8 +302,8 @@ fn unpack_without_first_dir<R: Read>(
             None
         }
     };
-    let unpack_ram = unpack_ram(IO_CHUNK_SIZE, effective_max_ram, notify_handler);
-    let mut io_executor: Box<dyn Executor> = get_executor(notify_handler, unpack_ram)?;
+    let unpack_ram = unpack_ram(IO_CHUNK_SIZE, effective_max_ram, notify_handler, process);
+    let mut io_executor: Box<dyn Executor> = get_executor(notify_handler, unpack_ram, process)?;
 
     let mut directories: HashMap<PathBuf, DirStatus> = HashMap::new();
     // Path is presumed to exist. Call it a precondition.
@@ -452,40 +453,40 @@ fn unpack_without_first_dir<R: Read>(
 
         let item = loop {
             // Create the full path to the entry if it does not exist already
-            if let Some(parent) = item.full_path.to_owned().parent() {
-                match directories.get_mut(parent) {
-                    None => {
-                        // Tar has item before containing directory
-                        // Complain about this so we can see if these exist.
-                        writeln!(
-                            process().stderr().lock(),
-                            "Unexpected: missing parent '{}' for '{}'",
-                            parent.display(),
-                            entry.path()?.display()
-                        )?;
-                        directories.insert(parent.to_owned(), DirStatus::Pending(vec![item]));
-                        item = Item::make_dir(parent.to_owned(), 0o755);
-                        // Check the parent's parent
-                        continue;
-                    }
-                    Some(DirStatus::Exists) => {
-                        break Some(item);
-                    }
-                    Some(DirStatus::Pending(pending)) => {
-                        // Parent dir is being made
-                        pending.push(item);
-                        if incremental_file_sender.is_none() {
-                            // take next item from tar
-                            continue 'entries;
-                        } else {
-                            // don't submit a new item for processing, but do be ready to feed data to the incremental file.
-                            break None;
-                        }
+            let full_path = item.full_path.to_owned();
+            let Some(parent) = full_path.parent() else {
+                // We should never see a path with no parent.
+                unreachable!()
+            };
+            match directories.get_mut(parent) {
+                None => {
+                    // Tar has item before containing directory
+                    // Complain about this so we can see if these exist.
+                    writeln!(
+                        process.stderr().lock(),
+                        "Unexpected: missing parent '{}' for '{}'",
+                        parent.display(),
+                        entry.path()?.display()
+                    )?;
+                    directories.insert(parent.to_owned(), DirStatus::Pending(vec![item]));
+                    item = Item::make_dir(parent.to_owned(), 0o755);
+                    // Check the parent's parent
+                    continue;
+                }
+                Some(DirStatus::Exists) => {
+                    break Some(item);
+                }
+                Some(DirStatus::Pending(pending)) => {
+                    // Parent dir is being made
+                    pending.push(item);
+                    if incremental_file_sender.is_none() {
+                        // take next item from tar
+                        continue 'entries;
+                    } else {
+                        // don't submit a new item for processing, but do be ready to feed data to the incremental file.
+                        break None;
                     }
                 }
-            } else {
-                // We should never see a path with no parent.
-                panic!();
             }
         };
 
@@ -531,7 +532,7 @@ fn unpack_without_first_dir<R: Read>(
     Ok(())
 }
 
-impl<'a> Package for TarPackage<'a> {
+impl Package for TarPackage<'_> {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.0.contains(component, short_name)
     }
@@ -557,17 +558,19 @@ impl<'a> TarGzPackage<'a> {
         stream: R,
         tmp_cx: &'a temp::Context,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+        process: &Process,
     ) -> Result<Self> {
         let stream = flate2::read::GzDecoder::new(stream);
         Ok(TarGzPackage(TarPackage::new(
             stream,
             tmp_cx,
             notify_handler,
+            process,
         )?))
     }
 }
 
-impl<'a> Package for TarGzPackage<'a> {
+impl Package for TarGzPackage<'_> {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.0.contains(component, short_name)
     }
@@ -593,17 +596,19 @@ impl<'a> TarXzPackage<'a> {
         stream: R,
         tmp_cx: &'a temp::Context,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+        process: &Process,
     ) -> Result<Self> {
         let stream = xz2::read::XzDecoder::new(stream);
         Ok(TarXzPackage(TarPackage::new(
             stream,
             tmp_cx,
             notify_handler,
+            process,
         )?))
     }
 }
 
-impl<'a> Package for TarXzPackage<'a> {
+impl Package for TarXzPackage<'_> {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.0.contains(component, short_name)
     }
@@ -629,17 +634,19 @@ impl<'a> TarZStdPackage<'a> {
         stream: R,
         tmp_cx: &'a temp::Context,
         notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
+        process: &Process,
     ) -> Result<Self> {
         let stream = zstd::stream::read::Decoder::new(stream)?;
         Ok(TarZStdPackage(TarPackage::new(
             stream,
             tmp_cx,
             notify_handler,
+            process,
         )?))
     }
 }
 
-impl<'a> Package for TarZStdPackage<'a> {
+impl Package for TarZStdPackage<'_> {
     fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.0.contains(component, short_name)
     }

@@ -1,51 +1,53 @@
-use std::{
-    convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, fs, path::Path, process::Command,
-};
+#[cfg(windows)]
+use std::fs;
+use std::{convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, path::Path, process::Command};
 
-use anyhow::{anyhow, Context};
+#[cfg(windows)]
+use anyhow::Context;
+use anyhow::anyhow;
 
 use crate::{
-    component_for_bin,
+    RustupError, component_for_bin,
     config::Cfg,
     dist::{
+        DistOptions, PartialToolchainDesc, Profile, ToolchainDesc,
         config::Config,
-        dist::{Profile, ToolchainDesc},
         manifest::{Component, ComponentStatus, Manifest},
         manifestation::{Changes, Manifestation},
         prefix::InstallPrefix,
     },
     install::{InstallMethod, UpdateStatus},
-    notifications::Notification,
-    RustupError,
 };
 
 use super::{
+    Toolchain,
     names::{LocalToolchainName, ToolchainName},
-    toolchain::{InstalledPath, Toolchain},
 };
 
 /// An official toolchain installed on the local disk
 #[derive(Debug)]
 pub(crate) struct DistributableToolchain<'a> {
-    toolchain: Toolchain<'a>,
-    cfg: &'a Cfg,
+    pub(super) toolchain: Toolchain<'a>,
     desc: ToolchainDesc,
 }
 
 impl<'a> DistributableToolchain<'a> {
-    pub(crate) fn new(cfg: &'a Cfg, desc: ToolchainDesc) -> Result<Self, RustupError> {
-        Toolchain::new(cfg, (&desc).into()).map(|toolchain| Self {
-            toolchain,
-            cfg,
-            desc,
-        })
+    pub(crate) fn from_partial(
+        toolchain: Option<PartialToolchainDesc>,
+        cfg: &'a Cfg<'a>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::try_from(&cfg.toolchain_from_partial(toolchain)?)?)
+    }
+
+    pub(crate) fn new(cfg: &'a Cfg<'a>, desc: ToolchainDesc) -> Result<Self, RustupError> {
+        Toolchain::new(cfg, (&desc).into()).map(|toolchain| Self { toolchain, desc })
     }
 
     pub(crate) fn desc(&self) -> &ToolchainDesc {
         &self.desc
     }
 
-    pub(crate) fn add_component(&self, mut component: Component) -> anyhow::Result<()> {
+    pub(crate) async fn add_component(&self, mut component: Component) -> anyhow::Result<()> {
         // TODO: take multiple components?
         let manifestation = self.get_manifestation()?;
         let manifest = self.get_manifest()?;
@@ -100,17 +102,19 @@ impl<'a> DistributableToolchain<'a> {
         };
 
         let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.cfg.notify_handler)(n.into());
-        let download_cfg = self.cfg.download_cfg(&notify_handler);
+            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
+        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
 
-        manifestation.update(
-            &manifest,
-            changes,
-            false,
-            &download_cfg,
-            &self.desc.manifest_name(),
-            false,
-        )?;
+        manifestation
+            .update(
+                &manifest,
+                changes,
+                false,
+                &download_cfg,
+                &self.desc.manifest_name(),
+                false,
+            )
+            .await?;
 
         Ok(())
     }
@@ -192,19 +196,21 @@ impl<'a> DistributableToolchain<'a> {
         // directory for the exe to spawn before searching PATH, and we don't want
         // it to do that, because cargo's directory contains the _wrong_ rustc. See
         // the documentation for the lpCommandLine argument of CreateProcess.
-        let exe_path = if cfg!(windows) {
-            let fallback_dir = self.cfg.rustup_dir.join("fallback");
+        #[cfg(windows)]
+        let exe_path = {
+            let fallback_dir = self.toolchain.cfg.rustup_dir.join("fallback");
             fs::create_dir_all(&fallback_dir)
                 .context("unable to create dir to hold fallback exe")?;
             let fallback_file = fallback_dir.join("cargo.exe");
             if fallback_file.exists() {
                 fs::remove_file(&fallback_file).context("unable to unlink old fallback exe")?;
             }
-            fs::hard_link(&src_file, &fallback_file).context("unable to hard link fallback exe")?;
+            fs::hard_link(src_file, &fallback_file).context("unable to hard link fallback exe")?;
             fallback_file
-        } else {
-            src_file
         };
+        #[cfg(not(windows))]
+        let exe_path = src_file;
+
         let mut cmd = Command::new(exe_path);
         installed_primary.set_env(&mut cmd); // set up the environment to match rustc, not cargo
         cmd.env("RUSTUP_TOOLCHAIN", installed_primary.name().to_string());
@@ -295,14 +301,14 @@ impl<'a> DistributableToolchain<'a> {
         }
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn get_manifestation(&self) -> anyhow::Result<Manifestation> {
         let prefix = InstallPrefix::from(self.toolchain.path());
         Manifestation::open(prefix, self.desc.target.clone())
     }
 
     /// Get the manifest associated with this distribution
-    #[cfg_attr(feature = "otel", tracing::instrument(skip_all))]
+    #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) fn get_manifest(&self) -> anyhow::Result<Manifest> {
         self.get_manifestation()?
             .load_manifest()
@@ -318,21 +324,21 @@ impl<'a> DistributableToolchain<'a> {
         InstallPrefix::from(self.toolchain.path().to_owned()).guess_v1_manifest()
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument(err, skip_all))]
-    pub(crate) fn install(
-        cfg: &'a Cfg,
-        desc: &'_ ToolchainDesc,
+    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
+    pub(crate) async fn install(
+        cfg: &'a Cfg<'a>,
+        toolchain: &ToolchainDesc,
         components: &[&str],
         targets: &[&str],
         profile: Profile,
         force: bool,
     ) -> anyhow::Result<(UpdateStatus, DistributableToolchain<'a>)> {
-        let hash_path = cfg.get_hash_file(desc, true)?;
+        let hash_path = cfg.get_hash_file(toolchain, true)?;
         let update_hash = Some(&hash_path as &Path);
 
-        let status = InstallMethod::Dist {
+        let status = InstallMethod::Dist(DistOptions {
             cfg,
-            desc,
+            toolchain,
             profile,
             update_hash,
             dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
@@ -342,38 +348,26 @@ impl<'a> DistributableToolchain<'a> {
             old_date_version: None,
             components,
             targets,
-        }
-        .install()?;
-        Ok((status, Self::new(cfg, desc.clone())?))
+        })
+        .install()
+        .await?;
+        Ok((status, Self::new(cfg, toolchain.clone())?))
     }
 
-    #[cfg_attr(feature = "otel", tracing::instrument(err, skip_all))]
-    pub fn install_if_not_installed(
-        cfg: &'a Cfg,
-        desc: &'a ToolchainDesc,
-    ) -> anyhow::Result<UpdateStatus> {
-        (cfg.notify_handler)(Notification::LookingForToolchain(desc));
-        if Toolchain::exists(cfg, &desc.into())? {
-            (cfg.notify_handler)(Notification::UsingExistingToolchain(desc));
-            Ok(UpdateStatus::Unchanged)
-        } else {
-            Ok(Self::install(cfg, desc, &[], &[], cfg.get_profile()?, false)?.0)
-        }
-    }
-
-    #[cfg_attr(feature = "otel", tracing::instrument(err, skip_all))]
-    pub(crate) fn update(
+    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
+    pub(crate) async fn update(
         &mut self,
         components: &[&str],
         targets: &[&str],
         profile: Profile,
     ) -> anyhow::Result<UpdateStatus> {
         self.update_extra(components, targets, profile, true, false)
+            .await
     }
 
     /// Update a toolchain with control over the channel behaviour
-    #[cfg_attr(feature = "otel", tracing::instrument(err, skip_all))]
-    pub(crate) fn update_extra(
+    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
+    pub(crate) async fn update_extra(
         &mut self,
         components: &[&str],
         targets: &[&str],
@@ -396,25 +390,25 @@ impl<'a> DistributableToolchain<'a> {
                 })
                 .ok();
 
-        let hash_path = self.cfg.get_hash_file(&self.desc, true)?;
+        let cfg = self.toolchain.cfg;
+        let hash_path = cfg.get_hash_file(&self.desc, true)?;
         let update_hash = Some(&hash_path as &Path);
 
-        InstallMethod::Dist {
-            cfg: self.cfg,
-            desc: &self.desc,
+        InstallMethod::Dist(DistOptions {
+            cfg,
+            toolchain: &self.desc,
             profile,
             update_hash,
-            dl_cfg: self
-                .cfg
-                .download_cfg(&|n| (self.cfg.notify_handler)(n.into())),
+            dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
             force,
             allow_downgrade,
             exists: true,
             old_date_version,
             components,
             targets,
-        }
+        })
         .install()
+        .await
     }
 
     pub fn recursion_error(&self, binary_lossy: String) -> Result<Infallible, anyhow::Error> {
@@ -432,17 +426,21 @@ impl<'a> DistributableToolchain<'a> {
             let short_name = component_status.component.short_name(&manifest);
             if !component_status.available {
                 Err(anyhow!(
-                                "the '{short_name}' component which provides the command '{binary_lossy}' is not available for the '{desc}' toolchain"))
+                    "the '{short_name}' component which provides the command '{binary_lossy}' is not available for the '{desc}' toolchain"
+                ))
             } else if component_status.installed {
                 Err(anyhow!(
-                    "the '{binary_lossy}' binary, normally provided by the '{short_name}' component, is not applicable to the '{desc}' toolchain"))
+                    "the '{binary_lossy}' binary, normally provided by the '{short_name}' component, is not applicable to the '{desc}' toolchain"
+                ))
             } else {
                 // available, not installed, recommend installation
-                let selector = match self.cfg.get_default()? {
+                let selector = match self.toolchain.cfg.get_default()? {
                     Some(ToolchainName::Official(n)) if n == self.desc => String::new(),
                     _ => format!("--toolchain {} ", self.toolchain.name()),
                 };
-                Err(anyhow!("'{binary_lossy}' is not installed for the toolchain '{desc}'.\nTo install, run `rustup component add {selector}{component_name}`"))
+                Err(anyhow!(
+                    "'{binary_lossy}' is not installed for the toolchain '{desc}'.\nTo install, run `rustup component add {selector}{component_name}`"
+                ))
             }
         } else {
             // Unknown binary - no component to recommend
@@ -452,7 +450,7 @@ impl<'a> DistributableToolchain<'a> {
         }
     }
 
-    pub(crate) fn remove_component(&self, mut component: Component) -> anyhow::Result<()> {
+    pub(crate) async fn remove_component(&self, mut component: Component) -> anyhow::Result<()> {
         // TODO: take multiple components?
         let manifestation = self.get_manifestation()?;
         let config = manifestation.read_config()?.unwrap_or_default();
@@ -498,28 +496,30 @@ impl<'a> DistributableToolchain<'a> {
         };
 
         let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.cfg.notify_handler)(n.into());
-        let download_cfg = self.cfg.download_cfg(&notify_handler);
+            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
+        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
 
-        manifestation.update(
-            &manifest,
-            changes,
-            false,
-            &download_cfg,
-            &self.desc.manifest_name(),
-            false,
-        )?;
+        manifestation
+            .update(
+                &manifest,
+                changes,
+                false,
+                &download_cfg,
+                &self.desc.manifest_name(),
+                false,
+            )
+            .await?;
 
         Ok(())
     }
 
-    pub fn show_dist_version(&self) -> anyhow::Result<Option<String>> {
-        let update_hash = self.cfg.get_hash_file(&self.desc, false)?;
+    pub async fn show_dist_version(&self) -> anyhow::Result<Option<String>> {
+        let update_hash = self.toolchain.cfg.get_hash_file(&self.desc, false)?;
         let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.cfg.notify_handler)(n.into());
-        let download_cfg = self.cfg.download_cfg(&notify_handler);
+            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
+        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
 
-        match crate::dist::dist::dl_v2_manifest(download_cfg, Some(&update_hash), &self.desc)? {
+        match crate::dist::dl_v2_manifest(download_cfg, Some(&update_hash), &self.desc).await? {
             Some((manifest, _)) => Ok(Some(manifest.get_rust_version()?.to_string())),
             None => Ok(None),
         }
@@ -531,20 +531,6 @@ impl<'a> DistributableToolchain<'a> {
             None => Ok(None),
         }
     }
-
-    pub(crate) fn installed_paths<'b>(
-        cfg: &'b Cfg,
-        desc: &ToolchainDesc,
-        path: &'b Path,
-    ) -> anyhow::Result<Vec<InstalledPath<'b>>> {
-        Ok(vec![
-            InstalledPath::File {
-                name: "update hash",
-                path: cfg.get_hash_file(desc, false)?,
-            },
-            InstalledPath::Dir { path },
-        ])
-    }
 }
 
 impl<'a> TryFrom<&Toolchain<'a>> for DistributableToolchain<'a> {
@@ -554,7 +540,6 @@ impl<'a> TryFrom<&Toolchain<'a>> for DistributableToolchain<'a> {
         match value.name() {
             LocalToolchainName::Named(ToolchainName::Official(desc)) => Ok(Self {
                 toolchain: value.clone(),
-                cfg: value.cfg(),
                 desc: desc.clone(),
             }),
             n => Err(RustupError::ComponentsUnsupported(n.to_string())),

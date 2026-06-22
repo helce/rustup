@@ -2,14 +2,15 @@ use std::fs;
 use std::ops;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::dist::notifications::*;
 use crate::dist::temp;
 use crate::errors::*;
-use crate::utils::utils;
+use crate::process::Process;
+use crate::utils;
 
 const UPDATE_HASH_LEN: usize = 20;
 
@@ -19,6 +20,7 @@ pub struct DownloadCfg<'a> {
     pub tmp_cx: &'a temp::Context,
     pub download_dir: &'a PathBuf,
     pub notify_handler: &'a dyn Fn(Notification<'_>),
+    pub process: &'a Process,
 }
 
 pub(crate) struct File {
@@ -38,7 +40,7 @@ impl<'a> DownloadCfg<'a> {
     /// Partial downloads are stored in `self.download_dir`, keyed by hash. If the
     /// target file already exists, then the hash is checked and it is returned
     /// immediately without re-downloading.
-    pub(crate) fn download(&self, url: &Url, hash: &str) -> Result<File> {
+    pub(crate) async fn download(&self, url: &Url, hash: &str) -> Result<File> {
         utils::ensure_dir_exists(
             "Download Directory",
             self.download_dir,
@@ -77,7 +79,10 @@ impl<'a> DownloadCfg<'a> {
             Some(&mut hasher),
             true,
             &|n| (self.notify_handler)(n.into()),
-        ) {
+            self.process,
+        )
+        .await
+        {
             let err = Err(e);
             if partial_file_existed {
                 return err.context(RustupError::BrokenPartialFile);
@@ -104,11 +109,12 @@ impl<'a> DownloadCfg<'a> {
         } else {
             (self.notify_handler)(Notification::ChecksumValid(url.as_ref()));
 
-            utils::rename_file(
+            utils::rename(
                 "downloaded",
                 &partial_file_path,
                 &target_file,
                 self.notify_handler,
+                self.process,
             )?;
             Ok(File { path: target_file })
         }
@@ -124,13 +130,18 @@ impl<'a> DownloadCfg<'a> {
         Ok(())
     }
 
-    fn download_hash(&self, url: &str) -> Result<String> {
+    async fn download_hash(&self, url: &str) -> Result<String> {
         let hash_url = utils::parse_url(&(url.to_owned() + ".sha256"))?;
         let hash_file = self.tmp_cx.new_file()?;
 
-        utils::download_file(&hash_url, &hash_file, None, &|n| {
-            (self.notify_handler)(n.into())
-        })?;
+        utils::download_file(
+            &hash_url,
+            &hash_file,
+            None,
+            &|n| (self.notify_handler)(n.into()),
+            self.process,
+        )
+        .await?;
 
         utils::read_file("hash", &hash_file).map(|s| s[0..64].to_owned())
     }
@@ -140,13 +151,13 @@ impl<'a> DownloadCfg<'a> {
     /// and if they match, the download is skipped.
     /// Verifies the signature found at the same url with a `.asc` suffix, and prints a
     /// warning when the signature does not verify, or is not found.
-    pub(crate) fn download_and_check(
+    pub(crate) async fn download_and_check(
         &self,
         url_str: &str,
         update_hash: Option<&Path>,
         ext: &str,
     ) -> Result<Option<(temp::File<'a>, String)>> {
-        let hash = self.download_hash(url_str)?;
+        let hash = self.download_hash(url_str).await?;
         let partial_hash: String = hash.chars().take(UPDATE_HASH_LEN).collect();
 
         if let Some(hash_file) = update_hash {
@@ -168,9 +179,14 @@ impl<'a> DownloadCfg<'a> {
         let file = self.tmp_cx.new_file_with_ext("", ext)?;
 
         let mut hasher = Sha256::new();
-        utils::download_file(&url, &file, Some(&mut hasher), &|n| {
-            (self.notify_handler)(n.into())
-        })?;
+        utils::download_file(
+            &url,
+            &file,
+            Some(&mut hasher),
+            &|n| (self.notify_handler)(n.into()),
+            self.process,
+        )
+        .await?;
         let actual_hash = format!("{:x}", hasher.finalize());
 
         if hash != actual_hash {

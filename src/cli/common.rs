@@ -3,40 +3,39 @@
 use std::cell::RefCell;
 use std::fmt::Display;
 use std::fs;
-use std::io::{BufRead, ErrorKind, Write};
-use std::path::Path;
-use std::sync::Arc;
+#[cfg(not(windows))]
+use std::io::ErrorKind;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::{cmp, env};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use git_testament::{git_testament, render_testament};
-use once_cell::sync::Lazy;
+use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
 use super::self_update;
-use crate::cli::download_tracker::DownloadTracker;
-use crate::currentprocess::{
-    argsource::ArgSource,
-    filesource::{StdinSource, StdoutSource},
-    terminalsource,
-    varsource::VarSource,
-};
-use crate::dist::dist::{TargetTriple, ToolchainDesc};
-use crate::install::UpdateStatus;
-use crate::utils::notifications as util_notifications;
-use crate::utils::notify::NotificationLevel;
-use crate::utils::utils;
 use crate::{
-    dist::notifications as dist_notifications, toolchain::distributable::DistributableToolchain,
+    cli::download_tracker::DownloadTracker,
+    config::Cfg,
+    dist::{
+        TargetTriple, ToolchainDesc, manifest::ComponentStatus, notifications as dist_notifications,
+    },
+    errors::RustupError,
+    install::UpdateStatus,
+    notifications::Notification,
+    process::{Process, terminalsource},
+    toolchain::{DistributableToolchain, LocalToolchainName, Toolchain, ToolchainName},
+    utils::{self, notifications as util_notifications, notify::NotificationLevel},
 };
-use crate::{process, toolchain::toolchain::Toolchain};
-use crate::{Cfg, Notification};
 
 pub(crate) const WARN_COMPLETE_PROFILE: &str = "downloading with complete profile isn't recommended unless you are a developer of the rust language";
 
-pub(crate) fn confirm(question: &str, default: bool) -> Result<bool> {
-    write!(process().stdout().lock(), "{question} ")?;
+pub(crate) fn confirm(question: &str, default: bool, process: &Process) -> Result<bool> {
+    write!(process.stdout().lock(), "{question} ")?;
     let _ = std::io::stdout().flush();
-    let input = read_line()?;
+    let input = read_line(process)?;
 
     let r = match &*input.to_lowercase() {
         "y" | "yes" => true,
@@ -45,7 +44,7 @@ pub(crate) fn confirm(question: &str, default: bool) -> Result<bool> {
         _ => false,
     };
 
-    writeln!(process().stdout().lock())?;
+    writeln!(process.stdout().lock())?;
 
     Ok(r)
 }
@@ -56,19 +55,19 @@ pub(crate) enum Confirm {
     Advanced,
 }
 
-pub(crate) fn confirm_advanced(customized_install: bool) -> Result<Confirm> {
-    writeln!(process().stdout().lock())?;
+pub(crate) fn confirm_advanced(customized_install: bool, process: &Process) -> Result<Confirm> {
+    writeln!(process.stdout().lock())?;
     let first_option = match customized_install {
         true => "1) Proceed with selected options (default - just press enter)",
         false => "1) Proceed with standard installation (default - just press enter)",
     };
-    writeln!(process().stdout().lock(), "{first_option}")?;
-    writeln!(process().stdout().lock(), "2) Customize installation")?;
-    writeln!(process().stdout().lock(), "3) Cancel installation")?;
-    write!(process().stdout().lock(), ">")?;
+    writeln!(process.stdout().lock(), "{first_option}")?;
+    writeln!(process.stdout().lock(), "2) Customize installation")?;
+    writeln!(process.stdout().lock(), "3) Cancel installation")?;
+    write!(process.stdout().lock(), ">")?;
 
     let _ = std::io::stdout().flush();
-    let input = read_line()?;
+    let input = read_line(process)?;
 
     let r = match &*input {
         "1" | "" => Confirm::Yes,
@@ -76,17 +75,17 @@ pub(crate) fn confirm_advanced(customized_install: bool) -> Result<Confirm> {
         _ => Confirm::No,
     };
 
-    writeln!(process().stdout().lock())?;
+    writeln!(process.stdout().lock())?;
 
     Ok(r)
 }
 
-pub(crate) fn question_str(question: &str, default: &str) -> Result<String> {
-    writeln!(process().stdout().lock(), "{question} [{default}]")?;
+pub(crate) fn question_str(question: &str, default: &str, process: &Process) -> Result<String> {
+    writeln!(process.stdout().lock(), "{question} [{default}]")?;
     let _ = std::io::stdout().flush();
-    let input = read_line()?;
+    let input = read_line(process)?;
 
-    writeln!(process().stdout().lock())?;
+    writeln!(process.stdout().lock())?;
 
     if input.is_empty() {
         Ok(default.to_string())
@@ -95,14 +94,14 @@ pub(crate) fn question_str(question: &str, default: &str) -> Result<String> {
     }
 }
 
-pub(crate) fn question_bool(question: &str, default: bool) -> Result<bool> {
+pub(crate) fn question_bool(question: &str, default: bool, process: &Process) -> Result<bool> {
     let default_text = if default { "(Y/n)" } else { "(y/N)" };
-    writeln!(process().stdout().lock(), "{question} {default_text}")?;
+    writeln!(process.stdout().lock(), "{question} {default_text}")?;
 
     let _ = std::io::stdout().flush();
-    let input = read_line()?;
+    let input = read_line(process)?;
 
-    writeln!(process().stdout().lock())?;
+    writeln!(process.stdout().lock())?;
 
     if input.is_empty() {
         Ok(default)
@@ -115,8 +114,8 @@ pub(crate) fn question_bool(question: &str, default: bool) -> Result<bool> {
     }
 }
 
-pub(crate) fn read_line() -> Result<String> {
-    let stdin = process().stdin();
+pub(crate) fn read_line(process: &Process) -> Result<String> {
+    let stdin = process.stdin();
     let stdin = stdin.lock();
     let mut lines = stdin.lines();
     let lines = lines.next().transpose()?;
@@ -127,31 +126,39 @@ pub(crate) fn read_line() -> Result<String> {
     .context("unable to read from stdin for confirmation")
 }
 
-#[derive(Default)]
-struct NotifyOnConsole {
-    ram_notice_shown: bool,
-    verbose: bool,
+pub(super) struct Notifier {
+    tracker: Mutex<DownloadTracker>,
+    ram_notice_shown: RefCell<bool>,
 }
 
-impl NotifyOnConsole {
-    fn handle(&mut self, n: Notification<'_>) {
+impl Notifier {
+    pub(super) fn new(quiet: bool, process: &Process) -> Self {
+        Self {
+            tracker: Mutex::new(DownloadTracker::new_with_display_progress(!quiet, process)),
+            ram_notice_shown: RefCell::new(false),
+        }
+    }
+
+    pub(super) fn handle(&self, n: Notification<'_>) {
+        if self.tracker.lock().unwrap().handle_notification(&n) {
+            return;
+        }
+
         if let Notification::Install(dist_notifications::Notification::Utils(
             util_notifications::Notification::SetDefaultBufferSize(_),
         )) = &n
         {
-            if self.ram_notice_shown {
+            if *self.ram_notice_shown.borrow() {
                 return;
             } else {
-                self.ram_notice_shown = true;
+                *self.ram_notice_shown.borrow_mut() = true;
             }
         };
         let level = n.level();
         for n in format!("{n}").lines() {
             match level {
-                NotificationLevel::Verbose => {
-                    if self.verbose {
-                        verbose!("{}", n);
-                    }
+                NotificationLevel::Debug => {
+                    debug!("{}", n);
                 }
                 NotificationLevel::Info => {
                     info!("{}", n);
@@ -160,34 +167,24 @@ impl NotifyOnConsole {
                     warn!("{}", n);
                 }
                 NotificationLevel::Error => {
-                    err!("{}", n);
+                    error!("{}", n);
                 }
-                NotificationLevel::Debug => {
-                    debug!("{}", n);
+                NotificationLevel::Trace => {
+                    trace!("{}", n);
                 }
             }
         }
     }
 }
 
-#[cfg_attr(feature = "otel", tracing::instrument)]
-pub(crate) fn set_globals(verbose: bool, quiet: bool) -> Result<Cfg> {
-    let download_tracker = DownloadTracker::new_with_display_progress(!quiet);
-    let console_notifier = RefCell::new(NotifyOnConsole {
-        verbose,
-        ..Default::default()
-    });
-
-    Cfg::from_env(Arc::new(move |n: Notification<'_>| {
-        if download_tracker.lock().unwrap().handle_notification(&n) {
-            return;
-        }
-        console_notifier.borrow_mut().handle(n);
-    }))
+#[tracing::instrument(level = "trace")]
+pub(crate) fn set_globals(current_dir: PathBuf, quiet: bool, process: &Process) -> Result<Cfg<'_>> {
+    let notifier = Notifier::new(quiet, process);
+    Cfg::from_env(current_dir, Arc::new(move |n| notifier.handle(n)), process)
 }
 
 pub(crate) fn show_channel_update(
-    cfg: &Cfg,
+    cfg: &Cfg<'_>,
     name: PackageUpdate,
     updated: Result<UpdateStatus>,
 ) -> Result<()> {
@@ -209,7 +206,7 @@ impl Display for PackageUpdate {
 }
 
 fn show_channel_updates(
-    cfg: &Cfg,
+    cfg: &Cfg<'_>,
     updates: Vec<(PackageUpdate, Result<UpdateStatus>)>,
 ) -> Result<()> {
     let data = updates.into_iter().map(|(pkg, result)| {
@@ -255,7 +252,7 @@ fn show_channel_updates(
         Ok((pkg, banner, width, color, version, previous_version))
     });
 
-    let mut t = process().stdout().terminal();
+    let mut t = cfg.process.stdout().terminal(cfg.process);
 
     let data: Vec<_> = data.collect::<Result<_>>()?;
     let max_width = data
@@ -283,12 +280,14 @@ fn show_channel_updates(
     Ok(())
 }
 
-pub(crate) fn update_all_channels(
-    cfg: &Cfg,
+pub(crate) async fn update_all_channels(
+    cfg: &Cfg<'_>,
     do_self_update: bool,
     force_update: bool,
 ) -> Result<utils::ExitCode> {
-    let toolchains = cfg.update_all_channels(force_update)?;
+    let toolchains = cfg.update_all_channels(force_update).await?;
+    let has_update_error = toolchains.iter().any(|(_, r)| r.is_err());
+    let mut exit_code = utils::ExitCode(if has_update_error { 1 } else { 0 });
 
     if toolchains.is_empty() {
         info!("no updatable toolchains installed");
@@ -296,7 +295,7 @@ pub(crate) fn update_all_channels(
 
     let show_channel_updates = || {
         if !toolchains.is_empty() {
-            writeln!(process().stdout().lock())?;
+            writeln!(cfg.process.stdout().lock())?;
 
             let t = toolchains
                 .into_iter()
@@ -304,64 +303,70 @@ pub(crate) fn update_all_channels(
                 .collect();
             show_channel_updates(cfg, t)?;
         }
-        Ok(utils::ExitCode(0))
+        Ok(())
     };
 
     if do_self_update {
-        self_update(show_channel_updates)
+        exit_code &= self_update(show_channel_updates, cfg.process).await?;
     } else {
-        show_channel_updates()
+        show_channel_updates()?;
     }
+    Ok(exit_code)
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum SelfUpdatePermission {
     HardFail,
+    #[cfg(not(windows))]
     Skip,
     Permit,
 }
 
-pub(crate) fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
-    if cfg!(windows) {
-        Ok(SelfUpdatePermission::Permit)
-    } else {
-        // Detect if rustup is not meant to self-update
-        let current_exe = env::current_exe()?;
-        let current_exe_dir = current_exe.parent().expect("Rustup isn't in a directory‽");
-        if let Err(e) = tempfile::Builder::new()
-            .prefix("updtest")
-            .tempdir_in(current_exe_dir)
-        {
-            match e.kind() {
-                ErrorKind::PermissionDenied => {
-                    debug!("Skipping self-update because we cannot write to the rustup dir");
-                    if explicit {
-                        return Ok(SelfUpdatePermission::HardFail);
-                    } else {
-                        return Ok(SelfUpdatePermission::Skip);
-                    }
-                }
-                _ => return Err(e.into()),
-            }
-        }
-        Ok(SelfUpdatePermission::Permit)
-    }
+#[cfg(windows)]
+pub(crate) fn self_update_permitted(_explicit: bool) -> Result<SelfUpdatePermission> {
+    Ok(SelfUpdatePermission::Permit)
 }
 
-pub(crate) fn self_update<F>(before_restart: F) -> Result<utils::ExitCode>
+#[cfg(not(windows))]
+pub(crate) fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
+    // Detect if rustup is not meant to self-update
+    let current_exe = env::current_exe()?;
+    let current_exe_dir = current_exe.parent().expect("Rustup isn't in a directory‽");
+    if let Err(e) = tempfile::Builder::new()
+        .prefix("updtest")
+        .tempdir_in(current_exe_dir)
+    {
+        match e.kind() {
+            ErrorKind::PermissionDenied => {
+                trace!("Skipping self-update because we cannot write to the rustup dir");
+                if explicit {
+                    return Ok(SelfUpdatePermission::HardFail);
+                } else {
+                    return Ok(SelfUpdatePermission::Skip);
+                }
+            }
+            _ => return Err(e.into()),
+        }
+    }
+    Ok(SelfUpdatePermission::Permit)
+}
+
+/// Performs all of a self-update: check policy, download, apply and exit.
+pub(crate) async fn self_update<F>(before_restart: F, process: &Process) -> Result<utils::ExitCode>
 where
-    F: FnOnce() -> Result<utils::ExitCode>,
+    F: FnOnce() -> Result<()>,
 {
     match self_update_permitted(false)? {
         SelfUpdatePermission::HardFail => {
-            err!("Unable to self-update.  STOP");
+            error!("Unable to self-update.  STOP");
             return Ok(utils::ExitCode(1));
         }
+        #[cfg(not(windows))]
         SelfUpdatePermission::Skip => return Ok(utils::ExitCode(0)),
         SelfUpdatePermission::Permit => {}
     }
 
-    let setup_path = self_update::prepare_update()?;
+    let setup_path = self_update::prepare_update(process).await?;
 
     before_restart()?;
 
@@ -369,170 +374,122 @@ where
         return self_update::run_update(setup_path);
     } else {
         // Try again in case we emitted "tool `{}` is already installed" last time.
-        self_update::install_proxies()?;
+        self_update::install_proxies(process)?;
     }
 
     Ok(utils::ExitCode(0))
 }
 
-pub(crate) fn list_targets(distributable: DistributableToolchain<'_>) -> Result<utils::ExitCode> {
-    let mut t = process().stdout().terminal();
-    let manifestation = distributable.get_manifestation()?;
-    let config = manifestation.read_config()?.unwrap_or_default();
-    let manifest = distributable.get_manifest()?;
-    let components = manifest.query_components(distributable.desc(), &config)?;
-    for component in components {
-        if component.component.short_name_in_manifest() == "rust-std" {
-            let target = component
-                .component
-                .target
-                .as_ref()
-                .expect("rust-std should have a target");
-            if component.installed {
-                let _ = t.attr(terminalsource::Attr::Bold);
-                let _ = writeln!(t.lock(), "{target} (installed)");
-                let _ = t.reset();
-            } else if component.available {
-                let _ = writeln!(t.lock(), "{target}");
-            }
-        }
-    }
-
-    Ok(utils::ExitCode(0))
-}
-
-pub(crate) fn list_installed_targets(
+pub(super) fn list_items(
     distributable: DistributableToolchain<'_>,
+    f: impl Fn(&ComponentStatus) -> Option<&str>,
+    installed_only: bool,
+    quiet: bool,
+    process: &Process,
 ) -> Result<utils::ExitCode> {
-    let t = process().stdout();
-    let manifestation = distributable.get_manifestation()?;
-    let config = manifestation.read_config()?.unwrap_or_default();
-    let manifest = distributable.get_manifest()?;
-    let components = manifest.query_components(distributable.desc(), &config)?;
-    for component in components {
-        if component.component.short_name_in_manifest() == "rust-std" {
-            let target = component
-                .component
-                .target
-                .as_ref()
-                .expect("rust-std should have a target");
-            if component.installed {
-                writeln!(t.lock(), "{target}")?;
-            }
-        }
-    }
-    Ok(utils::ExitCode(0))
-}
-
-pub(crate) fn list_components(
-    distributable: DistributableToolchain<'_>,
-) -> Result<utils::ExitCode> {
-    let mut t = process().stdout().terminal();
-
-    let manifestation = distributable.get_manifestation()?;
-    let config = manifestation.read_config()?.unwrap_or_default();
-    let manifest = distributable.get_manifest()?;
-    let components = manifest.query_components(distributable.desc(), &config)?;
-    for component in components {
-        let name = component.name;
-        if component.installed {
-            t.attr(terminalsource::Attr::Bold)?;
-            writeln!(t.lock(), "{name} (installed)")?;
-            t.reset()?;
-        } else if component.available {
-            writeln!(t.lock(), "{name}")?;
-        }
-    }
-
-    Ok(utils::ExitCode(0))
-}
-
-pub(crate) fn list_installed_components(distributable: DistributableToolchain<'_>) -> Result<()> {
-    let t = process().stdout();
+    let mut t = process.stdout().terminal(process);
     for component in distributable.components()? {
-        if component.installed {
-            writeln!(t.lock(), "{}", component.name)?;
+        let Some(name) = f(&component) else { continue };
+        match (component.available, component.installed, installed_only) {
+            (false, _, _) | (_, false, true) => continue,
+            (true, true, false) if !quiet => {
+                t.attr(terminalsource::Attr::Bold)?;
+                writeln!(t.lock(), "{name} (installed)")?;
+                t.reset()?;
+            }
+            (true, _, false) | (_, true, true) => {
+                writeln!(t.lock(), "{name}")?;
+            }
         }
     }
-    Ok(())
+
+    Ok(utils::ExitCode(0))
 }
 
-fn print_toolchain_path(
-    cfg: &Cfg,
-    toolchain: &str,
-    if_default: &str,
-    if_override: &str,
+pub(crate) fn list_toolchains(
+    cfg: &Cfg<'_>,
     verbose: bool,
-) -> Result<()> {
-    let toolchain_path = cfg.toolchains_dir.join(toolchain);
-    let toolchain_meta = fs::symlink_metadata(&toolchain_path)?;
-    let toolchain_path = if verbose {
-        if toolchain_meta.is_dir() {
-            format!("\t{}", toolchain_path.display())
-        } else {
-            format!("\t{}", fs::read_link(toolchain_path)?.display())
-        }
-    } else {
-        String::new()
-    };
-    writeln!(
-        process().stdout().lock(),
-        "{}{}{}{}",
-        &toolchain,
-        if_default,
-        if_override,
-        toolchain_path
-    )?;
-    Ok(())
-}
-
-pub(crate) fn list_toolchains(cfg: &Cfg, verbose: bool) -> Result<utils::ExitCode> {
-    // Work with LocalToolchainName to accommodate path based overrides
-    let toolchains = cfg
-        .list_toolchains()?
-        .iter()
-        .map(Into::into)
-        .collect::<Vec<_>>();
+    quiet: bool,
+) -> Result<utils::ExitCode> {
+    let toolchains = cfg.list_toolchains()?;
     if toolchains.is_empty() {
-        writeln!(process().stdout().lock(), "no installed toolchains")?;
+        writeln!(cfg.process.stdout().lock(), "no installed toolchains")?;
     } else {
-        let def_toolchain_name = cfg.get_default()?.map(|t| (&t).into());
-        let cwd = utils::current_dir()?;
-        let ovr_toolchain_name = if let Ok(Some((toolchain, _reason))) = cfg.find_override(&cwd) {
-            Some(toolchain)
-        } else {
-            None
-        };
-        for toolchain in toolchains {
-            let if_default = if def_toolchain_name.as_ref() == Some(&toolchain) {
-                " (default)"
+        let default_toolchain_name = cfg.get_default()?;
+        let active_toolchain_name: Option<ToolchainName> =
+            if let Ok(Some((LocalToolchainName::Named(toolchain), _reason))) =
+                cfg.find_active_toolchain()
+            {
+                Some(toolchain)
             } else {
-                ""
-            };
-            let if_override = if ovr_toolchain_name.as_ref() == Some(&toolchain) {
-                " (override)"
-            } else {
-                ""
+                None
             };
 
-            print_toolchain_path(
+        for toolchain in toolchains {
+            let is_default_toolchain = default_toolchain_name.as_ref() == Some(&toolchain);
+            let is_active_toolchain = active_toolchain_name.as_ref() == Some(&toolchain);
+
+            print_toolchain(
                 cfg,
                 &toolchain.to_string(),
-                if_default,
-                if_override,
+                is_default_toolchain,
+                is_active_toolchain,
                 verbose,
+                quiet,
             )
             .context("Failed to list toolchains' directories")?;
         }
     }
+
+    fn print_toolchain(
+        cfg: &Cfg<'_>,
+        toolchain: &str,
+        is_default: bool,
+        is_active: bool,
+        verbose: bool,
+        quiet: bool,
+    ) -> Result<()> {
+        if quiet {
+            writeln!(cfg.process.stdout().lock(), "{toolchain}")?;
+            return Ok(());
+        }
+
+        let toolchain_path = cfg.toolchains_dir.join(toolchain);
+        let toolchain_meta = fs::symlink_metadata(&toolchain_path)?;
+        let toolchain_path = if verbose {
+            if toolchain_meta.is_dir() {
+                format!(" {}", toolchain_path.display())
+            } else {
+                format!(" {}", fs::read_link(toolchain_path)?.display())
+            }
+        } else {
+            String::new()
+        };
+        let status_str = match (is_default, is_active) {
+            (true, true) => " (active, default)",
+            (true, false) => " (default)",
+            (false, true) => " (active)",
+            (false, false) => "",
+        };
+
+        writeln!(
+            cfg.process.stdout().lock(),
+            "{}{}{}",
+            &toolchain,
+            status_str,
+            toolchain_path
+        )?;
+        Ok(())
+    }
+
     Ok(utils::ExitCode(0))
 }
 
-pub(crate) fn list_overrides(cfg: &Cfg) -> Result<utils::ExitCode> {
+pub(crate) fn list_overrides(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
     let overrides = cfg.settings_file.with(|s| Ok(s.overrides.clone()))?;
 
     if overrides.is_empty() {
-        writeln!(process().stdout().lock(), "no overrides")?;
+        writeln!(cfg.process.stdout().lock(), "no overrides")?;
     } else {
         let mut any_not_exist = false;
         for (k, v) in overrides {
@@ -541,7 +498,7 @@ pub(crate) fn list_overrides(cfg: &Cfg) -> Result<utils::ExitCode> {
                 any_not_exist = true;
             }
             writeln!(
-                process().stdout().lock(),
+                cfg.process.stdout().lock(),
                 "{:<40}\t{:<20}",
                 utils::format_path_for_display(&k)
                     + if dir_exists { "" } else { " (not a directory)" },
@@ -549,7 +506,7 @@ pub(crate) fn list_overrides(cfg: &Cfg) -> Result<utils::ExitCode> {
             )?
         }
         if any_not_exist {
-            writeln!(process().stdout().lock())?;
+            writeln!(cfg.process.stdout().lock())?;
             info!(
                 "you may remove overrides for non-existent directories with
 `rustup override unset --nonexistent`"
@@ -565,58 +522,54 @@ pub(crate) fn version() -> &'static str {
     // Because we trust our `stable` branch given the careful release
     // process, we mark it trusted here so that our version numbers look
     // right when built from CI before the tag is pushed
-    static RENDERED: Lazy<String> = Lazy::new(|| render_testament!(TESTAMENT, "stable"));
+    static RENDERED: LazyLock<String> = LazyLock::new(|| render_testament!(TESTAMENT, "stable"));
     &RENDERED
 }
 
-pub(crate) fn dump_testament() -> Result<utils::ExitCode> {
+pub(crate) fn dump_testament(process: &Process) -> Result<utils::ExitCode> {
     use git_testament::GitModification::*;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "Rustup version renders as: {}",
         version()
     )?;
     writeln!(
-        process().stdout().lock(),
+        process.stdout().lock(),
         "Current crate version: {}",
         env!("CARGO_PKG_VERSION")
     )?;
     if TESTAMENT.branch_name.is_some() {
         writeln!(
-            process().stdout().lock(),
+            process.stdout().lock(),
             "Built from branch: {}",
             TESTAMENT.branch_name.unwrap()
         )?;
     } else {
-        writeln!(process().stdout().lock(), "Branch information missing")?;
+        writeln!(process.stdout().lock(), "Branch information missing")?;
     }
-    writeln!(
-        process().stdout().lock(),
-        "Commit info: {}",
-        TESTAMENT.commit
-    )?;
+    writeln!(process.stdout().lock(), "Commit info: {}", TESTAMENT.commit)?;
     if TESTAMENT.modifications.is_empty() {
-        writeln!(process().stdout().lock(), "Working tree is clean")?;
+        writeln!(process.stdout().lock(), "Working tree is clean")?;
     } else {
         for fmod in TESTAMENT.modifications {
             match fmod {
                 Added(f) => writeln!(
-                    process().stdout().lock(),
+                    process.stdout().lock(),
                     "Added: {}",
                     String::from_utf8_lossy(f)
                 )?,
                 Removed(f) => writeln!(
-                    process().stdout().lock(),
+                    process.stdout().lock(),
                     "Removed: {}",
                     String::from_utf8_lossy(f)
                 )?,
                 Modified(f) => writeln!(
-                    process().stdout().lock(),
+                    process.stdout().lock(),
                     "Modified: {}",
                     String::from_utf8_lossy(f)
                 )?,
                 Untracked(f) => writeln!(
-                    process().stdout().lock(),
+                    process.stdout().lock(),
                     "Untracked: {}",
                     String::from_utf8_lossy(f)
                 )?,
@@ -626,16 +579,16 @@ pub(crate) fn dump_testament() -> Result<utils::ExitCode> {
     Ok(utils::ExitCode(0))
 }
 
-fn show_backtrace() -> bool {
-    if let Ok(true) = process().var("RUSTUP_NO_BACKTRACE").map(|s| s == "1") {
+fn show_backtrace(process: &Process) -> bool {
+    if let Ok(true) = process.var("RUSTUP_NO_BACKTRACE").map(|s| s == "1") {
         return false;
     }
 
-    if let Ok(true) = process().var("RUST_BACKTRACE").map(|s| s == "1") {
+    if let Ok(true) = process.var("RUST_BACKTRACE").map(|s| s == "1") {
         return true;
     }
 
-    for arg in process().args() {
+    for arg in process.args() {
         if arg == "-v" || arg == "--verbose" {
             return true;
         }
@@ -644,39 +597,93 @@ fn show_backtrace() -> bool {
     false
 }
 
-pub fn report_error(e: &anyhow::Error) {
+pub fn report_error(e: &anyhow::Error, process: &Process) {
     // NB: This shows one error: even for multiple causes and backtraces etc,
     // rather than one per cause, and one for the backtrace. This seems like a
     // reasonable tradeoff, but if we want to do differently, this is the code
     // hunk to revisit, that and a similar build.rs auto-detect glue as anyhow
     // has to detect when backtrace is available.
-    if show_backtrace() {
-        err!("{:?}", e);
+    if show_backtrace(process) {
+        error!("{:?}", e);
     } else {
-        err!("{:#}", e);
+        error!("{:#}", e);
     }
 }
 
-pub(crate) fn ignorable_error(error: &'static str, no_prompt: bool) -> Result<()> {
+pub(crate) fn ignorable_error(
+    error: &'static str,
+    no_prompt: bool,
+    process: &Process,
+) -> Result<()> {
     let error = anyhow!(error);
-    report_error(&error);
+    report_error(&error, process);
     if no_prompt {
         warn!("continuing (because the -y flag is set and the error is ignorable)");
         Ok(())
-    } else if confirm("\nContinue? (y/N)", false).unwrap_or(false) {
+    } else if confirm("\nContinue? (y/N)", false, process).unwrap_or(false) {
         Ok(())
     } else {
         Err(error)
     }
 }
 
+/// Returns an error for a toolchain if both conditions are met:
+/// - The toolchain has an incompatible target triple,
+///   i.e. it might not be able to run on the host system.
+/// - The `force_non_host` flag is set to `false`.
+pub(crate) fn check_non_host_toolchain(
+    toolchain: String,
+    host_arch: &TargetTriple,
+    target_triple: &TargetTriple,
+    force_non_host: bool,
+) -> Result<()> {
+    if force_non_host || host_arch.can_run(target_triple)? {
+        return Ok(());
+    }
+    Err(RustupError::ToolchainIncompatible {
+        toolchain,
+        target_triple: target_triple.clone(),
+    }
+    .into())
+}
+
 /// Warns if rustup is running under emulation, such as macOS Rosetta
-pub(crate) fn warn_if_host_is_emulated() {
+pub(crate) fn warn_if_host_is_emulated(process: &Process) {
     if TargetTriple::is_host_emulated() {
         warn!(
             "Rustup is not running natively. It's running under emulation of {}.",
-            TargetTriple::from_host_or_build()
+            TargetTriple::from_host_or_build(process)
         );
-        warn!("For best compatibility and performance you should reinstall rustup for your native CPU.");
+        warn!(
+            "For best compatibility and performance you should reinstall rustup for your native CPU."
+        );
+    }
+}
+
+/// Updates the console logger level according to whether `quiet` or `verbose` is set to `true`.
+///
+/// Does nothing if at least one of the following conditions is met:
+/// - The `RUSTUP_LOG` environment variable is set.
+/// - Both `quiet` and `verbose` are set to `true`.
+pub(super) fn update_console_filter(
+    process: &Process,
+    filter: &Handle<EnvFilter, Registry>,
+    quiet: bool,
+    verbose: bool,
+) {
+    if process.var("RUSTUP_LOG").is_ok() {
+        return;
+    }
+
+    let maybe_directives = match (quiet, verbose) {
+        (true, _) => Some("rustup=WARN"),
+        (_, true) => Some("rustup=DEBUG"),
+        (_, _) => None,
+    };
+
+    if let Some(directives) = maybe_directives {
+        filter
+            .modify(|it| *it = EnvFilter::new(directives))
+            .expect("error reloading `EnvFilter` for console_logger");
     }
 }

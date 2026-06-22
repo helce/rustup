@@ -40,12 +40,10 @@ mod imp {
     use std::mem;
     use std::ptr;
 
-    use winapi::shared::minwindef::*;
-    use winapi::um::handleapi::*;
-    use winapi::um::jobapi2::*;
-    use winapi::um::processthreadsapi::*;
-    use winapi::um::winnt::HANDLE;
-    use winapi::um::winnt::*;
+    use tracing::info;
+    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::System::JobObjects::*;
+    use windows_sys::Win32::System::Threading::*;
 
     pub(crate) struct Setup {
         job: Handle,
@@ -60,47 +58,49 @@ mod imp {
     }
 
     pub(crate) unsafe fn setup() -> Option<Setup> {
-        // Creates a new job object for us to use and then adds ourselves to it.
-        // Note that all errors are basically ignored in this function,
-        // intentionally. Job objects are "relatively new" in Windows,
-        // particularly the ability to support nested job objects. Older
-        // Windows installs don't support this ability. We probably don't want
-        // to force Cargo to abort in this situation or force others to *not*
-        // use job objects, so we instead just ignore errors and assume that
-        // we're otherwise part of someone else's job object in this case.
+        unsafe {
+            // Creates a new job object for us to use and then adds ourselves to it.
+            // Note that all errors are basically ignored in this function,
+            // intentionally. Job objects are "relatively new" in Windows,
+            // particularly the ability to support nested job objects. Older
+            // Windows installs don't support this ability. We probably don't want
+            // to force Cargo to abort in this situation or force others to *not*
+            // use job objects, so we instead just ignore errors and assume that
+            // we're otherwise part of someone else's job object in this case.
 
-        let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
-        if job.is_null() {
-            return None;
+            let job = CreateJobObjectW(ptr::null_mut(), ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let job = Handle { inner: job };
+
+            // Indicate that when all handles to the job object are gone that all
+            // process in the object should be killed. Note that this includes our
+            // entire process tree by default because we've added ourselves and
+            // our children will reside in the job once we spawn a process.
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
+            info = mem::zeroed();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let r = SetInformationJobObject(
+                job.inner,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *const std::ffi::c_void,
+                mem::size_of_val(&info) as u32,
+            );
+            if r == 0 {
+                return None;
+            }
+
+            // Assign our process to this job object, meaning that our children will
+            // now live or die based on our existence.
+            let me = GetCurrentProcess();
+            let r = AssignProcessToJobObject(job.inner, me);
+            if r == 0 {
+                return None;
+            }
+
+            Some(Setup { job })
         }
-        let job = Handle { inner: job };
-
-        // Indicate that when all handles to the job object are gone that all
-        // process in the object should be killed. Note that this includes our
-        // entire process tree by default because we've added ourselves and
-        // our children will reside in the job once we spawn a process.
-        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION;
-        info = mem::zeroed();
-        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let r = SetInformationJobObject(
-            job.inner,
-            JobObjectExtendedLimitInformation,
-            &mut info as *mut _ as LPVOID,
-            mem::size_of_val(&info) as DWORD,
-        );
-        if r == 0 {
-            return None;
-        }
-
-        // Assign our process to this job object, meaning that our children will
-        // now live or die based on our existence.
-        let me = GetCurrentProcess();
-        let r = AssignProcessToJobObject(job.inner, me);
-        if r == 0 {
-            return None;
-        }
-
-        Some(Setup { job })
     }
 
     impl Drop for Setup {
@@ -114,8 +114,8 @@ mod imp {
                 let r = SetInformationJobObject(
                     self.job.inner,
                     JobObjectExtendedLimitInformation,
-                    &mut info as *mut _ as LPVOID,
-                    mem::size_of_val(&info) as DWORD,
+                    &mut info as *mut _ as *const std::ffi::c_void,
+                    mem::size_of_val(&info) as u32,
                 );
                 if r == 0 {
                     info!("failed to configure job object to defaults: {}", last_err());

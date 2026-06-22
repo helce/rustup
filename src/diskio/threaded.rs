@@ -6,15 +6,15 @@
 /// will cause minutes of wall clock time.
 use std::cell::{Cell, RefCell};
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 
-use enum_map::{enum_map, Enum, EnumMap};
+use enum_map::{Enum, EnumMap, enum_map};
 use sharded_slab::pool::{OwnedRef, OwnedRefMut};
+use tracing::debug;
 
-use super::{perform, CompletedIo, Executor, Item};
-use crate::currentprocess::varsource::VarSource;
+use super::{CompletedIo, Executor, Item, perform};
 use crate::utils::notifications::Notification;
 use crate::utils::units::Unit;
 
@@ -234,7 +234,7 @@ impl<'a> Threaded<'a> {
     }
 }
 
-impl<'a> Executor for Threaded<'a> {
+impl Executor for Threaded<'_> {
     fn dispatch(&self, item: Item) -> Box<dyn Iterator<Item = CompletedIo> + '_> {
         // Yield any completed work before accepting new work - keep memory
         // pressure under control
@@ -270,7 +270,7 @@ impl<'a> Executor for Threaded<'a> {
             ));
         }
         if prev_files > 50 {
-            eprintln!("{prev_files} deferred IO operations");
+            debug!("{prev_files} deferred IO operations");
         }
         let buf: Vec<u8> = vec![0; prev_files];
         // Cheap wrap-around correctness check - we have 20k files, more than
@@ -306,13 +306,6 @@ impl<'a> Executor for Threaded<'a> {
         self.tx
             .send(Task::Sentinel)
             .expect("must still be listening");
-        if crate::currentprocess::process().var("RUSTUP_DEBUG").is_ok() {
-            // debug! is in the cli layer. erg. And notification stack is still terrible.
-            debug!("");
-            for (bucket, pool) in &self.vec_pools {
-                debug!("{:?}: {:?}", bucket, pool);
-            }
-        }
         Box::new(JoinIterator {
             executor: self,
             consume_sentinel: false,
@@ -358,7 +351,7 @@ impl<'a> Executor for Threaded<'a> {
     }
 }
 
-impl<'a> Drop for Threaded<'a> {
+impl Drop for Threaded<'_> {
     fn drop(&mut self) {
         // We are not permitted to fail - consume but do not handle the items.
         self.join().for_each(drop);
@@ -370,7 +363,7 @@ struct JoinIterator<'a, 'b> {
     consume_sentinel: bool,
 }
 
-impl<'a, 'b> JoinIterator<'a, 'b> {
+impl JoinIterator<'_, '_> {
     fn inner<T: Iterator<Item = Task>>(&self, mut iter: T) -> Option<CompletedIo> {
         loop {
             let task_o = iter.next();
@@ -394,7 +387,7 @@ impl<'a, 'b> JoinIterator<'a, 'b> {
     }
 }
 
-impl<'a, 'b> Iterator for JoinIterator<'a, 'b> {
+impl Iterator for JoinIterator<'_, '_> {
     type Item = CompletedIo;
 
     fn next(&mut self) -> Option<CompletedIo> {
@@ -411,7 +404,7 @@ struct SubmitIterator<'a, 'b> {
     item: Cell<Option<Item>>,
 }
 
-impl<'a, 'b> Iterator for SubmitIterator<'a, 'b> {
+impl Iterator for SubmitIterator<'_, '_> {
     type Item = CompletedIo;
 
     fn next(&mut self) -> Option<CompletedIo> {

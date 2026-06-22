@@ -1,9 +1,13 @@
-
 # Coding standards
 
 Generally we just follow good sensible Rust practices, clippy and so forth.
 However there are some practices we've agreed on that are not machine-enforced;
 meeting those requirements in a PR will make it easier to merge.
+
+## Atomic commits
+
+We use atomic commits across the repo. Each commit should represent a single unit of change.
+You can read more about atomic commits [here](https://www.aleksandrhovhannisyan.com/blog/atomic-git-commits).
 
 ## Import grouping
 
@@ -20,12 +24,15 @@ order. Any file that is not grouped like this can be rearranged whenever the
 file is touched - we're not precious about having it done in a separate commit,
 though that is helpful.
 
-## No direct use of process state outside rustup::currentprocess
+## No direct use of process state outside rustup::process
 
-The `rustup::currentprocess` module abstracts the global state that is
-`std::env::args`, `std::env::vars`, `std::io::std*`, `std::process::id`,
-`std::env::current_dir` and `std::process::exit` permitting threaded tests of
-the CLI logic; use `process()` rather than those APIs directly.
+The `rustup::process` module abstracts the global state that is
+`std::env::args`, `std::env::vars`, `std::io::std*` and `std::env::current_dir`
+permitting threaded tests of the CLI logic; use the relevant methods of the
+`rustup::process::Process` type rather than those APIs directly.
+Usually, a `process: &Process` variable will be available to you in the current context.
+For example, it could be in the form of a parameter of the current function,
+or a field of a `Cfg` instance, etc.
 
 ## Clippy lints
 
@@ -57,8 +64,3 @@ Clippy is also run in GitHub Actions, in the `General Checks / Checks` build
 task, but not currently run per-platform, which means there is no way to find
 out the status of clippy per platform without running it on that platform as a
 developer.
-
-### import rustup-macros::{integration,unit}_test into test modules
-
-These test helpers add pre-and-post logic to tests to enable the use of tracing
-inside tests, which can be helpful for tracking down behaviours in larger tests.

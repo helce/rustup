@@ -1,4 +1,9 @@
-#![allow(clippy::box_default)]
+#![allow(
+    clippy::box_default,
+    clippy::print_stdout,
+    clippy::print_stderr,
+    clippy::dbg_macro
+)]
 //! Test support module; public to permit use from integration tests.
 
 pub mod mock;
@@ -15,12 +20,11 @@ use std::process::Command;
 #[cfg(test)]
 use anyhow::Result;
 
-pub use crate::cli::self_update::test::{with_saved_global_state, with_saved_path};
-use crate::currentprocess;
-use crate::dist::dist::TargetTriple;
+use crate::dist::TargetTriple;
+use crate::process::TestProcess;
 
 #[cfg(windows)]
-pub use crate::cli::self_update::test::{get_path, with_saved_reg_value};
+pub use crate::cli::self_update::{RegistryGuard, RegistryValueId, USER_PATH, get_path};
 
 // Things that can have environment variables applied to them.
 pub trait Env {
@@ -113,22 +117,22 @@ fn tempdir_in_with_prefix<P: AsRef<Path>>(path: P, prefix: &str) -> io::Result<P
 /// ... perhaps this is so that the test data we have is only exercised on known
 /// triples?
 ///
-/// NOTE: This *cannot* be called within a currentprocess context as it creates
+/// NOTE: This *cannot* be called within a process context as it creates
 /// its own context on Windows hosts. This is partly by chance but also partly
 /// deliberate: If you need the host triple, or to call for_host(), you can do
-/// so outside of calls to run() or unit test code that runs in a currentprocess
+/// so outside of calls to run() or unit test code that runs in a process
 /// context.
 ///
 /// IF it becomes very hard to workaround that, then we can either make a second
-/// this_host_triple that doesn't make its own currentprocess or use
-/// TargetTriple::from_host() from within the currentprocess context as needed.
+/// this_host_triple that doesn't make its own process or use
+/// TargetTriple::from_host() from within the process context as needed.
 pub fn this_host_triple() -> String {
     if cfg!(target_os = "windows") {
         // For windows, this host may be different to the target: we may be
         // building with i686 toolchain, but on an x86_64 host, so run the
         // actual detection logic and trust it.
-        let tp = currentprocess::TestProcess::default();
-        return currentprocess::with(tp.into(), || TargetTriple::from_host().unwrap().to_string());
+        let tp = TestProcess::default();
+        return TargetTriple::from_host(&tp.process).unwrap().to_string();
     }
     let arch = if cfg!(target_arch = "x86") {
         "i686"
@@ -140,6 +144,10 @@ pub fn this_host_triple() -> String {
         "aarch64"
     } else if cfg!(target_arch = "loongarch64") {
         "loongarch64"
+    } else if cfg!(target_arch = "powerpc64") && cfg!(target_endian = "little") {
+        "powerpc64le"
+    } else if cfg!(target_arch = "s390x") {
+        "s390x"
     } else {
         unimplemented!()
     };
@@ -170,8 +178,8 @@ pub fn this_host_triple() -> String {
 // Format a string with this host triple.
 #[macro_export]
 macro_rules! for_host {
-    ($s: expr) => {
-        &format!($s, $crate::test::this_host_triple())
+    ($s:tt $($arg:tt)*) => {
+        &format!($s, $crate::test::this_host_triple() $($arg)*)
     };
 }
 
@@ -222,87 +230,4 @@ where
     let test_dir = test_dir()?;
     let rustup_home = RustupHome::new_in(test_dir)?;
     f(&rustup_home)
-}
-
-#[cfg(feature = "otel")]
-use once_cell::sync::Lazy;
-
-/// A tokio runtime for the sync tests, permitting the use of tracing. This is
-/// never shutdown, instead it is just dropped at end of process.
-#[cfg(feature = "otel")]
-static TRACE_RUNTIME: Lazy<tokio::runtime::Runtime> =
-    Lazy::new(|| tokio::runtime::Runtime::new().unwrap());
-/// A tracer for the tests.
-#[cfg(feature = "otel")]
-static TRACER: Lazy<opentelemetry_sdk::trace::Tracer> = Lazy::new(|| {
-    use std::time::Duration;
-
-    use opentelemetry::{global, KeyValue};
-    use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::{
-        propagation::TraceContextPropagator,
-        trace::{self, Sampler},
-        Resource,
-    };
-    use tokio::runtime::Handle;
-    use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
-
-    // Use the current runtime, or the sync test runtime otherwise.
-    let handle = match Handle::try_current() {
-        Ok(handle) => handle,
-        Err(_) => TRACE_RUNTIME.handle().clone(),
-    };
-    let _guard = handle.enter();
-
-    let tracer = opentelemetry_otlp::new_pipeline()
-        .tracing()
-        .with_exporter(
-            opentelemetry_otlp::new_exporter()
-                .tonic()
-                .with_timeout(Duration::from_secs(3)),
-        )
-        .with_trace_config(
-            trace::config()
-                .with_sampler(Sampler::AlwaysOn)
-                .with_resource(Resource::new(vec![KeyValue::new("service.name", "rustup")])),
-        )
-        .install_batch(opentelemetry_sdk::runtime::Tokio)
-        .unwrap();
-
-    global::set_text_map_propagator(TraceContextPropagator::new());
-    let env_filter = EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new("INFO"));
-    let telemetry = tracing_opentelemetry::layer().with_tracer(tracer.clone());
-    let subscriber = Registry::default().with(env_filter).with(telemetry);
-    tracing::subscriber::set_global_default(subscriber).unwrap();
-    tracer
-});
-
-pub fn before_test() {
-    #[cfg(feature = "otel")]
-    {
-        Lazy::force(&TRACER);
-    }
-}
-
-pub async fn before_test_async() {
-    #[cfg(feature = "otel")]
-    {
-        Lazy::force(&TRACER);
-    }
-}
-
-pub fn after_test() {
-    #[cfg(feature = "otel")]
-    {
-        let handle = TRACE_RUNTIME.handle();
-        let _guard = handle.enter();
-        TRACER.provider().map(|p| p.force_flush());
-    }
-}
-
-pub async fn after_test_async() {
-    #[cfg(feature = "otel")]
-    {
-        TRACER.provider().map(|p| p.force_flush());
-    }
 }

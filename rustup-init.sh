@@ -27,11 +27,13 @@ set -u
 
 # If RUSTUP_UPDATE_ROOT is unset or empty, default it.
 RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://dev.mcst.ru/rust/rustup}"
+# Set quiet as a global for ease of use
+RUSTUP_QUIET=no
 
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
     cat <<EOF
-rustup-init 1.27.1 (a8e4f5c64 2024-04-24)
+rustup-init 1.28.0 (6b57e4b95 2024-03-02)
 
 The installer for rustup
 
@@ -39,21 +41,21 @@ Usage: rustup-init[EXE] [OPTIONS]
 
 Options:
   -v, --verbose
-          Enable verbose output
+          Set log level to 'DEBUG' if 'RUSTUP_LOG' is unset
   -q, --quiet
-          Disable progress output
+          Disable progress output, set log level to 'WARN' if 'RUSTUP_LOG' is unset
   -y
-          Disable confirmation prompt.
-      --default-host <default-host>
+          Disable confirmation prompt
+      --default-host <DEFAULT_HOST>
           Choose a default host triple
-      --default-toolchain <default-toolchain>
+      --default-toolchain <DEFAULT_TOOLCHAIN>
           Choose a default toolchain to install. Use 'none' to not install any toolchains at all
-      --profile <profile>
+      --profile <PROFILE>
           [default: default] [possible values: minimal, default, complete]
-  -c, --component <components>...
-          Component name to also install
-  -t, --target <targets>...
-          Target name to also install
+  -c, --component <COMPONENT>
+          Comma-separated list of component names to also install
+  -t, --target <TARGET>
+          Comma-separated list of target names to also install
       --no-update-default-toolchain
           Don't update any existing default toolchain after install
       --no-modify-path
@@ -114,6 +116,9 @@ main() {
                 usage
                 exit 0
                 ;;
+            --quiet)
+                RUSTUP_QUIET=yes
+                ;;
             *)
                 OPTIND=1
                 if [ "${arg%%--*}" = "" ]; then
@@ -121,11 +126,14 @@ main() {
                     # don't attempt to interpret it.
                     continue
                 fi
-                while getopts :hy sub_arg "$arg"; do
+                while getopts :hqy sub_arg "$arg"; do
                     case "$sub_arg" in
                         h)
                             usage
                             exit 0
+                            ;;
+                        q)
+                            RUSTUP_QUIET=yes
                             ;;
                         y)
                             # user wants to skip the prompt --
@@ -140,18 +148,14 @@ main() {
         esac
     done
 
-    if $_ansi_escapes_are_valid; then
-        printf "\33[1minfo:\33[0m downloading installer\n" 1>&2
-    else
-        printf '%s\n' 'info: downloading installer' 1>&2
-    fi
+    say 'downloading installer'
 
     ensure mkdir -p "$_dir"
     ensure downloader "$_url" "$_file" "$_arch"
     ensure chmod u+x "$_file"
     if [ ! -x "$_file" ]; then
-        printf '%s\n' "Cannot execute $_file (likely because of mounting /tmp as noexec)." 1>&2
-        printf '%s\n' "Please copy the file to a location where you can execute binaries and run ./rustup-init${_ext}." 1>&2
+        err "Cannot execute $_file (likely because of mounting /tmp as noexec)."
+        err "Please copy the file to a location where you can execute binaries and run ./rustup-init${_ext}."
         exit 1
     fi
 
@@ -162,6 +166,7 @@ main() {
         # to explicitly connect /dev/tty to the installer's stdin.
         if [ ! -t 1 ]; then
             err "Unable to run interactively. Run with -y to accept defaults, --help for additional options"
+            exit 1;
         fi
 
         ignore "$_file" "$@" < /dev/tty
@@ -177,12 +182,23 @@ main() {
     return "$_retval"
 }
 
-check_proc() {
-    # Check for /proc by looking for the /proc/self/exe link
+get_current_exe() {
+    # Returns the executable used for system architecture detection
     # This is only run on Linux
-    if ! test -L /proc/self/exe ; then
-        err "fatal: Unable to find /proc/self/exe.  Is /proc mounted?  Installation cannot proceed without /proc."
+    local _current_exe
+    if test -L /proc/self/exe ; then
+        _current_exe=/proc/self/exe
+    else
+        warn "Unable to find /proc/self/exe. System architecture detection might be inaccurate."
+        if test -n "$SHELL" ; then
+            _current_exe=$SHELL
+        else
+            need_cmd /bin/sh
+            _current_exe=/bin/sh
+        fi
+        warn "Falling back to $_current_exe."
     fi
+    echo "$_current_exe"
 }
 
 get_bitness() {
@@ -193,45 +209,51 @@ get_bitness() {
     #   0x02 for 64-bit.
     # The printf builtin on some shells like dash only supports octal
     # escape sequences, so we use those.
+    local _current_exe=$1
     local _current_exe_head
-    _current_exe_head=$(head -c 5 /proc/self/exe )
+    _current_exe_head=$(head -c 5 "$_current_exe")
     if [ "$_current_exe_head" = "$(printf '\177ELF\001')" ]; then
         echo 32
     elif [ "$_current_exe_head" = "$(printf '\177ELF\002')" ]; then
         echo 64
     else
         err "unknown platform bitness"
+        exit 1;
     fi
 }
 
 is_host_amd64_elf() {
+    local _current_exe=$1
+
     need_cmd head
     need_cmd tail
     # ELF e_machine detection without dependencies beyond coreutils.
     # Two-byte field at offset 0x12 indicates the CPU,
     # but we're interested in it being 0x3E to indicate amd64, or not that.
     local _current_exe_machine
-    _current_exe_machine=$(head -c 19 /proc/self/exe | tail -c 1)
+    _current_exe_machine=$(head -c 19 "$_current_exe" | tail -c 1)
     [ "$_current_exe_machine" = "$(printf '\076')" ]
 }
 
 get_endianness() {
-    local cputype=$1
-    local suffix_eb=$2
-    local suffix_el=$3
+    local _current_exe=$1
+    local cputype=$2
+    local suffix_eb=$3
+    local suffix_el=$4
 
     # detect endianness without od/hexdump, like get_bitness() does.
     need_cmd head
     need_cmd tail
 
     local _current_exe_endianness
-    _current_exe_endianness="$(head -c 6 /proc/self/exe | tail -c 1)"
+    _current_exe_endianness="$(head -c 6 "$_current_exe" | tail -c 1)"
     if [ "$_current_exe_endianness" = "$(printf '\001')" ]; then
         echo "${cputype}${suffix_el}"
     elif [ "$_current_exe_endianness" = "$(printf '\002')" ]; then
         echo "${cputype}${suffix_eb}"
     else
         err "unknown platform endianness"
+        exit 1
     fi
 }
 
@@ -311,19 +333,14 @@ ensure_loongarch_uapi() {
             return 0
             ;;
         234)
-            echo >&2
-            echo 'Your Linux kernel does not provide the ABI required by this Rust' >&2
-            echo 'distribution.  Please check with your OS provider for how to obtain a' >&2
-            echo 'compatible Rust package for your system.' >&2
-            echo >&2
+            err 'Your Linux kernel does not provide the ABI required by this Rust distribution.'
+            err 'Please check with your OS provider for how to obtain a compatible Rust package for your system.'
             exit 1
             ;;
         *)
-            echo "Warning: Cannot determine current system's ABI flavor, continuing anyway." >&2
-            echo >&2
-            echo 'Note that the official Rust distribution only works with the upstream' >&2
-            echo 'kernel ABI.  Installation will fail if your running kernel happens to be' >&2
-            echo 'incompatible.' >&2
+            warn "Cannot determine current system's ABI flavor, continuing anyway."
+            warn 'Note that the official Rust distribution only works with the upstream kernel ABI.'
+            warn 'Installation will fail if your running kernel happens to be incompatible.'
             ;;
     esac
 }
@@ -388,6 +405,7 @@ get_architecture() {
         fi
     fi
 
+    local _current_exe
     case "$_ostype" in
 
         Android)
@@ -395,9 +413,9 @@ get_architecture() {
             ;;
 
         Linux)
-            check_proc
+            _current_exe=$(get_current_exe)
             _ostype=unknown-linux-$_clibtype
-            _bitness=$(get_bitness)
+            _bitness=$(get_bitness "$_current_exe")
             ;;
 
         FreeBSD)
@@ -426,6 +444,7 @@ get_architecture() {
 
         *)
             err "unrecognized OS type: $_ostype"
+            exit 1
             ;;
 
     esac
@@ -470,14 +489,14 @@ get_architecture() {
             ;;
 
         mips)
-            _cputype=$(get_endianness mips '' el)
+            _cputype=$(get_endianness "$_current_exe" mips '' el)
             ;;
 
         mips64)
             if [ "$_bitness" -eq 64 ]; then
                 # only n64 ABI is supported for now
                 _ostype="${_ostype}abi64"
-                _cputype=$(get_endianness mips64 '' el)
+                _cputype=$(get_endianness "$_current_exe" mips64 '' el)
             fi
             ;;
 
@@ -508,6 +527,7 @@ get_architecture() {
             ;;
         *)
             err "unknown CPU type: $_cputype"
+            exit 1
 
     esac
 
@@ -519,15 +539,11 @@ get_architecture() {
                     _cputype="$RUSTUP_CPUTYPE"
                 else {
                     # 32-bit executable for amd64 = x32
-                    if is_host_amd64_elf; then {
-                         echo "This host is running an x32 userland; as it stands, x32 support is poor," 1>&2
-                         echo "and there isn't a native toolchain -- you will have to install" 1>&2
-                         echo "multiarch compatibility with i686 and/or amd64, then select one" 1>&2
-                         echo "by re-running this script with the RUSTUP_CPUTYPE environment variable" 1>&2
-                         echo "set to i686 or x86_64, respectively." 1>&2
-                         echo 1>&2
-                         echo "You will be able to add an x32 target after installation by running" 1>&2
-                         echo "  rustup target add x86_64-unknown-linux-gnux32" 1>&2
+                    if is_host_amd64_elf "$_current_exe"; then {
+                        err "This host is running an x32 userland, for which no native toolchain is provided."
+                        err "You will have to install multiarch compatibility with i686 or amd64."
+                        err "To do so, set the RUSTUP_CPUTYPE environment variable set to i686 or amd64 and re-run this script."
+                        err "You will be able to add an x32 target after installation by running \`rustup target add x86_64-unknown-linux-gnux32\`."
                          exit 1
                     }; else
                         _cputype=i686
@@ -535,7 +551,7 @@ get_architecture() {
                 }; fi
                 ;;
             mips64)
-                _cputype=$(get_endianness mips '' el)
+                _cputype=$(get_endianness "$_current_exe" mips '' el)
                 ;;
             powerpc64)
                 _cputype=powerpc
@@ -550,6 +566,7 @@ get_architecture() {
                 ;;
             riscv64gc)
                 err "riscv64 with 32-bit userland unsupported"
+                exit 1
                 ;;
         esac
     fi
@@ -558,8 +575,9 @@ get_architecture() {
     # and fall back to arm.
     # See https://github.com/rust-lang/rustup.rs/issues/587.
     if [ "$_ostype" = "unknown-linux-gnueabihf" ] && [ "$_cputype" = armv7 ]; then
-        if ensure grep '^Features' /proc/cpuinfo | grep -E -q -v 'neon|simd'; then
-            # At least one processor does not have NEON (which is asimd on armv8+).
+        if ! (ensure grep '^Features' /proc/cpuinfo | grep -E -q 'neon|simd') ; then
+            # Either `/proc/cpuinfo` is malformed or unavailable, or
+            # at least one processor does not have NEON (which is asimd on armv8+).
             _cputype=arm
         fi
     fi
@@ -569,18 +587,34 @@ get_architecture() {
     RETVAL="$_arch"
 }
 
-say() {
-    printf 'rustup: %s\n' "$1"
+__print() {
+    if $_ansi_escapes_are_valid; then
+        printf '\33[1m%s:\33[0m %s\n' "$1" "$2" >&2
+    else
+        printf '%s: %s\n' "$1" "$2" >&2
+    fi
 }
 
+warn() {
+    __print 'warn' "$1" >&2
+}
+
+say() {
+    if [ "$RUSTUP_QUIET" = "no" ]; then
+        __print 'info' "$1" >&2
+    fi
+}
+
+# NOTE: you are required to exit yourself
+# we don't do it here because of multiline errors
 err() {
-    say "$1" >&2
-    exit 1
+    __print 'error' "$1" >&2
 }
 
 need_cmd() {
     if ! check_cmd "$1"; then
         err "need '$1' (command not found)"
+        exit 1
     fi
 }
 
@@ -589,14 +623,20 @@ check_cmd() {
 }
 
 assert_nz() {
-    if [ -z "$1" ]; then err "assert_nz $2"; fi
+    if [ -z "$1" ]; then
+        err "assert_nz $2"
+        exit 1
+    fi
 }
 
 # Run a command that should never fail. If the command fails execution
 # will immediately terminate with an error showing the failing
 # command.
 ensure() {
-    if ! "$@"; then err "command failed: $*"; fi
+    if ! "$@"; then
+        err "command failed: $*"
+        exit 1
+    fi
 }
 
 # This is just for indicating that commands' results are being
@@ -633,29 +673,33 @@ downloader() {
         get_ciphersuites_for_curl
         _ciphersuites="$RETVAL"
         if [ -n "$_ciphersuites" ]; then
+            # shellcheck disable=SC2086
             _err=$(curl $_retry --proto '=https' --tlsv1.2 --ciphers "$_ciphersuites" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
             _status=$?
         else
-            echo "Warning: Not enforcing strong cipher suites for TLS, this is potentially less secure"
+            warn "Not enforcing strong cipher suites for TLS, this is potentially less secure"
             if ! check_help_for "$3" curl --proto --tlsv1.2; then
-                echo "Warning: Not enforcing TLS v1.2, this is potentially less secure"
+                warn "Not enforcing TLS v1.2, this is potentially less secure"
+                # shellcheck disable=SC2086
                 _err=$(curl $_retry --silent --show-error --fail --location "$1" --output "$2" 2>&1)
                 _status=$?
             else
+                # shellcheck disable=SC2086
                 _err=$(curl $_retry --proto '=https' --tlsv1.2 --silent --show-error --fail --location "$1" --output "$2" 2>&1)
                 _status=$?
             fi
         fi
         if [ -n "$_err" ]; then
-            echo "$_err" >&2
+            warn "$_err"
             if echo "$_err" | grep -q 404$; then
                 err "installer for platform '$3' not found, this may be unsupported"
+                exit 1
             fi
         fi
         return $_status
     elif [ "$_dld" = wget ]; then
         if [ "$(wget -V 2>&1|head -2|tail -1|cut -f1 -d" ")" = "BusyBox" ]; then
-            echo "Warning: using the BusyBox version of wget.  Not enforcing strong cipher suites for TLS or TLS v1.2, this is potentially less secure"
+            warn "using the BusyBox version of wget.  Not enforcing strong cipher suites for TLS or TLS v1.2, this is potentially less secure"
             _err=$(wget "$1" -O "$2" 2>&1)
             _status=$?
         else
@@ -665,9 +709,9 @@ downloader() {
                 _err=$(wget --https-only --secure-protocol=TLSv1_2 --ciphers "$_ciphersuites" "$1" -O "$2" 2>&1)
                 _status=$?
             else
-                echo "Warning: Not enforcing strong cipher suites for TLS, this is potentially less secure"
+                warn "Not enforcing strong cipher suites for TLS, this is potentially less secure"
                 if ! check_help_for "$3" wget --https-only --secure-protocol; then
-                    echo "Warning: Not enforcing TLS v1.2, this is potentially less secure"
+                    warn "Not enforcing TLS v1.2, this is potentially less secure"
                     _err=$(wget "$1" -O "$2" 2>&1)
                     _status=$?
                 else
@@ -677,14 +721,16 @@ downloader() {
             fi
         fi
         if [ -n "$_err" ]; then
-            echo "$_err" >&2
+            warn "$_err"
             if echo "$_err" | grep -q ' 404 Not Found$'; then
                 err "installer for platform '$3' not found, this may be unsupported"
+                exit 1
             fi
         fi
         return $_status
     else
         err "Unknown downloader"   # should not reach here
+        exit 1
     fi
 }
 
@@ -698,7 +744,7 @@ check_help_for() {
     shift
 
     local _category
-    if "$_cmd" --help | grep -q 'For all options use the manual or "--help all".'; then
+    if "$_cmd" --help | grep -q '"--help all"'; then
       _category="all"
     else
       _category=""
@@ -708,24 +754,27 @@ check_help_for() {
 
         *darwin*)
         if check_cmd sw_vers; then
-            case $(sw_vers -productVersion) in
-                10.*)
+            local _os_version
+            local _os_major
+            _os_version=$(sw_vers -productVersion)
+            _os_major=$(echo "$_os_version" | cut -d. -f1)
+            case $_os_major in
+                10)
                     # If we're running on macOS, older than 10.13, then we always
                     # fail to find these options to force fallback
-                    if [ "$(sw_vers -productVersion | cut -d. -f2)" -lt 13 ]; then
+                    if [ "$(echo "$_os_version" | cut -d. -f2)" -lt 13 ]; then
                         # Older than 10.13
-                        echo "Warning: Detected macOS platform older than 10.13"
+                        warn "Detected macOS platform older than 10.13"
                         return 1
                     fi
                     ;;
-                11.*)
-                    # We assume Big Sur will be OK for now
-                    ;;
                 *)
-                    # Unknown product version, warn and continue
-                    echo "Warning: Detected unknown macOS major version: $(sw_vers -productVersion)"
-                    echo "Warning TLS capabilities detection may fail"
-                    ;;
+                    if ! { [ "$_os_major" -eq "$_os_major" ] 2>/dev/null && [ "$_os_major" -ge 11 ]; }; then
+                        # Unknown product version, warn and continue
+                        warn "Detected unknown macOS major version: $_os_version"
+                        warn "TLS capabilities detection may fail"
+                    fi
+                    ;; # We assume that macOS v11+ will always be okay.
             esac
         fi
         ;;
@@ -843,4 +892,13 @@ get_strong_ciphersuites_for() {
     fi
 }
 
-main "$@" || exit 1
+set +u
+case "$RUSTUP_INIT_SH_PRINT" in
+    arch | architecture)
+        get_architecture || exit 1
+        echo "$RETVAL"
+        ;;
+    *)
+        main "$@" || exit 1
+        ;;
+esac

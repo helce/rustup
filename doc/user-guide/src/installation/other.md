@@ -3,8 +3,9 @@
 The primary installation method, as described at <https://rustup.rs>, differs
 by platform:
 
-* On Windows, download and run the [`rustup-init.exe` built for the
-  `x86_64-pc-windows-msvc` target][setup]. In general, this is the build of
+* On Windows, download and run the `rustup-init.exe` built for the
+  [`x86_64-pc-windows-msvc`] or [`aarch64-pc-windows-msvc`] target,
+  depending on your OS architecture. In general, this is the build of
   `rustup` one should install on Windows. This will require the Visual C++
   Build Tools 2019 or equivalent (Visual Studio 2019, etc.) to already be
   installed. If you would prefer to install GNU toolchains or the i686
@@ -15,7 +16,8 @@ by platform:
   downloads and runs [`rustup-init.sh`], which in turn downloads and runs the
   correct version of the `rustup-init` executable for your platform.
 
-[setup]: https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+[`x86_64-pc-windows-msvc`]: https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe
+[`aarch64-pc-windows-msvc`]: https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe
 [`rustup-init.sh`]: https://static.rust-lang.org/rustup/rustup-init.sh
 
 `rustup-init` accepts arguments, which can be passed through the shell script.
@@ -36,6 +38,39 @@ $ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --profile
 > If you have encountered any problems installing `rustup` with a package manager,
 > please contact the package maintainer(s) for further information.
 
+### General tips
+
+Different package managers take slightly different approaches towards managing rustup.
+After installing rustup with your favorite package manager, there are usually two possibilities:
+
+- If your package manager has made the `rustup` command available
+  together with proxies for Rust tools such as `rustc` and `cargo`,
+  picking a default toolchain (e.g. `stable`) would usually be enough:
+
+  ```sh
+  $ rustup default stable
+  ```
+
+  > As of 2024/12/23, this is the case for
+  > [APT](https://packages.debian.org/search?searchon=names&keywords=rustup),
+  > [homebrew](https://formulae.brew.sh/formula/rustup)
+  > and [pacman](https://wiki.archlinux.org/title/Rust#Arch_Linux_package).
+
+- If your package manager has only made the `rustup-init` command available, simply run:
+
+  ```sh
+  $ rustup-init
+  ```
+
+  This will allow you to perform the initial setup of `rustup`, populate all the proxies
+  managed by rustup, and install a default toolchain. When the installation is completed,
+  please make sure that these proxies (usually under `$HOME/.cargo/bin`) are exposed via your `$PATH`.
+
+  > As of 2024/12/23, this is the case for
+  > [DNF](https://developer.fedoraproject.org/tech/languages/rust/further-reading.html).
+
+Now you should be able to run `rustup`, `rustc`, `cargo`, etc. normally.
+
 ### APT
 
 Starting from Debian 13 (trixie) and Ubuntu 24.04 (noble),
@@ -47,17 +82,16 @@ $ sudo apt install rustup
 
 ### Homebrew
 
-You can use `brew` to install `rustup-init`[^not-rust]:
+You can use `brew` to install `rustup`[^not-rust]:
 
 ```sh
-$ brew install rustup-init
+$ brew install rustup
 ```
 
-Then execute `rustup-init` to proceed with the installation.
-
-When the installation is complete,
-make sure that `$HOME/.cargo/bin` is in your `$PATH`,
-and you should be able to use `rustup` normally.
+Please note that Rust tools like `rustc` and `cargo` are not available via `$PATH` by default
+in this `rustup` distribution
+(see [homebrew-core#177582](https://github.com/Homebrew/homebrew-core/pull/177582) for more details).
+You might want to add `$(brew --prefix rustup)/bin` to `$PATH` to make them easier to access.
 
 [^not-rust]: This is not to be confused with the `rust` package,
 which is a `brew`-managed `rust` toolchain installation.
@@ -74,6 +108,8 @@ You can manually download `rustup-init` for a given target from
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init.sha256)
 - [aarch64-linux-android](https://static.rust-lang.org/rustup/dist/aarch64-linux-android/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-linux-android/rustup-init.sha256)
+- [aarch64-pc-windows-msvc](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe.sha256)
 - [aarch64-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init.sha256)
 - [aarch64-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init)
@@ -100,6 +136,8 @@ You can manually download `rustup-init` for a given target from
   - [sha256 file](https://static.rust-lang.org/rustup/dist/i686-unknown-linux-gnu/rustup-init.sha256)
 - [loongarch64-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/loongarch64-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/loongarch64-unknown-linux-gnu/rustup-init.sha256)
+- [loongarch64-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/loongarch64-unknown-linux-musl/rustup-init)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/loongarch64-unknown-linux-musl/rustup-init.sha256)
 - [mips-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/mips-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/mips-unknown-linux-gnu/rustup-init.sha256)
 - [mips64-unknown-linux-gnuabi64](https://static.rust-lang.org/rustup/dist/mips64-unknown-linux-gnuabi64/rustup-init)

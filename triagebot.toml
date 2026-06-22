@@ -1,9 +1,21 @@
 [relabel]
 
 allow-unauthenticated = [
-    "bug", "duplicate", "enhancement", "forwarded",
-    "performance", "question", "security", "tracking", "website",
-    "O-*", "A-*"
+  "bug",
+  "duplicate",
+  "enhancement",
+  "forwarded",
+  "performance",
+  "question",
+  "security",
+  "tracking",
+  "website",
+  "O-*",
+  "A-*",
 ]
 
 [assign]
+
+# Enable issue transfers within the org
+# Documentation at: https://forge.rust-lang.org/triagebot/transfer.html
+[transfer]

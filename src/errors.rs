@@ -11,12 +11,11 @@ use thiserror::Error as ThisError;
 use url::Url;
 
 use crate::{
-    currentprocess::process,
-    dist::dist::{TargetTriple, ToolchainDesc},
-};
-use crate::{
-    dist::manifest::{Component, Manifest},
-    toolchain::names::{PathBasedToolchainName, ToolchainName},
+    dist::{
+        Channel, TargetTriple, ToolchainDesc,
+        manifest::{Component, Manifest},
+    },
+    toolchain::{PathBasedToolchainName, ToolchainName},
 };
 
 /// A type erasing thunk for the retry crate to permit use with anyhow. See <https://github.com/dtolnay/anyhow/issues/149>
@@ -25,7 +24,7 @@ use crate::{
 pub struct OperationError(pub anyhow::Error);
 
 #[derive(ThisError, Debug)]
-pub(crate) enum RustupError {
+pub enum RustupError {
     #[error("partially downloaded file may have been damaged and was removed, please try again")]
     BrokenPartialFile,
     #[error("component download failed for {0}")]
@@ -71,6 +70,8 @@ pub(crate) enum RustupError {
     ReadingDirectory { name: &'static str, path: PathBuf },
     #[error("could not read {name} file: '{}'", .path.display())]
     ReadingFile { name: &'static str, path: PathBuf },
+    #[error("could not parse {name} file: '{}'", .path.display())]
+    ParsingFile { name: &'static str, path: PathBuf },
     #[error("could not remove '{}' directory: '{}'", .name, .path.display())]
     RemovingDirectory { name: &'static str, path: PathBuf },
     #[error("could not remove '{name}' file: '{}'", .path.display())]
@@ -83,21 +84,36 @@ pub(crate) enum RustupError {
     },
     #[error("command failed: '{}'", PathBuf::from(.name).display())]
     RunningCommand { name: OsString },
+    #[error(
+        "toolchain '{toolchain}' may not be able to run on this system\n\
+        note: to build software for that platform, try `rustup target add {target_triple}` instead\n\
+        note: add the `--force-non-host` flag to install the toolchain anyway"
+    )]
+    ToolchainIncompatible {
+        toolchain: String,
+        target_triple: TargetTriple,
+    },
     #[error("toolchain '{0}' is not installable")]
     ToolchainNotInstallable(String),
-    #[error("toolchain '{0}' is not installed")]
-    ToolchainNotInstalled(ToolchainName),
+    #[error(
+        "toolchain '{name}' is not installed{}",
+        if let ToolchainName::Official(t) = name {
+            format!("\nhelp: run `rustup toolchain install {t}` to install it")
+        } else {
+            String::new()
+        },
+    )]
+    ToolchainNotInstalled { name: ToolchainName },
     #[error("path '{0}' not found")]
     PathToolchainNotInstalled(PathBasedToolchainName),
     #[error(
-        "rustup could not choose a version of {} to run, because one wasn't specified explicitly, and no default is configured.\n{}",
-        process().name().unwrap_or_else(|| "Rust".into()),
-        "help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
+        "rustup could not choose a version of {0} to run, because one wasn't specified explicitly, and no default is configured.\n\
+        help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
     )]
-    ToolchainNotSelected,
+    ToolchainNotSelected(String),
     #[error("toolchain '{}' does not contain component {}{}{}", .desc, .component, suggest_message(.suggestion), if .component.contains("rust-std") {
         format!("\nnote: not all platforms have the standard library pre-compiled: https://doc.rust-lang.org/nightly/rustc/platform-support.html{}",
-            if desc.channel == "nightly" { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
+            if desc.channel == Channel::Nightly { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
         )
     } else { "".to_string() })]
     UnknownComponent {
@@ -141,7 +157,7 @@ fn suggest_message(suggestion: &Option<String>) -> String {
 
 /// Returns a error message indicating that certain [`Component`]s are unavailable.
 ///
-/// See also [`component_missing_msg`](../dist/dist/fn.components_missing_msg.html)
+/// See also [`components_missing_msg`](../dist/dist/fn.components_missing_msg.html)
 /// which generates error messages for component unavailability toolchain-wide operations.
 ///
 /// # Panics
@@ -149,7 +165,9 @@ fn suggest_message(suggestion: &Option<String>) -> String {
 fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &str) -> String {
     let mut buf = vec![];
     match cs {
-        [] => panic!("`component_unavailable_msg` should not be called with an empty collection of unavailable components"),
+        [] => panic!(
+            "`component_unavailable_msg` should not be called with an empty collection of unavailable components"
+        ),
         [c] => {
             let _ = writeln!(
                 buf,
@@ -185,7 +203,7 @@ fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &
 
             let _ = write!(
                 buf,
-                "some components unavailable for download for channel '{toolchain}': {cs_str}"
+                "some components are unavailable for download for channel '{toolchain}': {cs_str}"
             );
 
             if toolchain.starts_with("nightly") {

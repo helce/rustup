@@ -13,7 +13,7 @@ on:
       - master
       - stable
   schedule:
-    - cron: "30 0 * * 1" # Every Monday at half past midnight UTC
+    - cron: "30 0 * * 1,3,5" # At 00:30 UTC on Monday, Wednesday, and Friday
 
 jobs:
 
@@ -24,6 +24,10 @@ jobs:
     if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-master skip-stable
     env:
       RUSTFLAGS: -Ctarget-feature=+crt-static
+      RUST_MIN_STACK: 16777216
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -32,9 +36,15 @@ jobs:
           - release
         target:
           - x86_64-pc-windows-msvc
+          - aarch64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
         include:
           - target: x86_64-pc-windows-msvc
             run_tests: YES
+          - target: x86_64-pc-windows-gnu
+            arch: x86_64
+            mingwdir: mingw64
+            gcc: x86_64-w64-mingw32-gcc
     steps:
       - uses: actions/checkout@v4
         # v2 defaults to a shallow checkout, but we need at least to the previous tag
@@ -52,18 +62,22 @@ jobs:
           New-Item "${env:USERPROFILE}\.cargo\registry" -ItemType Directory -Force
           New-Item "${env:USERPROFILE}\.cargo\git" -ItemType Directory -Force
         shell: powershell
+      - name: Install NASM
+        # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
+        # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
+        uses: ilammy/setup-nasm@v1
+        if: matrix.mingwdir == ''
       - name: Install mingw
-        run: |
-          # We retrieve mingw from the Rust CI buckets
-          # Disable the download progress bar which can cause perf issues
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest ${{ matrix.mingw }} -OutFile mingw.7z
-          7z x -y mingw.7z -oC:\msys64 | Out-Null
-          del mingw.7z
-          echo "C:\msys64\usr\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          echo "C:\msys64\${{ matrix.mingwdir }}\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+        uses: bwoodsend/setup-winlibs-action@v1
+        if: matrix.mingwdir != ''
+        with:
+          architecture: ${{ matrix.arch }}
+      - name: Verify mingw gcc installation
         shell: powershell
-        if: matrix.mingw != ''
+        if: matrix.mingwdir != ''
+        run: |
+          Get-Command ${{ matrix.gcc }}
+          ${{ matrix.gcc }} --version
       - name: Set PATH
         run: |
           echo "%USERPROFILE%\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
@@ -119,7 +133,7 @@ jobs:
           cargo check --all --all-targets --features test
           git ls-files -- '*.rs' | xargs touch
       - name: Run cargo clippy
-        if: matrix.mode != 'release' && matrix.mingw == ''
+        if: matrix.mode != 'release' && matrix.mingwdir == ''
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -132,12 +146,13 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/rustup-init.exe
           retention-days: 7
-      - name: Acquire the AWS tooling
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+      - name: Ensure that awscli is installed
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
-          choco upgrade awscli
+          Get-Command aws
+          aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           .\ci\prepare-deploy.ps1
         shell: powershell
@@ -149,6 +164,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive dist s3://rustup-builds/${{ github.sha }}/dist
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -158,9 +185,13 @@ jobs:
   # Do not edit this file in .github/workflows
   build-windows-master: # job-name skip-pr skip-stable
     runs-on: windows-latest
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') || github.event_name == 'schedule' }} # skip-pr skip-stable
+    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') }} # skip-pr skip-stable
     env:
       RUSTFLAGS: -Ctarget-feature=+crt-static
+      RUST_MIN_STACK: 16777216
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -169,14 +200,15 @@ jobs:
           - release
         target:
           - x86_64-pc-windows-msvc
-          - aarch64-pc-windows-msvc # skip-pr
-          - x86_64-pc-windows-gnu # skip-pr
+          - aarch64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
         include:
           - target: x86_64-pc-windows-msvc
             run_tests: YES
-          - target: x86_64-pc-windows-gnu # skip-pr
-            mingw: https://ci-mirrors.rust-lang.org/rustc/x86_64-6.3.0-release-posix-seh-rt_v5-rev2.7z # skip-pr
-            mingwdir: mingw64 # skip-pr
+          - target: x86_64-pc-windows-gnu
+            arch: x86_64
+            mingwdir: mingw64
+            gcc: x86_64-w64-mingw32-gcc
     steps:
       - uses: actions/checkout@v4
         # v2 defaults to a shallow checkout, but we need at least to the previous tag
@@ -194,18 +226,22 @@ jobs:
           New-Item "${env:USERPROFILE}\.cargo\registry" -ItemType Directory -Force
           New-Item "${env:USERPROFILE}\.cargo\git" -ItemType Directory -Force
         shell: powershell
+      - name: Install NASM
+        # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
+        # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
+        uses: ilammy/setup-nasm@v1
+        if: matrix.mingwdir == ''
       - name: Install mingw
-        run: |
-          # We retrieve mingw from the Rust CI buckets
-          # Disable the download progress bar which can cause perf issues
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest ${{ matrix.mingw }} -OutFile mingw.7z
-          7z x -y mingw.7z -oC:\msys64 | Out-Null
-          del mingw.7z
-          echo "C:\msys64\usr\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          echo "C:\msys64\${{ matrix.mingwdir }}\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+        uses: bwoodsend/setup-winlibs-action@v1
+        if: matrix.mingwdir != ''
+        with:
+          architecture: ${{ matrix.arch }}
+      - name: Verify mingw gcc installation
         shell: powershell
-        if: matrix.mingw != ''
+        if: matrix.mingwdir != ''
+        run: |
+          Get-Command ${{ matrix.gcc }}
+          ${{ matrix.gcc }} --version
       - name: Set PATH
         run: |
           echo "%USERPROFILE%\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
@@ -261,7 +297,7 @@ jobs:
           cargo check --all --all-targets --features test
           git ls-files -- '*.rs' | xargs touch
       - name: Run cargo clippy
-        if: matrix.mode != 'release' && matrix.mingw == ''
+        if: matrix.mode != 'release' && matrix.mingwdir == ''
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -274,12 +310,13 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/rustup-init.exe
           retention-days: 7
-      - name: Acquire the AWS tooling
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+      - name: Ensure that awscli is installed
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
-          choco upgrade awscli
+          Get-Command aws
+          aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           .\ci\prepare-deploy.ps1
         shell: powershell
@@ -291,6 +328,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive dist s3://rustup-builds/${{ github.sha }}/dist
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -300,9 +349,13 @@ jobs:
   # Do not edit this file in .github/workflows
   build-windows-stable: # job-name skip-master skip-pr
     runs-on: windows-latest
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' }} # skip-pr skip-master
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-master
     env:
       RUSTFLAGS: -Ctarget-feature=+crt-static
+      RUST_MIN_STACK: 16777216
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -312,18 +365,20 @@ jobs:
         target:
           - x86_64-pc-windows-msvc
           - i686-pc-windows-msvc # skip-pr skip-master
-          - aarch64-pc-windows-msvc # skip-pr
-          - x86_64-pc-windows-gnu # skip-pr
+          - aarch64-pc-windows-msvc
+          - x86_64-pc-windows-gnu
           - i686-pc-windows-gnu # skip-pr skip-master
         include:
           - target: x86_64-pc-windows-msvc
             run_tests: YES
-          - target: x86_64-pc-windows-gnu # skip-pr
-            mingw: https://ci-mirrors.rust-lang.org/rustc/x86_64-6.3.0-release-posix-seh-rt_v5-rev2.7z # skip-pr
-            mingwdir: mingw64 # skip-pr
+          - target: x86_64-pc-windows-gnu
+            arch: x86_64
+            mingwdir: mingw64
+            gcc: x86_64-w64-mingw32-gcc
           - target: i686-pc-windows-gnu # skip-pr skip-master
+            arch: i686 # skip-pr skip-master
             mingwdir: mingw32 # skip-pr skip-master
-            mingw: https://ci-mirrors.rust-lang.org/rustc/i686-6.3.0-release-posix-dwarf-rt_v5-rev2.7z # skip-pr skip-master
+            gcc: i686-w64-mingw32-gcc # skip-pr skip-master
     steps:
       - uses: actions/checkout@v4
         # v2 defaults to a shallow checkout, but we need at least to the previous tag
@@ -341,18 +396,22 @@ jobs:
           New-Item "${env:USERPROFILE}\.cargo\registry" -ItemType Directory -Force
           New-Item "${env:USERPROFILE}\.cargo\git" -ItemType Directory -Force
         shell: powershell
+      - name: Install NASM
+        # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
+        # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
+        uses: ilammy/setup-nasm@v1
+        if: matrix.mingwdir == ''
       - name: Install mingw
-        run: |
-          # We retrieve mingw from the Rust CI buckets
-          # Disable the download progress bar which can cause perf issues
-          $ProgressPreference = "SilentlyContinue"
-          Invoke-WebRequest ${{ matrix.mingw }} -OutFile mingw.7z
-          7z x -y mingw.7z -oC:\msys64 | Out-Null
-          del mingw.7z
-          echo "C:\msys64\usr\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
-          echo "C:\msys64\${{ matrix.mingwdir }}\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+        uses: bwoodsend/setup-winlibs-action@v1
+        if: matrix.mingwdir != ''
+        with:
+          architecture: ${{ matrix.arch }}
+      - name: Verify mingw gcc installation
         shell: powershell
-        if: matrix.mingw != ''
+        if: matrix.mingwdir != ''
+        run: |
+          Get-Command ${{ matrix.gcc }}
+          ${{ matrix.gcc }} --version
       - name: Set PATH
         run: |
           echo "%USERPROFILE%\.cargo\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
@@ -408,7 +467,7 @@ jobs:
           cargo check --all --all-targets --features test
           git ls-files -- '*.rs' | xargs touch
       - name: Run cargo clippy
-        if: matrix.mode != 'release' && matrix.mingw == ''
+        if: matrix.mode != 'release' && matrix.mingwdir == ''
         env:
           TARGET: ${{ matrix.target }}
         run: |
@@ -421,12 +480,13 @@ jobs:
           path: |
             target/${{ matrix.target }}/release/rustup-init.exe
           retention-days: 7
-      - name: Acquire the AWS tooling
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+      - name: Ensure that awscli is installed
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
-          choco upgrade awscli
+          Get-Command aws
+          aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           .\ci\prepare-deploy.ps1
         shell: powershell
@@ -438,6 +498,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive dist s3://rustup-builds/${{ github.sha }}/dist
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -446,8 +518,11 @@ jobs:
   # This is ci/actions-templates/linux-builds-template.yaml
   # Do not edit this file in .github/workflows
   build-linux-pr: # job-name skip-master skip-stable
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
     if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-master skip-stable
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -458,10 +533,17 @@ jobs:
           - x86_64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - aarch64-linux-android
+          - aarch64-unknown-linux-gnu
         include:
           - target: x86_64-unknown-linux-gnu
             run_tests: YES
             #snap_arch: amd64
+            # We add an ARM-based host to the following target.
+            # We need to do that because rust's CI uses ARM-based runners
+            # to generate their Dockerfiles.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            run_tests: YES
           - target: armv7-unknown-linux-gnueabihf
             #snap_arch: armhf
     steps:
@@ -546,6 +628,7 @@ jobs:
             --env LIBZ_SYS_STATIC=1 \
             --env SKIP_TESTS="${SKIP_TESTS}" \
             --env TARGET="${TARGET}" \
+            --env INSTALL_BINDGEN=1 \
             --init \
             --rm \
             --tty \
@@ -566,12 +649,12 @@ jobs:
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -582,6 +665,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -590,8 +685,11 @@ jobs:
   # This is ci/actions-templates/linux-builds-template.yaml
   # Do not edit this file in .github/workflows
   build-linux-master: # job-name skip-pr skip-stable
-    runs-on: ubuntu-latest
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') || github.event_name == 'schedule' }} # skip-pr skip-stable
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    if: ${{ (github.event_name == 'push' && github.ref_name == 'master') }} # skip-pr skip-stable
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -602,15 +700,19 @@ jobs:
           - x86_64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - aarch64-linux-android
-          - aarch64-unknown-linux-gnu     # skip-pr
-          - powerpc64-unknown-linux-gnu   # skip-pr
-          - x86_64-unknown-linux-musl     # skip-pr
+          - aarch64-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu    # skip-pr
+          - x86_64-unknown-linux-musl      # skip-pr
         include:
           - target: x86_64-unknown-linux-gnu
             run_tests: YES
             #snap_arch: amd64
-          - target: aarch64-unknown-linux-gnu # skip-pr
-            #snap_arch: arm64 # skip-pr
+            # We add an ARM-based host to the following target.
+            # We need to do that because rust's CI uses ARM-based runners
+            # to generate their Dockerfiles.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            run_tests: YES
           - target: armv7-unknown-linux-gnueabihf
             #snap_arch: armhf
     steps:
@@ -695,6 +797,7 @@ jobs:
             --env LIBZ_SYS_STATIC=1 \
             --env SKIP_TESTS="${SKIP_TESTS}" \
             --env TARGET="${TARGET}" \
+            --env INSTALL_BINDGEN=1 \
             --init \
             --rm \
             --tty \
@@ -715,12 +818,12 @@ jobs:
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -731,6 +834,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -739,8 +854,11 @@ jobs:
   # This is ci/actions-templates/linux-builds-template.yaml
   # Do not edit this file in .github/workflows
   build-linux-stable: # job-name skip-master skip-pr
-    runs-on: ubuntu-latest
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' }} # skip-pr skip-master
+    runs-on: ${{ matrix.os || 'ubuntu-latest' }}
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-master
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -751,33 +869,37 @@ jobs:
           - x86_64-unknown-linux-gnu
           - armv7-unknown-linux-gnueabihf
           - aarch64-linux-android
-          - aarch64-unknown-linux-gnu     # skip-pr
-          - aarch64-unknown-linux-musl    # skip-pr skip-master
-          - powerpc64-unknown-linux-gnu   # skip-pr
-          - x86_64-unknown-linux-musl     # skip-pr
-          - i686-unknown-linux-gnu        # skip-pr skip-master
-          - arm-unknown-linux-gnueabi     # skip-pr skip-master
-          - arm-unknown-linux-gnueabihf   # skip-pr skip-master
-          - x86_64-unknown-freebsd        # skip-pr skip-master
-          - x86_64-unknown-netbsd         # skip-pr skip-master
-          - x86_64-unknown-illumos        # skip-pr skip-master
-          - powerpc-unknown-linux-gnu     # skip-pr skip-master
-          - powerpc64le-unknown-linux-gnu # skip-pr skip-master
-          - s390x-unknown-linux-gnu       # skip-pr skip-master
-          - arm-linux-androideabi         # skip-pr skip-master
-          - armv7-linux-androideabi       # skip-pr skip-master
-          - i686-linux-android            # skip-pr skip-master
-          - x86_64-linux-android          # skip-pr skip-master
-          - riscv64gc-unknown-linux-gnu   # skip-pr skip-master
-          - loongarch64-unknown-linux-gnu # skip-pr skip-master
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl     # skip-pr skip-master
+          - powerpc64-unknown-linux-gnu    # skip-pr
+          - x86_64-unknown-linux-musl      # skip-pr
+          - i686-unknown-linux-gnu         # skip-pr skip-master
+          - arm-unknown-linux-gnueabi      # skip-pr skip-master
+          - arm-unknown-linux-gnueabihf    # skip-pr skip-master
+          - x86_64-unknown-freebsd         # skip-pr skip-master
+          - x86_64-unknown-netbsd          # skip-pr skip-master
+          - x86_64-unknown-illumos         # skip-pr skip-master
+          - powerpc-unknown-linux-gnu      # skip-pr skip-master
+          - powerpc64le-unknown-linux-gnu  # skip-pr skip-master
+          - s390x-unknown-linux-gnu        # skip-pr skip-master
+          - arm-linux-androideabi          # skip-pr skip-master
+          - armv7-linux-androideabi        # skip-pr skip-master
+          - x86_64-linux-android           # skip-pr skip-master
+          - riscv64gc-unknown-linux-gnu    # skip-pr skip-master
+          - loongarch64-unknown-linux-gnu  # skip-pr skip-master
+          - loongarch64-unknown-linux-musl # skip-pr skip-master
         include:
           - target: x86_64-unknown-linux-gnu
             run_tests: YES
             #snap_arch: amd64
           - target: i686-unknown-linux-gnu # skip-pr skip-master
             #snap_arch: i386  # skip-pr skip-master
-          - target: aarch64-unknown-linux-gnu # skip-pr
-            #snap_arch: arm64 # skip-pr
+            # We add an ARM-based host to the following target.
+            # We need to do that because rust's CI uses ARM-based runners
+            # to generate their Dockerfiles.
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            run_tests: YES
           - target: armv7-unknown-linux-gnueabihf
             #snap_arch: armhf
           - target: powerpc64le-unknown-linux-gnu # skip-pr skip-master
@@ -866,6 +988,7 @@ jobs:
             --env LIBZ_SYS_STATIC=1 \
             --env SKIP_TESTS="${SKIP_TESTS}" \
             --env TARGET="${TARGET}" \
+            --env INSTALL_BINDGEN=1 \
             --init \
             --rm \
             --tty \
@@ -886,12 +1009,12 @@ jobs:
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -902,6 +1025,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -913,6 +1048,9 @@ jobs:
     runs-on: macos-13 # skip-aarch64
     env: # skip-aarch64
       MACOSX_DEPLOYMENT_TARGET: 10.12 # skip-aarch64
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       matrix:
         mode:
@@ -996,12 +1134,13 @@ jobs:
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
+          brew install --overwrite awscli
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -1012,6 +1151,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -1026,9 +1177,12 @@ jobs:
   # This is ci/actions-templates/macos-builds-template.yaml
   # Do not edit this file in .github/workflows
   build-macos-aarch64: # job-name skip-x86_64
-    runs-on: macos-14 # skip-x86_64
+    runs-on: macos-latest # skip-x86_64
     env: # skip-x86_64
       MACOSX_DEPLOYMENT_TARGET: 11.0 # skip-x86_64
+    permissions:
+      id-token: write
+      contents: read
     strategy:
       matrix:
         mode:
@@ -1112,12 +1266,13 @@ jobs:
             target/${{ matrix.target }}/release/rustup-init
           retention-days: 7
       - name: Ensure that awscli is installed
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
+          brew install --overwrite awscli
           which aws
           aws --version
       - name: Prepare the dist
-        if: github.event_name == 'push' && github.ref == 'refs/heads/stable' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/master')
         run: |
           bash ci/prepare-deploy.bash
       - name: Deploy build to dev-static dist tree for release team
@@ -1128,6 +1283,18 @@ jobs:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
+      - name: Configure AWS credentials
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
+          aws-region: us-east-1
+      - name: Deploy build to rustup-builds bucket for release team
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master' && matrix.mode == 'release'
+        run: |
+          aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
+        env:
+          AWS_DEFAULT_REGION: us-east-1
       - name: Clear the cargo caches
         run: |
           cargo install cargo-cache --no-default-features --features ci-autoclean
@@ -1159,7 +1326,9 @@ jobs:
         usesh: true
         copyback: false
         prepare: |
-          pkg install -y git gmake bash sudo
+          pkg install -y git gmake bash sudo \
+            `# The following packages are required by 'aws-lc-rs':` \
+            cmake-core llvm-devel-lite rust-bindgen-cli
         run: |
           echo "========="
           echo "create non-root user and log into it"
@@ -1189,7 +1358,9 @@ jobs:
         usesh: true
         copyback: false
         prepare: |
-          pkg install -y git gmake bash sudo
+          pkg install -y git gmake bash sudo \
+            `# The following packages are required by 'aws-lc-rs':` \
+            cmake-core llvm-devel-lite rust-bindgen-cli
         run: |
           echo "========="
           echo "create non-root user and log into it"
@@ -1221,7 +1392,7 @@ jobs:
       - name: Run CI workflow generation checks
         run: |
           ./ci/actions-templates/gen-workflows.sh
-          git diff --quiet
+          git diff --exit-code
       - name: Prep cargo dirs
         run: |
           mkdir -p ~/.cargo/{registry,git}
@@ -1264,7 +1435,15 @@ jobs:
           shellcheck -x -s dash -- rustup-init.sh
           git ls-files -- '*.sh' | xargs shellcheck -x -s dash
           git ls-files -- '*.bash' | xargs shellcheck -x -s bash
-      - name: Run formatting checks
+      - name: Install taplo
+        uses: taiki-e/install-action@v2
+        with:
+          tool: taplo-cli
+      - name: Run TOML formatting checks
+        run: |
+          taplo fmt
+          git diff --exit-code
+      - name: Run Rust formatting checks
         run: |
           cargo fmt --all --check
       - name: Run cargo check and clippy
@@ -1281,14 +1460,17 @@ jobs:
   # nor run on the rust docker images. This permits a smaller workflow without the
   # templating and so on.
   build-all-features: # job-name
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }}
     strategy:
       fail-fast: false
       matrix:
-        # Might add more targets in future.
-        target:
-          - x86_64-unknown-linux-gnu
+        include:
+          # Might add more targets in future.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - name: Clone repo
         uses: actions/checkout@v4
@@ -1299,18 +1481,35 @@ jobs:
         with:
           version: "3.x"
           repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install OpenSSL
+        if: ${{ contains(matrix.os, 'windows') }}
+        run: |
+          Get-Command openssl
+          openssl version
+          echo "OPENSSL_LIB_DIR=C:/Program Files/OpenSSL/lib" >> $env:GITHUB_ENV
+          echo "OPENSSL_DIR=C:/Program Files/OpenSSL/" >> $env:GITHUB_ENV
+          echo "OPENSSL_INCLUDE_DIR=C:/Program Files/OpenSSL/include" >> $env:GITHUB_ENV
+      - name: Install NASM
+        # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
+        # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
+        uses: ilammy/setup-nasm@v1
+        if: ${{ contains(matrix.os, 'windows') }}
       - name: Set environment variables appropriately for the build
+        shell: bash
         run: |
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           echo "TARGET=${{ matrix.target }}" >> $GITHUB_ENV
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-all-features
-        run: cargo install cargo-all-features --git https://github.com/rbtcollins/cargo-all-features.git
+        shell: bash
+        run: which cargo-check-all-features || cargo install cargo-all-features --git https://github.com/rbtcollins/cargo-all-features.git
       - name: Ensure we have our goal target installed
         run: |
-          rustup target install "$TARGET"
+          rustup target install ${{ matrix.target }}
       - name: Build every combination
+        env:
+          RUSTFLAGS: -D warnings
         run: |
           cargo check-all-features --root-only
 
@@ -1321,24 +1520,50 @@ jobs:
   # stable is placed in the root of the gh-pages branch, while master is placed at /devel
   doc: # job-name
     runs-on: ubuntu-latest
-    if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - name: Install mdbook
+        uses: taiki-e/install-action@v2
+        env:
+          # renovate: datasource=crate depName=mdbook
+          MDBOOK_VERSION: "0.4.43"
+        with:
+          tool: mdbook@${{ env.MDBOOK_VERSION }}
+      - name: Build user-guide (stable)
+        if: ${{ !contains('["pull_request", "merge_group"]', github.event_name) }}
         run: |
-          mkdir mdbook
-          curl -Lf https://github.com/rust-lang/mdBook/releases/download/v0.4.37/mdbook-v0.4.37-x86_64-unknown-linux-gnu.tar.gz | tar -xz --directory=./mdbook
-          echo "`pwd`/mdbook" >> $GITHUB_PATH
-      - name: Build user-guide
+          git checkout stable
+          # Support both old and new directory structure during the transition
+          cd doc/user-guide || cd doc
+          mdbook build
+          mv book ${{ runner.temp }}
+      - name: Build user-guide (master)
         run: |
+          git checkout master
           cd doc/user-guide
           mdbook build
-      - name: Build dev-guide
+          mkdir -p ${{ runner.temp }}/book
+          mv book ${{ runner.temp }}/book/devel
+      - name: Build dev-guide (master)
         run: |
+          git checkout master
           cd doc/dev-guide
           mdbook build
+          mkdir -p ${{ runner.temp }}/book
+          mv book ${{ runner.temp }}/book/dev-guide
+      - name: Deploy to GitHub
+        if: ${{ !contains('["pull_request", "merge_group"]', github.event_name) }}
+        run: |
+          cd ${{ runner.temp }}/book
+          git init
+          git config user.name "Deploy from CI"
+          git config user.email ""
+          git add . .nojekyll
+          git commit -m "Deploy $GITHUB_REF $GITHUB_SHA to gh-pages"
+          git remote add origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/$GITHUB_REPOSITORY
+          git push --force --set-upstream origin master:gh-pages
 
   # This is ci/actions-templates/conclusion-template.yaml
   # Do not edit this file in .github/workflows

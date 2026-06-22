@@ -1,26 +1,26 @@
 use std::env;
 
-include!("src/dist/triple.rs");
+use platforms::Platform;
 
-fn from_build() -> Result<PartialTargetTriple, String> {
-    let triple = if let Ok(triple) = env::var("RUSTUP_OVERRIDE_BUILD_TRIPLE") {
-        triple
+fn from_build() -> Result<String, String> {
+    let triple =
+        env::var("RUSTUP_OVERRIDE_BUILD_TRIPLE").unwrap_or_else(|_| env::var("TARGET").unwrap());
+    if Platform::ALL.iter().any(|p| p.target_triple == triple) {
+        Ok(triple)
     } else {
-        env::var("TARGET").unwrap()
-    };
-    PartialTargetTriple::new(&triple).ok_or(triple)
+        Err(triple)
+    }
 }
 
 fn main() {
     println!("cargo:rerun-if-env-changed=RUSTUP_OVERRIDE_BUILD_TRIPLE");
     println!("cargo:rerun-if-env-changed=TARGET");
     match from_build() {
-        Ok(triple) => eprintln!("Computed build based partial target triple: {triple:#?}"),
+        Ok(triple) => eprintln!("Computed build based on target triple: {triple:#?}"),
         Err(s) => {
-            eprintln!("Unable to parse target '{s}' as a PartialTargetTriple");
+            eprintln!("Unable to parse target '{s}' as a known target triple");
             eprintln!(
-                "If you are attempting to bootstrap a new target you may need to adjust the\n\
-               permitted values found in src/dist/triple.rs"
+                "If you are attempting to bootstrap a new target, you might need to update `platforms` to a newer version"
             );
             std::process::abort();
         }
@@ -53,7 +53,7 @@ fn main() {
     // This will work on all supported Windows versions but it relies on
     // us using `SetDefaultDllDirectories` before any libraries are loaded.
     // See also: src/bin/rustup-init.rs
-    let delay_load_dlls = ["bcrypt", "powrprof", "secur32"];
+    let delay_load_dlls = ["bcrypt", "secur32"];
     for dll in delay_load_dlls {
         println!("cargo:rustc-link-arg-bin=rustup-init=/delayload:{dll}.dll");
     }
@@ -66,5 +66,5 @@ fn main() {
     // Rust hides linker warnings meaning mistakes may go unnoticed.
     // Turning them into errors forces them to be displayed (and the build to fail).
     // If we do want to ignore specific warnings then `/IGNORE:` should be used.
-    println!("cargo:cargo:rustc-link-arg-bin=rustup-init=/WX");
+    println!("cargo:rustc-link-arg-bin=rustup-init=/WX");
 }
