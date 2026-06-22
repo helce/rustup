@@ -265,8 +265,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "bindgen"
 version = "0.69.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271383c67ccabffb7381723dea0672a673f292304fcb45c01cc648c7a8d58088"
+source = "git+https://github.com/helce/rust-bindgen?tag=v0.69.5#efcb7367af8220adcdc34f131f939749ca1e4616"
 dependencies = [
  "bitflags",
  "cexpr",
@@ -346,8 +345,8 @@ checksum = "f61dac84819c6588b558454b194026eb1f09c293b9036ae9b159e74e73ab6cf9"
 
 [[package]]
 name = "cc"
-version = "1.1.19"
-source = "git+https://github.com/helce/cc-rs?tag=cc-v1.1.19#7977aab526c66d6dbfc0496532d1ec4196751cf2"
+version = "1.2.15"
+source = "git+https://github.com/helce/cc-rs?tag=cc-v1.2.15#ad436f27bbbc59ae47600cc429181c3904ec0289"
 dependencies = [
  "jobserver",
  "libc",
@@ -1409,8 +1408,8 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "libc"
-version = "0.2.153"
-source = "git+https://github.com/helce/libc?tag=0.2.153#1df116b5bfd73e2c3666e85cce6ccd10c6b5888f"
+version = "0.2.170"
+source = "git+https://github.com/helce/libc?tag=0.2.170#d1b603f83e71502aa1326a3aac721e31f35dc173"
 
 [[package]]
 name = "libdbus-sys"
@@ -1457,8 +1456,8 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
-version = "0.4.13"
-source = "git+https://github.com/helce/linux-raw-sys?tag=v0.4.13#248adf06624743a241d14443a21bdf9f06da7525"
+version = "0.4.15"
+source = "git+https://github.com/helce/linux-raw-sys?tag=v0.4.15#a0fa97804fdeee231566e5f5005512794e1a76ab"
 
 [[package]]
 name = "litemap"
@@ -1556,8 +1555,7 @@ dependencies = [
 [[package]]
 name = "nix"
 version = "0.29.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e2746dc3a24dd78b3cfcb7be93368c6de9963d30f43a6a73998a9cf4b17b46"
+source = "git+https://github.com/helce/nix?tag=v0.29.0#ee9aac1a6ea24bcef3f1dc2fb4beca46ef91e08a"
 dependencies = [
  "bitflags",
  "cfg-if 1.0.0",
@@ -1686,8 +1684,8 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-src"
-version = "111.28.1+1.1.1w"
-source = "git+https://github.com/helce/openssl-src-rs?tag=111.28.1+1.1.1w#412de048909c2afad882018a5f9bcdd4bf7801c5"
+version = "300.4.2+3.4.1"
+source = "git+https://github.com/helce/openssl-src-rs?tag=300.4.2%2B3.4.1#f71b769501d06a29f96028e631876918a7a63810"
 dependencies = [
  "cc",
 ]
@@ -1856,8 +1854,7 @@ checksum = "953ec861398dccce10c670dfeaf3ec4911ca479e9c02154b3a215178c5f566f2"
 [[package]]
 name = "platforms"
 version = "3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d43467300237085a4f9e864b937cf0bc012cef7740be12be1a48b10d2c8a3701"
+source = "git+https://github.com/helce/rustsec?tag=platforms%2Fv3.5.0#8da815e7b08e2ab5acef5019ceb12e716e0b479e"
 
 [[package]]
 name = "powerfmt"
@@ -2180,8 +2177,8 @@ dependencies = [
 
 [[package]]
 name = "ring"
-version = "0.17.8"
-source = "git+https://github.com/helce/ring?tag=0.17.8#e7ac1fc45fa226b92f5fa91ef166d85dca04041c"
+version = "0.17.13"
+source = "git+https://github.com/helce/ring?tag=0.17.13#344d96af07e012a90bf53c9de5bf8f7fa7aa7c01"
 dependencies = [
  "cc",
  "cfg-if 1.0.0",
@@ -2215,14 +2212,14 @@ checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustix"
-version = "0.38.34"
-source = "git+https://github.com/helce/rustix?tag=0.38.34#d7d8acdee74f5da78d88ad8e7516c079aabd70c2"
+version = "0.38.44"
+source = "git+https://github.com/helce/rustix?tag=0.38.44#8daff198d899a0eb3627f7b034f0752e87a2fb07"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
