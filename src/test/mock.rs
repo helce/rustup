@@ -1,18 +1,122 @@
 //! Mocks for testing
 
-pub mod clitools;
-pub mod dist;
-pub mod topical_doc_data;
-
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
+use super::clitools::mock_bin;
+use super::{this_host_triple, topical_doc_data};
+
 // Mock of the on-disk structure of rust-installer installers
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub struct MockInstallerBuilder {
     pub components: Vec<MockComponentBuilder>,
+}
+
+impl MockInstallerBuilder {
+    pub(super) fn std(trip: &str) -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: format!("rust-std-{trip}"),
+                files: vec![MockFile::new(
+                    format!("lib/rustlib/{trip}/libstd.rlib"),
+                    b"",
+                )],
+            }],
+        }
+    }
+
+    pub(super) fn cross_std(target: &str, date: &str) -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: format!("rust-std-{target}"),
+                files: vec![
+                    MockFile::new(format!("lib/rustlib/{target}/lib/libstd.rlib"), b""),
+                    MockFile::new(format!("lib/rustlib/{target}/lib/{date}"), b""),
+                ],
+            }],
+        }
+    }
+
+    pub(super) fn rustc(target: &str, version: &str, version_hash_: &str) -> Self {
+        // For cross-host rustc's modify the version_hash so they can be identified from
+        // test cases.
+        let this_host = this_host_triple();
+        let version_hash = if this_host != target {
+            format!("xxxx-{}", &version_hash_[5..])
+        } else {
+            version_hash_.to_string()
+        };
+
+        Self {
+            components: vec![MockComponentBuilder {
+                name: "rustc".to_string(),
+                files: mock_bin("rustc", version, &version_hash),
+            }],
+        }
+    }
+
+    pub(super) fn cargo(version: &str, version_hash: &str) -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: "cargo".to_string(),
+                files: mock_bin("cargo", version, version_hash),
+            }],
+        }
+    }
+
+    pub(super) fn rls(version: &str, version_hash: &str, pkg_name: &str) -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: pkg_name.to_string(),
+                files: mock_bin("rls", version, version_hash),
+            }],
+        }
+    }
+
+    pub(super) fn rust_doc() -> Self {
+        let mut files: Vec<MockFile> = topical_doc_data::unique_paths()
+            .map(|x| MockFile::new(x, b""))
+            .collect();
+        files.insert(0, MockFile::new("share/doc/rust/html/index.html", b""));
+        Self {
+            components: vec![MockComponentBuilder {
+                name: "rust-docs".to_string(),
+                files,
+            }],
+        }
+    }
+
+    pub(super) fn rust_analysis(trip: &str) -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: format!("rust-analysis-{trip}"),
+                files: vec![MockFile::new(
+                    format!("lib/rustlib/{trip}/analysis/libfoo.json"),
+                    b"",
+                )],
+            }],
+        }
+    }
+
+    pub(super) fn rust_src() -> Self {
+        Self {
+            components: vec![MockComponentBuilder {
+                name: "rust-src".to_string(),
+                files: vec![MockFile::new("lib/rustlib/src/rust-src/foo.rs", b"")],
+            }],
+        }
+    }
+
+    pub(super) fn combined(components: &[&Self]) -> Self {
+        Self {
+            components: components
+                .iter()
+                .flat_map(|m| m.components.clone())
+                .collect(),
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]

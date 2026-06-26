@@ -6,9 +6,11 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use rustup::dist::TargetTriple;
+use rustup::dist::manifest::Manifest;
 use rustup::for_host;
-use rustup::test::mock::clitools::{self, CliTestContext, Config, Scenario, set_current_dist_date};
-use rustup::test::this_host_triple;
+use rustup::test::{
+    CROSS_ARCH1, CROSS_ARCH2, CliTestContext, Config, Scenario, create_hash, this_host_triple,
+};
 
 #[tokio::test]
 async fn rustc_no_default_toolchain() {
@@ -83,7 +85,7 @@ async fn install_toolchain_from_version() {
 async fn install_with_profile() {
     let mut cx = CliTestContext::new(Scenario::UnavailableRls).await;
     // Start with a config that uses the "complete" profile
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config
         .expect_ok(&["rustup", "set", "profile", "complete"])
         .await;
@@ -106,7 +108,7 @@ async fn install_with_profile() {
     cx.config.expect_component_not_executable("cargo").await;
 
     // After an update, we should _still_ only have the profile-dictated components
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
 
     cx.config.expect_component_executable("rustup").await;
@@ -129,12 +131,12 @@ async fn default_existing_toolchain() {
 #[tokio::test]
 async fn update_channel() {
     let mut cx = CliTestContext::new(Scenario::ArchivesV2).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-1")
         .await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-2")
@@ -325,14 +327,10 @@ async fn remove_override_toolchain_err_handling() {
         .expect_ok(&["rustup", "toolchain", "remove", "beta"])
         .await;
     cx.config
-        .expect_err_ex(
+        .expect_ok_contains(
             &["rustc", "--version"],
-            "",
-            for_host!(
-                r"error: toolchain 'beta-{0}' is not installed
-help: run `rustup toolchain install beta-{0}` to install it
-"
-            ),
+            "1.2.0 (hash-beta-1.2.0)",
+            "info: downloading component 'rustc'",
         )
         .await;
 }
@@ -344,9 +342,10 @@ async fn file_override_toolchain_err_handling() {
     let toolchain_file = cwd.join("rust-toolchain");
     rustup::utils::raw::write_file(&toolchain_file, "beta").unwrap();
     cx.config
-        .expect_err(
+        .expect_ok_contains(
             &["rustc", "--version"],
-            for_host!("toolchain 'beta-{0}' is not installed"),
+            "1.2.0 (hash-beta-1.2.0)",
+            "info: downloading component 'rustc'",
         )
         .await;
 }
@@ -355,9 +354,17 @@ async fn file_override_toolchain_err_handling() {
 async fn plus_override_toolchain_err_handling() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config
-        .expect_err(
-            &["rustc", "+beta"],
+        .expect_err_env(
+            &["rustc", "+beta", "--version"],
+            &[("RUSTUP_AUTO_INSTALL", "0")],
             for_host!("toolchain 'beta-{0}' is not installed"),
+        )
+        .await;
+    cx.config
+        .expect_ok_contains(
+            &["rustc", "+beta", "--version"],
+            "1.2.0 (hash-beta-1.2.0)",
+            "",
         )
         .await;
 }
@@ -690,12 +697,12 @@ async fn no_update_on_channel_when_date_has_not_changed() {
 #[tokio::test]
 async fn update_on_channel_when_date_has_changed() {
     let mut cx = CliTestContext::new(Scenario::ArchivesV2).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-1")
         .await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-2")
@@ -730,7 +737,7 @@ async fn remove_toolchain_then_add_again() {
 #[tokio::test]
 async fn upgrade_v1_to_v2() {
     let mut cx = CliTestContext::new(Scenario::Full).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     // Delete the v2 manifest so the first day we install from the v1s
     fs::remove_file(
         cx.config
@@ -744,7 +751,7 @@ async fn upgrade_v1_to_v2() {
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-1")
         .await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-2")
@@ -754,9 +761,9 @@ async fn upgrade_v1_to_v2() {
 #[tokio::test]
 async fn upgrade_v2_to_v1() {
     let mut cx = CliTestContext::new(Scenario::Full).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     fs::remove_file(
         cx.config
             .distdir
@@ -777,8 +784,9 @@ async fn upgrade_v2_to_v1() {
 async fn list_targets_no_toolchain() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config
-        .expect_err(
+        .expect_err_env(
             &["rustup", "target", "list", "--toolchain=nightly"],
+            &[("RUSTUP_AUTO_INSTALL", "0")],
             for_host!("toolchain 'nightly-{0}' is not installed"),
         )
         .await;
@@ -820,10 +828,10 @@ async fn list_targets() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_stdout_ok(&["rustup", "target", "list"], clitools::CROSS_ARCH1)
+        .expect_stdout_ok(&["rustup", "target", "list"], CROSS_ARCH1)
         .await;
     cx.config
-        .expect_stdout_ok(&["rustup", "target", "list"], clitools::CROSS_ARCH2)
+        .expect_stdout_ok(&["rustup", "target", "list"], CROSS_ARCH2)
         .await;
 }
 
@@ -843,12 +851,12 @@ async fn add_target1() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(cx.config.rustupdir.has(path));
 }
@@ -858,12 +866,12 @@ async fn add_target2() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH2])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH2])
         .await;
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH2
+        CROSS_ARCH2
     );
     assert!(cx.config.rustupdir.has(path));
 }
@@ -878,13 +886,13 @@ async fn add_all_targets() {
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(cx.config.rustupdir.has(path));
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH2
+        CROSS_ARCH2
     );
     assert!(cx.config.rustupdir.has(path));
 }
@@ -895,18 +903,10 @@ async fn add_all_targets_fail() {
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_err(
-            &[
-                "rustup",
-                "target",
-                "add",
-                clitools::CROSS_ARCH1,
-                "all",
-                clitools::CROSS_ARCH2,
-            ],
+            &["rustup", "target", "add", CROSS_ARCH1, "all", CROSS_ARCH2],
             &format!(
                 "`rustup target add {} all {}` includes `all`",
-                clitools::CROSS_ARCH1,
-                clitools::CROSS_ARCH2
+                CROSS_ARCH1, CROSS_ARCH2
             ),
         )
         .await;
@@ -919,7 +919,7 @@ async fn add_target_by_component_add() {
     cx.config
         .expect_not_stdout_ok(
             &["rustup", "target", "list"],
-            &format!("{} (installed)", clitools::CROSS_ARCH1),
+            &format!("{} (installed)", CROSS_ARCH1),
         )
         .await;
     cx.config
@@ -927,13 +927,13 @@ async fn add_target_by_component_add() {
             "rustup",
             "component",
             "add",
-            &format!("rust-std-{}", clitools::CROSS_ARCH1),
+            &format!("rust-std-{}", CROSS_ARCH1),
         ])
         .await;
     cx.config
         .expect_stdout_ok(
             &["rustup", "target", "list"],
-            &format!("{} (installed)", clitools::CROSS_ARCH1),
+            &format!("{} (installed)", CROSS_ARCH1),
         )
         .await;
 }
@@ -943,12 +943,12 @@ async fn remove_target_by_component_remove() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
         .expect_stdout_ok(
             &["rustup", "target", "list"],
-            &format!("{} (installed)", clitools::CROSS_ARCH1),
+            &format!("{} (installed)", CROSS_ARCH1),
         )
         .await;
     cx.config
@@ -956,13 +956,13 @@ async fn remove_target_by_component_remove() {
             "rustup",
             "component",
             "remove",
-            &format!("rust-std-{}", clitools::CROSS_ARCH1),
+            &format!("rust-std-{}", CROSS_ARCH1),
         ])
         .await;
     cx.config
         .expect_not_stdout_ok(
             &["rustup", "target", "list"],
-            &format!("{} (installed)", clitools::CROSS_ARCH1),
+            &format!("{} (installed)", CROSS_ARCH1),
         )
         .await;
 }
@@ -971,18 +971,20 @@ async fn remove_target_by_component_remove() {
 async fn add_target_no_toolchain() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config
-        .expect_err(
+        .expect_err_env(
             &[
                 "rustup",
                 "target",
                 "add",
-                clitools::CROSS_ARCH1,
+                CROSS_ARCH1,
                 "--toolchain=nightly",
             ],
+            &[("RUSTUP_AUTO_INSTALL", "0")],
             for_host!("toolchain 'nightly-{0}' is not installed"),
         )
         .await;
 }
+
 #[tokio::test]
 async fn add_target_bogus() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
@@ -1005,7 +1007,7 @@ async fn add_target_v1_toolchain() {
                 "rustup",
                 "target",
                 "add",
-                clitools::CROSS_ARCH1,
+                CROSS_ARCH1,
                 "--toolchain=nightly",
             ],
             for_host!("toolchain 'nightly-{0}' does not support components (v1 manifest)"),
@@ -1026,7 +1028,7 @@ async fn add_target_custom_toolchain() {
         .await;
     cx.config
         .expect_err(
-            &["rustup", "target", "add", clitools::CROSS_ARCH1],
+            &["rustup", "target", "add", CROSS_ARCH1],
             "toolchain 'default-from-path' does not support components",
         )
         .await;
@@ -1050,21 +1052,21 @@ async fn add_target_again() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
         .expect_stderr_ok(
-            &["rustup", "target", "add", clitools::CROSS_ARCH1],
+            &["rustup", "target", "add", CROSS_ARCH1],
             &format!(
                 "component 'rust-std' for target '{}' is up to date",
-                clitools::CROSS_ARCH1
+                CROSS_ARCH1
             ),
         )
         .await;
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(cx.config.rustupdir.has(path));
 }
@@ -1084,27 +1086,27 @@ async fn remove_target() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
-        .expect_ok(&["rustup", "target", "remove", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "remove", CROSS_ARCH1])
         .await;
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib/libstd.rlib",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(!cx.config.rustupdir.has(path));
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}/lib",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(!cx.config.rustupdir.has(path));
     let path = format!(
         "toolchains/nightly-{}/lib/rustlib/{}",
         this_host_triple(),
-        clitools::CROSS_ARCH1
+        CROSS_ARCH1
     );
     assert!(!cx.config.rustupdir.has(path));
 }
@@ -1115,11 +1117,11 @@ async fn remove_target_not_installed() {
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_err(
-            &["rustup", "target", "remove", clitools::CROSS_ARCH1],
+            &["rustup", "target", "remove", CROSS_ARCH1],
             &format!(
                 "toolchain 'nightly-{}' does not have target '{}' installed",
                 this_host_triple(),
-                clitools::CROSS_ARCH1
+                CROSS_ARCH1
             ),
         )
         .await;
@@ -1129,14 +1131,15 @@ async fn remove_target_not_installed() {
 async fn remove_target_no_toolchain() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config
-        .expect_err(
+        .expect_err_env(
             &[
                 "rustup",
                 "target",
                 "remove",
-                clitools::CROSS_ARCH1,
+                CROSS_ARCH1,
                 "--toolchain=nightly",
             ],
+            &[("RUSTUP_AUTO_INSTALL", "0")],
             for_host!("toolchain 'nightly-{0}' is not installed"),
         )
         .await;
@@ -1164,7 +1167,7 @@ async fn remove_target_v1_toolchain() {
                 "rustup",
                 "target",
                 "remove",
-                clitools::CROSS_ARCH1,
+                CROSS_ARCH1,
                 "--toolchain=nightly",
             ],
             for_host!("toolchain 'nightly-{0}' does not support components (v1 manifest)"),
@@ -1185,7 +1188,7 @@ async fn remove_target_custom_toolchain() {
         .await;
     cx.config
         .expect_err(
-            &["rustup", "target", "remove", clitools::CROSS_ARCH1],
+            &["rustup", "target", "remove", CROSS_ARCH1],
             "toolchain 'default-from-path' does not support components",
         )
         .await;
@@ -1196,18 +1199,18 @@ async fn remove_target_again() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
-        .expect_ok(&["rustup", "target", "remove", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "remove", CROSS_ARCH1])
         .await;
     cx.config
         .expect_err(
-            &["rustup", "target", "remove", clitools::CROSS_ARCH1],
+            &["rustup", "target", "remove", CROSS_ARCH1],
             &format!(
                 "toolchain 'nightly-{}' does not have target '{}' installed",
                 this_host_triple(),
-                clitools::CROSS_ARCH1
+                CROSS_ARCH1
             ),
         )
         .await;
@@ -1219,7 +1222,7 @@ async fn remove_target_host() {
     let host = this_host_triple();
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
         .expect_stderr_ok(
@@ -1287,9 +1290,6 @@ async fn warn_about_and_remove_stray_hash() {
 }
 
 fn make_component_unavailable(config: &Config, name: &str, target: String) {
-    use rustup::dist::manifest::Manifest;
-    use rustup::test::mock::dist::create_hash;
-
     let manifest_path = config
         .distdir
         .as_ref()
@@ -1380,7 +1380,7 @@ Then you can use the toolchain with commands such as:
 #[tokio::test]
 async fn update_removed_component_toolchain() {
     let mut cx = CliTestContext::new(Scenario::RemovedRls).await;
-    set_current_dist_date(&cx.config, "2024-05-01");
+    cx.config.set_current_dist_date("2024-05-01");
     cx.config.expect_ok(&["rustup", "default", "stable"]).await;
 
     // Install `rls` on the first day.
@@ -1393,7 +1393,7 @@ async fn update_removed_component_toolchain() {
     cx.config.expect_component_executable("rls").await;
 
     // `rls` is missing on the second day.
-    set_current_dist_date(&cx.config, "2024-06-15");
+    cx.config.set_current_dist_date("2024-06-15");
 
     // An update at this time should inform the user of an unavailable component.
     cx.config
@@ -1512,13 +1512,8 @@ async fn add_target_suggest_best_match() {
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_err(
-            &[
-                "rustup",
-                "target",
-                "add",
-                &format!("{}a", clitools::CROSS_ARCH1)[..],
-            ],
-            &format!("did you mean '{}'", clitools::CROSS_ARCH1),
+            &["rustup", "target", "add", &format!("{}a", CROSS_ARCH1)[..]],
+            &format!("did you mean '{}'", CROSS_ARCH1),
         )
         .await;
     cx.config
@@ -1536,13 +1531,13 @@ async fn remove_target_suggest_best_match() {
                 "rustup",
                 "target",
                 "remove",
-                &format!("{}a", clitools::CROSS_ARCH1)[..],
+                &format!("{}a", CROSS_ARCH1)[..],
             ],
-            &format!("did you mean '{}'", clitools::CROSS_ARCH1),
+            &format!("did you mean '{}'", CROSS_ARCH1),
         )
         .await;
     cx.config
-        .expect_ok(&["rustup", "target", "add", clitools::CROSS_ARCH1])
+        .expect_ok(&["rustup", "target", "add", CROSS_ARCH1])
         .await;
     cx.config
         .expect_err(
@@ -1550,9 +1545,9 @@ async fn remove_target_suggest_best_match() {
                 "rustup",
                 "target",
                 "remove",
-                &format!("{}a", clitools::CROSS_ARCH1)[..],
+                &format!("{}a", CROSS_ARCH1)[..],
             ],
-            &format!("did you mean '{}'", clitools::CROSS_ARCH1),
+            &format!("did you mean '{}'", CROSS_ARCH1),
         )
         .await;
 }
@@ -1562,15 +1557,13 @@ async fn target_list_ignores_unavailable_targets() {
     let mut cx = CliTestContext::new(Scenario::SimpleV2).await;
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     let target_list = &["rustup", "target", "list"];
-    cx.config
-        .expect_stdout_ok(target_list, clitools::CROSS_ARCH1)
-        .await;
-    make_component_unavailable(&cx.config, "rust-std", clitools::CROSS_ARCH1.to_owned());
+    cx.config.expect_stdout_ok(target_list, CROSS_ARCH1).await;
+    make_component_unavailable(&cx.config, "rust-std", CROSS_ARCH1.to_owned());
     cx.config
         .expect_ok(&["rustup", "update", "nightly", "--force"])
         .await;
     cx.config
-        .expect_not_stdout_ok(target_list, clitools::CROSS_ARCH1)
+        .expect_not_stdout_ok(target_list, CROSS_ARCH1)
         .await;
 }
 
@@ -1608,23 +1601,19 @@ async fn install_with_targets() {
         cx.config
             .expect_stdout_ok(
                 &["rustup", "target", "list"],
-                &format!("{} (installed)", clitools::CROSS_ARCH1),
+                &format!("{} (installed)", CROSS_ARCH1),
             )
             .await;
         cx.config
             .expect_stdout_ok(
                 &["rustup", "target", "list"],
-                &format!("{} (installed)", clitools::CROSS_ARCH2),
+                &format!("{} (installed)", CROSS_ARCH2),
             )
             .await;
     }
 
-    go(&["-t", clitools::CROSS_ARCH1, "-t", clitools::CROSS_ARCH2]).await;
-    go(&[
-        "-t",
-        &format!("{},{}", clitools::CROSS_ARCH1, clitools::CROSS_ARCH2),
-    ])
-    .await;
+    go(&["-t", CROSS_ARCH1, "-t", CROSS_ARCH2]).await;
+    go(&["-t", &format!("{},{}", CROSS_ARCH1, CROSS_ARCH2)]).await;
 }
 
 #[tokio::test]
@@ -1640,7 +1629,7 @@ async fn install_with_component_and_target() {
             "-c",
             "rls",
             "-t",
-            clitools::CROSS_ARCH1,
+            CROSS_ARCH1,
         ])
         .await;
     cx.config
@@ -1652,7 +1641,7 @@ async fn install_with_component_and_target() {
     cx.config
         .expect_stdout_ok(
             &["rustup", "target", "list"],
-            &format!("{} (installed)", clitools::CROSS_ARCH1),
+            &format!("{} (installed)", CROSS_ARCH1),
         )
         .await;
 }
@@ -1681,7 +1670,7 @@ async fn test_warn_if_complete_profile_is_used() {
 #[tokio::test]
 async fn test_complete_profile_skips_missing_when_forced() {
     let mut cx = CliTestContext::new(Scenario::UnavailableRls).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
 
     cx.config
         .expect_ok(&["rustup", "set", "profile", "complete"])
@@ -1752,7 +1741,7 @@ async fn install_allow_downgrade() {
     let trip = this_host_triple();
 
     // this dist has no rls and there is no newer one
-    set_current_dist_date(&cx.config, "2019-09-14");
+    cx.config.set_current_dist_date("2019-09-14");
     cx.config
         .expect_ok(&["rustup", "toolchain", "install", "nightly"])
         .await;

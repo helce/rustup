@@ -5,13 +5,9 @@ use std::io::Write;
 use std::process::Stdio;
 
 use rustup::for_host;
-use rustup::test::mock::clitools::CliTestContext;
+use rustup::test::{CliTestContext, Config, SanitizedOutput, Scenario, this_host_triple};
 #[cfg(windows)]
 use rustup::test::{RegistryGuard, USER_PATH};
-use rustup::test::{
-    mock::clitools::{self, Config, SanitizedOutput, Scenario, set_current_dist_date},
-    this_host_triple,
-};
 use rustup::utils::raw;
 
 fn run_input(config: &Config, args: &[&str], input: &str) -> SanitizedOutput {
@@ -24,8 +20,8 @@ fn run_input_with_env(
     input: &str,
     env: &[(&str, &str)],
 ) -> SanitizedOutput {
-    let mut cmd = clitools::cmd(config, args[0], &args[1..]);
-    clitools::env(config, &mut cmd);
+    let mut cmd = config.cmd(args[0], &args[1..]);
+    config.env(&mut cmd);
 
     for (key, value) in env.iter() {
         cmd.env(key, value);
@@ -423,7 +419,7 @@ async fn install_with_components() {
 #[tokio::test]
 async fn install_forces_and_skips_rls() {
     let cx = CliTestContext::new(Scenario::UnavailableRls).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
 
     let out = run_input(
         &cx.config,

@@ -4,7 +4,7 @@
 use std::fs;
 
 use rustup::for_host;
-use rustup::test::mock::clitools::{CliTestContext, Scenario, set_current_dist_date};
+use rustup::test::{CliTestContext, Scenario};
 
 #[tokio::test]
 async fn rustc_no_default_toolchain() {
@@ -90,12 +90,12 @@ async fn default_existing_toolchain() {
 #[tokio::test]
 async fn update_channel() {
     let mut cx = CliTestContext::new(Scenario::ArchivesV1).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-1")
         .await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-2")
@@ -182,14 +182,10 @@ async fn remove_override_toolchain_err_handling() {
         .expect_ok(&["rustup", "toolchain", "remove", "beta"])
         .await;
     cx.config
-        .expect_err_ex(
+        .expect_ok_contains(
             &["rustc", "--version"],
-            "",
-            for_host!(
-                r"error: toolchain 'beta-{0}' is not installed
-help: run `rustup toolchain install beta-{0}` to install it
-"
-            ),
+            "1.2.0 (hash-beta-1.2.0)",
+            "info: downloading component 'rust'",
         )
         .await;
 }
@@ -443,12 +439,12 @@ async fn no_update_on_channel_when_date_has_not_changed() {
 #[tokio::test]
 async fn update_on_channel_when_date_has_changed() {
     let mut cx = CliTestContext::new(Scenario::ArchivesV1).await;
-    set_current_dist_date(&cx.config, "2015-01-01");
+    cx.config.set_current_dist_date("2015-01-01");
     cx.config.expect_ok(&["rustup", "default", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-1")
         .await;
-    set_current_dist_date(&cx.config, "2015-01-02");
+    cx.config.set_current_dist_date("2015-01-02");
     cx.config.expect_ok(&["rustup", "update", "nightly"]).await;
     cx.config
         .expect_stdout_ok(&["rustc", "--version"], "hash-nightly-2")

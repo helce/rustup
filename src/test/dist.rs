@@ -7,7 +7,6 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
-use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::dist::{
@@ -18,8 +17,150 @@ use crate::dist::{
     },
 };
 
-use super::MockInstallerBuilder;
 use super::clitools::hard_link;
+use super::mock::MockInstallerBuilder;
+use super::{CROSS_ARCH1, CROSS_ARCH2, MULTI_ARCH1, create_hash, this_host_triple};
+
+pub(super) struct Release {
+    // Either "nightly", "stable", "beta", or an explicit version number
+    channel: String,
+    date: String,
+    version: String,
+    hash: String,
+    rls: RlsStatus,
+    available: bool,
+    multi_arch: bool,
+}
+
+impl Release {
+    pub(super) fn stable(version: &str, date: &str) -> Self {
+        Release::new("stable", version, date, version)
+    }
+
+    pub(super) fn beta(version: &str, date: &str) -> Self {
+        Release::new("beta", version, date, version)
+    }
+
+    pub(super) fn beta_with_tag(tag: Option<&str>, version: &str, date: &str) -> Self {
+        let channel = match tag {
+            Some(tag) => format!("{version}-beta.{tag}"),
+            None => format!("{version}-beta"),
+        };
+        Release::new(&channel, version, date, version)
+    }
+
+    pub(super) fn with_rls(mut self, status: RlsStatus) -> Self {
+        self.rls = status;
+        self
+    }
+
+    pub(super) fn unavailable(mut self) -> Self {
+        self.available = false;
+        self
+    }
+
+    pub(super) fn multi_arch(mut self) -> Self {
+        self.multi_arch = true;
+        self
+    }
+
+    pub(super) fn only_multi_arch(mut self) -> Self {
+        self.multi_arch = true;
+        self.available = false;
+        self
+    }
+
+    pub(super) fn new(channel: &str, version: &str, date: &str, suffix: &str) -> Self {
+        Release {
+            channel: channel.to_string(),
+            date: date.to_string(),
+            version: version.to_string(),
+            hash: format!("hash-{channel}-{suffix}"),
+            available: true,
+            multi_arch: false,
+            rls: RlsStatus::Available,
+        }
+    }
+
+    pub(super) fn mock(&self) -> MockChannel {
+        if self.available {
+            MockChannel::new(
+                &self.channel,
+                &self.date,
+                &self.version,
+                &self.hash,
+                self.rls,
+                self.multi_arch,
+                false,
+            )
+        } else if self.multi_arch {
+            // unavailable but multiarch means to build only with host==MULTI_ARCH1
+            // instead of true multiarch
+            MockChannel::new(
+                &self.channel,
+                &self.date,
+                &self.version,
+                &self.hash,
+                self.rls,
+                false,
+                true,
+            )
+        } else {
+            MockChannel::unavailable(&self.channel, &self.date, &self.version, &self.hash)
+        }
+    }
+
+    #[tracing::instrument(level = "trace", skip_all)]
+    pub(super) fn link(&self, path: &Path) {
+        // Also create the manifests for releases by version
+        let _ = hard_link(
+            path.join(format!(
+                "dist/{}/channel-rust-{}.toml",
+                self.date, self.channel
+            )),
+            path.join(format!("dist/channel-rust-{}.toml", self.version)),
+        );
+        let _ = hard_link(
+            path.join(format!(
+                "dist/{}/channel-rust-{}.toml.asc",
+                self.date, self.channel
+            )),
+            path.join(format!("dist/channel-rust-{}.toml.asc", self.version)),
+        );
+        let _ = hard_link(
+            path.join(format!(
+                "dist/{}/channel-rust-{}.toml.sha256",
+                self.date, self.channel
+            )),
+            path.join(format!("dist/channel-rust-{}.toml.sha256", self.version)),
+        );
+
+        if self.channel == "stable" {
+            // Same for v1 manifests. These are just the installers.
+            let host_triple = this_host_triple();
+
+            hard_link(
+                path.join(format!(
+                    "dist/{}/rust-stable-{}.tar.gz",
+                    self.date, host_triple
+                )),
+                path.join(format!("dist/rust-{}-{}.tar.gz", self.version, host_triple)),
+            )
+            .unwrap();
+            hard_link(
+                path.join(format!(
+                    "dist/{}/rust-stable-{}.tar.gz.sha256",
+                    self.date, host_triple
+                )),
+                path.join(format!(
+                    "dist/rust-{}-{}.tar.gz.sha256",
+                    self.version, host_triple
+                )),
+            )
+            .unwrap();
+        }
+    }
+}
 
 // This function changes the mock manifest for a given channel to that
 // of a particular date. For advancing the build from e.g. 2016-02-1
@@ -68,13 +209,10 @@ pub fn change_channel_date(dist_server: &Url, channel: &str, date: &str) {
     }
 }
 
-// The manifest version created by this mock
-pub const MOCK_MANIFEST_VERSION: &str = "2";
-
 // A mock Rust v2 distribution server. Create it and run `write`
 // to write its structure to a directory.
 #[derive(Debug)]
-pub struct MockDistServer {
+pub(crate) struct MockDistServer {
     // The local path to the dist server root
     pub path: PathBuf,
     pub channels: Vec<MockChannel>,
@@ -82,7 +220,7 @@ pub struct MockDistServer {
 
 // A Rust distribution channel
 #[derive(Debug)]
-pub struct MockChannel {
+pub(crate) struct MockChannel {
     // e.g. "nightly"
     pub name: String,
     // YYYY-MM-DD
@@ -91,9 +229,274 @@ pub struct MockChannel {
     pub renames: HashMap<String, String>,
 }
 
+impl MockChannel {
+    pub(super) fn new(
+        channel: &str,
+        date: &str,
+        version: &str,
+        version_hash: &str,
+        rls: RlsStatus,
+        multi_arch: bool,
+        swap_triples: bool,
+    ) -> Self {
+        // Build the mock installers
+        let host_triple = if swap_triples {
+            MULTI_ARCH1.to_owned()
+        } else {
+            this_host_triple()
+        };
+        let std = MockInstallerBuilder::std(&host_triple);
+        let rustc = MockInstallerBuilder::rustc(&host_triple, version, version_hash);
+        let cargo = MockInstallerBuilder::cargo(version, version_hash);
+        let rust_docs = MockInstallerBuilder::rust_doc();
+        let rust = MockInstallerBuilder::combined(&[&std, &rustc, &cargo, &rust_docs]);
+        let cross_std1 = MockInstallerBuilder::cross_std(CROSS_ARCH1, date);
+        let cross_std2 = MockInstallerBuilder::cross_std(CROSS_ARCH2, date);
+        let rust_src = MockInstallerBuilder::rust_src();
+        let rust_analysis = MockInstallerBuilder::rust_analysis(&host_triple);
+
+        // Convert the mock installers to mock package definitions for the
+        // mock dist server
+        let mut all = MockChannelContent::default();
+        all.std.extend(vec![
+            (std, host_triple.clone()),
+            (cross_std1, CROSS_ARCH1.to_string()),
+            (cross_std2, CROSS_ARCH2.to_string()),
+        ]);
+        all.rustc.push((rustc, host_triple.clone()));
+        all.cargo.push((cargo, host_triple.clone()));
+
+        if rls != RlsStatus::Unavailable {
+            let rls = MockInstallerBuilder::rls(version, version_hash, rls.pkg_name());
+            all.rls.push((rls, host_triple.clone()));
+        } else {
+            all.rls.push((
+                MockInstallerBuilder { components: vec![] },
+                host_triple.clone(),
+            ));
+        }
+
+        all.docs.push((rust_docs, host_triple.clone()));
+        all.src.push((rust_src, "*".to_string()));
+        all.analysis.push((rust_analysis, "*".to_string()));
+        all.combined.push((rust, host_triple));
+
+        if multi_arch {
+            let std = MockInstallerBuilder::std(MULTI_ARCH1);
+            let rustc = MockInstallerBuilder::rustc(MULTI_ARCH1, version, version_hash);
+            let cargo = MockInstallerBuilder::cargo(version, version_hash);
+            let rust_docs = MockInstallerBuilder::rust_doc();
+            let rust = MockInstallerBuilder::combined(&[&std, &rustc, &cargo, &rust_docs]);
+
+            let triple = MULTI_ARCH1.to_string();
+            all.std.push((std, triple.clone()));
+            all.rustc.push((rustc, triple.clone()));
+            all.cargo.push((cargo, triple.clone()));
+
+            if rls != RlsStatus::Unavailable {
+                let rls = MockInstallerBuilder::rls(version, version_hash, rls.pkg_name());
+                all.rls.push((rls, triple.clone()));
+            } else {
+                all.rls
+                    .push((MockInstallerBuilder { components: vec![] }, triple.clone()));
+            }
+
+            all.docs.push((rust_docs, triple.to_string()));
+            all.combined.push((rust, triple));
+        }
+
+        let all_std_archs: Vec<String> = all.std.iter().map(|(_, arch)| arch).cloned().collect();
+
+        let all = all.into_packages(rls.pkg_name());
+
+        let packages = all.into_iter().map(|(name, target_pkgs)| {
+            let target_pkgs =
+                target_pkgs
+                    .into_iter()
+                    .map(|(installer, triple)| MockTargetedPackage {
+                        target: triple,
+                        available: !installer.components.is_empty(),
+                        components: vec![],
+                        installer,
+                    });
+
+            MockPackage {
+                name,
+                version: format!("{version} ({version_hash})"),
+                targets: target_pkgs.collect(),
+            }
+        });
+        let mut packages: Vec<_> = packages.collect();
+
+        // Add subcomponents of the rust package
+        {
+            let rust_pkg = packages.last_mut().unwrap();
+            for target_pkg in rust_pkg.targets.iter_mut() {
+                let target = &target_pkg.target;
+                target_pkg.components.push(MockComponent {
+                    name: "rust-std".to_string(),
+                    target: target.to_string(),
+                    is_extension: false,
+                });
+                target_pkg.components.push(MockComponent {
+                    name: "rustc".to_string(),
+                    target: target.to_string(),
+                    is_extension: false,
+                });
+                target_pkg.components.push(MockComponent {
+                    name: "cargo".to_string(),
+                    target: target.to_string(),
+                    is_extension: false,
+                });
+                target_pkg.components.push(MockComponent {
+                    name: "rust-docs".to_string(),
+                    target: target.to_string(),
+                    is_extension: false,
+                });
+                if rls == RlsStatus::Renamed {
+                    target_pkg.components.push(MockComponent {
+                        name: "rls-preview".to_string(),
+                        target: target.to_string(),
+                        is_extension: true,
+                    });
+                } else if rls == RlsStatus::Available {
+                    target_pkg.components.push(MockComponent {
+                        name: "rls".to_string(),
+                        target: target.to_string(),
+                        is_extension: true,
+                    });
+                } else {
+                    target_pkg.components.push(MockComponent {
+                        name: "rls".to_string(),
+                        target: target.to_string(),
+                        is_extension: true,
+                    })
+                }
+                for other_target in &all_std_archs {
+                    if other_target != target {
+                        target_pkg.components.push(MockComponent {
+                            name: "rust-std".to_string(),
+                            target: other_target.to_string(),
+                            is_extension: false,
+                        });
+                    }
+                }
+
+                target_pkg.components.push(MockComponent {
+                    name: "rust-src".to_string(),
+                    target: "*".to_string(),
+                    is_extension: true,
+                });
+                target_pkg.components.push(MockComponent {
+                    name: "rust-analysis".to_string(),
+                    target: target.to_string(),
+                    is_extension: true,
+                });
+            }
+        }
+
+        let mut renames = HashMap::new();
+        if rls == RlsStatus::Renamed {
+            renames.insert("rls".to_owned(), "rls-preview".to_owned());
+        }
+
+        Self {
+            name: channel.to_string(),
+            date: date.to_string(),
+            packages,
+            renames,
+        }
+    }
+
+    pub(super) fn unavailable(
+        channel: &str,
+        date: &str,
+        version: &str,
+        version_hash: &str,
+    ) -> Self {
+        let host_triple = this_host_triple();
+
+        let packages = [
+            "cargo",
+            "rust",
+            "rust-docs",
+            "rust-std",
+            "rustc",
+            "rls",
+            "rust-analysis",
+        ];
+        let packages = packages
+            .iter()
+            .map(|name| MockPackage {
+                name,
+                version: format!("{version} ({version_hash})"),
+                targets: vec![MockTargetedPackage {
+                    target: host_triple.clone(),
+                    available: false,
+                    components: vec![],
+                    installer: MockInstallerBuilder { components: vec![] },
+                }],
+            })
+            .collect();
+
+        Self {
+            name: channel.to_string(),
+            date: date.to_string(),
+            packages,
+            renames: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct MockChannelContent {
+    std: Vec<(MockInstallerBuilder, String)>,
+    rustc: Vec<(MockInstallerBuilder, String)>,
+    cargo: Vec<(MockInstallerBuilder, String)>,
+    rls: Vec<(MockInstallerBuilder, String)>,
+    docs: Vec<(MockInstallerBuilder, String)>,
+    src: Vec<(MockInstallerBuilder, String)>,
+    analysis: Vec<(MockInstallerBuilder, String)>,
+    combined: Vec<(MockInstallerBuilder, String)>,
+}
+
+impl MockChannelContent {
+    fn into_packages(
+        self,
+        rls_name: &'static str,
+    ) -> Vec<(&'static str, Vec<(MockInstallerBuilder, String)>)> {
+        vec![
+            ("rust-std", self.std),
+            ("rustc", self.rustc),
+            ("cargo", self.cargo),
+            (rls_name, self.rls),
+            ("rust-docs", self.docs),
+            ("rust-src", self.src),
+            ("rust-analysis", self.analysis),
+            ("rust", self.combined),
+        ]
+    }
+}
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub(super) enum RlsStatus {
+    Available,
+    Renamed,
+    Unavailable,
+}
+
+impl RlsStatus {
+    fn pkg_name(self) -> &'static str {
+        match self {
+            Self::Renamed => "rls-preview",
+            _ => "rls",
+        }
+    }
+}
+
 // A single rust-installer package
 #[derive(Debug, Hash, Eq, PartialEq)]
-pub struct MockPackage {
+pub(crate) struct MockPackage {
     // rust, rustc, rust-std-$triple, rust-doc, etc.
     pub name: &'static str,
     pub version: String,
@@ -101,7 +504,7 @@ pub struct MockPackage {
 }
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
-pub struct MockTargetedPackage {
+pub(crate) struct MockTargetedPackage {
     // Target triple
     pub target: String,
     // Whether the file actually exists (could be due to build failure)
@@ -112,20 +515,20 @@ pub struct MockTargetedPackage {
 }
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
-pub struct MockComponent {
+pub(crate) struct MockComponent {
     pub name: String,
     pub target: String,
     pub is_extension: bool,
 }
 
 #[derive(Clone)]
-pub struct MockHashes {
+struct MockHashes {
     pub gz: String,
     pub xz: Option<String>,
     pub zst: Option<String>,
 }
 
-pub enum MockManifestVersion {
+pub(crate) enum MockManifestVersion {
     V1,
     V2,
 }
@@ -485,23 +888,7 @@ fn create_tarball(relpath: &Path, src: &Path, dst: &Path) -> io::Result<()> {
     tar.finish()
 }
 
-pub fn calc_hash(src: &Path) -> String {
-    let mut buf = Vec::new();
-    File::open(src).unwrap().read_to_end(&mut buf).unwrap();
-    let mut hasher = Sha256::new();
-    hasher.update(buf);
-    format!("{:x}", hasher.finalize())
-}
-
-pub fn create_hash(src: &Path, dst: &Path) -> String {
-    let hex = calc_hash(src);
-    let src_file = src.file_name().unwrap();
-    let file_contents = format!("{} *{}\n", hex, src_file.to_string_lossy());
-    write_file(dst, &file_contents);
-    hex
-}
-
-pub fn write_file(dst: &Path, contents: &str) {
+pub(super) fn write_file(dst: &Path, contents: &str) {
     drop(fs::remove_file(dst));
     File::create(dst)
         .and_then(|mut f| f.write_all(contents.as_bytes()))

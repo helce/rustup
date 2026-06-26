@@ -6,25 +6,34 @@
 )]
 //! Test support module; public to permit use from integration tests.
 
-pub mod mock;
-
 use std::collections::HashMap;
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
-use std::io;
+use std::fs::File;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(test)]
 use anyhow::Result;
+use sha2::{Digest, Sha256};
 
 use crate::dist::TargetTriple;
 use crate::process::TestProcess;
 
 #[cfg(windows)]
 pub use crate::cli::self_update::{RegistryGuard, RegistryValueId, USER_PATH, get_path};
+
+mod clitools;
+pub use clitools::{
+    CliTestContext, Config, SanitizedOutput, Scenario, SelfUpdateTestContext, output_release_file,
+    print_command, print_indented,
+};
+pub(crate) mod dist;
+pub(crate) mod mock;
+pub use mock::{MockComponentBuilder, MockFile, MockInstallerBuilder};
 
 // Things that can have environment variables applied to them.
 pub trait Env {
@@ -231,3 +240,81 @@ where
     let rustup_home = RustupHome::new_in(test_dir)?;
     f(&rustup_home)
 }
+
+pub mod topical_doc_data {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    // Paths are written as a string in the UNIX format to make it easy
+    // to maintain.
+    static TEST_CASES: &[(&[&str], &str)] = &[
+        (&["core"], "core/index.html"),
+        (&["core::arch"], "core/arch/index.html"),
+        (&["fn"], "std/keyword.fn.html"),
+        (&["keyword:fn"], "std/keyword.fn.html"),
+        (&["primitive:fn"], "std/primitive.fn.html"),
+        (&["macro:file!"], "std/macro.file!.html"),
+        (&["macro:file"], "std/macro.file.html"),
+        (&["std::fs"], "std/fs/index.html"),
+        (&["std::fs::read_dir"], "std/fs/fn.read_dir.html"),
+        (&["std::io::Bytes"], "std/io/struct.Bytes.html"),
+        (&["std::iter::Sum"], "std/iter/trait.Sum.html"),
+        (&["std::io::error::Result"], "std/io/error/type.Result.html"),
+        (&["usize"], "std/primitive.usize.html"),
+        (&["eprintln"], "std/macro.eprintln.html"),
+        (&["alloc::format"], "alloc/macro.format.html"),
+        (&["std::mem::MaybeUninit"], "std/mem/union.MaybeUninit.html"),
+        (&["--rustc", "lints"], "rustc/lints/index.html"),
+        (&["--rustdoc", "lints"], "rustdoc/lints.html"),
+        (
+            &["lints::broken_intra_doc_links", "--rustdoc"],
+            "rustdoc/lints.html",
+        ),
+    ];
+
+    fn repath(origin: &str) -> String {
+        // Add doc prefix and rewrite string paths for the current platform
+        let with_prefix = "share/doc/rust/html/".to_owned() + origin;
+        let splitted = with_prefix.split('/');
+        let repathed = splitted.fold(PathBuf::new(), |acc, e| acc.join(e));
+        repathed.into_os_string().into_string().unwrap()
+    }
+
+    pub fn test_cases<'a>() -> impl Iterator<Item = (&'a [&'a str], String)> {
+        TEST_CASES.iter().map(|(args, path)| (*args, repath(path)))
+    }
+
+    pub fn unique_paths() -> impl Iterator<Item = String> {
+        // Hashset used to test uniqueness of values through insert method.
+        let mut unique_paths = HashSet::new();
+        TEST_CASES
+            .iter()
+            .filter(move |(_, p)| unique_paths.insert(p))
+            .map(|(_, p)| repath(p))
+    }
+}
+
+pub fn calc_hash(src: &Path) -> String {
+    let mut buf = Vec::new();
+    File::open(src).unwrap().read_to_end(&mut buf).unwrap();
+    let mut hasher = Sha256::new();
+    hasher.update(buf);
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn create_hash(src: &Path, dst: &Path) -> String {
+    let hex = calc_hash(src);
+    let src_file = src.file_name().unwrap();
+    let file_contents = format!("{} *{}\n", hex, src_file.to_string_lossy());
+    dist::write_file(dst, &file_contents);
+    hex
+}
+
+pub static CROSS_ARCH1: &str = "x86_64-unknown-linux-musl";
+pub static CROSS_ARCH2: &str = "arm-linux-androideabi";
+
+// Architecture for testing 'multi-host' installation.
+#[cfg(target_pointer_width = "64")]
+pub static MULTI_ARCH1: &str = "i686-unknown-linux-gnu";
+#[cfg(not(target_pointer_width = "64"))]
+pub static MULTI_ARCH1: &str = "x86_64-unknown-linux-gnu";
