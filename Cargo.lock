@@ -183,8 +183,7 @@ dependencies = [
 [[package]]
 name = "aws-lc-sys"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f9dd2e03ee80ca2822dd6ea431163d2ef259f2066a4d6ccaca6d9dcb386aa43"
+source = "git+https://github.com/helce/aws-lc-rs?tag=aws-lc-sys%2Fv0.26.0#9be09bc5953913b97dbfd523244af77f81a57d11"
 dependencies = [
  "bindgen",
  "cc",
@@ -2219,7 +2218,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
