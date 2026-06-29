@@ -185,8 +185,7 @@ dependencies = [
 [[package]]
 name = "aws-lc-sys"
 version = "0.38.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4321e568ed89bb5a7d291a7f37997c2c0df89809d7b6d12062c81ddb54aa782e"
+source = "git+https://github.com/helce/aws-lc-rs?tag=aws-lc-sys%2Fv0.38.0#534b5b58673d3691c2ad634cc2099901a40b60c9"
 dependencies = [
  "cc",
  "cmake",
@@ -256,8 +255,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 [[package]]
 name = "cc"
 version = "1.2.56"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
+source = "git+https://github.com/helce/cc-rs?tag=cc-v1.2.56#7236d15e58b1f1df9e887eb5b896601dc18dc6fa"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -668,8 +666,7 @@ dependencies = [
 [[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+source = "git+https://github.com/helce/cc-rs?tag=cc-v1.2.56#7236d15e58b1f1df9e887eb5b896601dc18dc6fa"
 
 [[package]]
 name = "flate2"
@@ -1306,8 +1303,7 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 [[package]]
 name = "libc"
 version = "0.2.182"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6800badb6cb2082ffd7b6a67e6125bb39f18782f793520caee8cb8846be06112"
+source = "git+https://github.com/helce/libc?tag=0.2.182#27bf4a4d30960fa0fc6aaae4f7126b95c08bd0d9"
 
 [[package]]
 name = "libredox"
@@ -1336,8 +1332,7 @@ dependencies = [
 [[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+source = "git+https://github.com/helce/linux-raw-sys?tag=v0.12.1#1555c7dee43aa0547c625cdd56b1c342f50867c4"
 
 [[package]]
 name = "litemap"
@@ -1540,8 +1535,7 @@ checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 [[package]]
 name = "openssl-src"
 version = "300.5.4+3.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a507b3792995dae9b0df8a1c1e3771e8418b7c2d9f0baeba32e6fe8b06c7cb72"
+source = "git+https://github.com/helce/openssl-src-rs?tag=300.5.4%2B3.5.4#b671dfe7fa09c3e19cbeaaeb7b16cdd0432c167d"
 dependencies = [
  "cc",
 ]
@@ -1694,8 +1688,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 [[package]]
 name = "platforms"
 version = "3.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a546fc83c436ffbef8e7e639df8498bbc5122e0bd19cf8db208720c2cc85290e"
+source = "git+https://github.com/helce/rustsec?tag=platforms%2Fv3.8.0#af82be0f44371329913e9e53ac4d9b07d8f2f31d"
 
 [[package]]
 name = "portable-atomic"
@@ -2104,14 +2097,13 @@ dependencies = [
 [[package]]
 name = "rustix"
 version = "1.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
+source = "git+https://github.com/helce/rustix?tag=v1.1.4#a64f3722f385ced778684547353884b4a97d7652"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
