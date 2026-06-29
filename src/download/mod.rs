@@ -4,9 +4,211 @@ use std::fs::remove_file;
 use std::path::Path;
 
 use anyhow::Context;
-pub use anyhow::Result;
+#[cfg(any(
+    not(feature = "curl-backend"),
+    not(feature = "reqwest-rustls-tls"),
+    not(feature = "reqwest-native-tls")
+))]
+use anyhow::anyhow;
+use sha2::Sha256;
 use thiserror::Error;
+#[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
+use tracing::info;
+use tracing::warn;
 use url::Url;
+
+use crate::{errors::RustupError, process::Process, utils::Notification};
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) async fn download_file(
+    url: &Url,
+    path: &Path,
+    hasher: Option<&mut Sha256>,
+    notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
+) -> anyhow::Result<()> {
+    download_file_with_resume(url, path, hasher, false, &notify_handler, process).await
+}
+
+pub(crate) async fn download_file_with_resume(
+    url: &Url,
+    path: &Path,
+    hasher: Option<&mut Sha256>,
+    resume_from_partial: bool,
+    notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
+) -> anyhow::Result<()> {
+    use crate::download::DownloadError as DEK;
+    match download_file_(
+        url,
+        path,
+        hasher,
+        resume_from_partial,
+        notify_handler,
+        process,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            if e.downcast_ref::<std::io::Error>().is_some() {
+                return Err(e);
+            }
+            let is_client_error = match e.downcast_ref::<DEK>() {
+                // Specifically treat the bad partial range error as not our
+                // fault in case it was something odd which happened.
+                Some(DEK::HttpStatus(416)) => false,
+                Some(DEK::HttpStatus(400..=499)) | Some(DEK::FileNotFound) => true,
+                _ => false,
+            };
+            Err(e).with_context(|| {
+                if is_client_error {
+                    RustupError::DownloadNotExists {
+                        url: url.clone(),
+                        path: path.to_path_buf(),
+                    }
+                } else {
+                    RustupError::DownloadingFile {
+                        url: url.clone(),
+                        path: path.to_path_buf(),
+                    }
+                }
+            })
+        }
+    }
+}
+
+async fn download_file_(
+    url: &Url,
+    path: &Path,
+    hasher: Option<&mut Sha256>,
+    resume_from_partial: bool,
+    notify_handler: &dyn Fn(Notification<'_>),
+    process: &Process,
+) -> anyhow::Result<()> {
+    #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
+    use crate::download::{Backend, Event, TlsBackend};
+    use sha2::Digest;
+    use std::cell::RefCell;
+
+    notify_handler(Notification::DownloadingFile(url, path));
+
+    let hasher = RefCell::new(hasher);
+
+    // This callback will write the download to disk and optionally
+    // hash the contents, then forward the notification up the stack
+    let callback: &dyn Fn(Event<'_>) -> anyhow::Result<()> = &|msg| {
+        if let Event::DownloadDataReceived(data) = msg {
+            if let Some(h) = hasher.borrow_mut().as_mut() {
+                h.update(data);
+            }
+        }
+
+        match msg {
+            Event::DownloadContentLengthReceived(len) => {
+                notify_handler(Notification::DownloadContentLengthReceived(len));
+            }
+            Event::DownloadDataReceived(data) => {
+                notify_handler(Notification::DownloadDataReceived(data));
+            }
+            Event::ResumingPartialDownload => {
+                notify_handler(Notification::ResumingPartialDownload);
+            }
+        }
+
+        Ok(())
+    };
+
+    // Download the file
+
+    // Keep the curl env var around for a bit
+    let use_curl_backend = process.var_os("RUSTUP_USE_CURL").map(|it| it != "0");
+    if use_curl_backend == Some(true) {
+        warn!(
+            "RUSTUP_USE_CURL is set; the curl backend is deprecated,
+            please file an issue if the default download backend does not work for your use case"
+        );
+    }
+
+    let use_rustls = process.var_os("RUSTUP_USE_RUSTLS").map(|it| it != "0");
+    if use_rustls == Some(false) {
+        warn!(
+            "RUSTUP_USE_RUSTLS is set to `0`; the native-tls backend is deprecated,
+            please file an issue if the default download backend does not work for your use case"
+        );
+    }
+
+    let backend = match (use_curl_backend, use_rustls) {
+        // If environment specifies a backend that's unavailable, error out
+        #[cfg(not(feature = "reqwest-rustls-tls"))]
+        (_, Some(true)) => {
+            return Err(anyhow!(
+                "RUSTUP_USE_RUSTLS is set, but this rustup distribution was not built with the reqwest-rustls-tls feature"
+            ));
+        }
+        #[cfg(not(feature = "reqwest-native-tls"))]
+        (_, Some(false)) => {
+            return Err(anyhow!(
+                "RUSTUP_USE_RUSTLS is set to false, but this rustup distribution was not built with the reqwest-native-tls feature"
+            ));
+        }
+        #[cfg(not(feature = "curl-backend"))]
+        (Some(true), _) => {
+            return Err(anyhow!(
+                "RUSTUP_USE_CURL is set, but this rustup distribution was not built with the curl-backend feature"
+            ));
+        }
+
+        // Positive selections, from least preferred to most preferred
+        #[cfg(feature = "curl-backend")]
+        (Some(true), None) => Backend::Curl,
+        #[cfg(feature = "reqwest-native-tls")]
+        (_, Some(false)) => {
+            if use_curl_backend == Some(true) {
+                info!(
+                    "RUSTUP_USE_CURL is set and RUSTUP_USE_RUSTLS is set to off, using reqwest with native-tls"
+                );
+            }
+            Backend::Reqwest(TlsBackend::NativeTls)
+        }
+        #[cfg(feature = "reqwest-rustls-tls")]
+        _ => {
+            if use_curl_backend == Some(true) {
+                info!(
+                    "both RUSTUP_USE_CURL and RUSTUP_USE_RUSTLS are set, using reqwest with rustls"
+                );
+            }
+            Backend::Reqwest(TlsBackend::Rustls)
+        }
+
+        // Falling back if only one backend is available
+        #[cfg(all(not(feature = "reqwest-rustls-tls"), feature = "reqwest-native-tls"))]
+        _ => Backend::Reqwest(TlsBackend::NativeTls),
+        #[cfg(all(
+            not(feature = "reqwest-rustls-tls"),
+            not(feature = "reqwest-native-tls"),
+            feature = "curl-backend"
+        ))]
+        _ => Backend::Curl,
+    };
+
+    notify_handler(match backend {
+        #[cfg(feature = "curl-backend")]
+        Backend::Curl => Notification::UsingCurl,
+        #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
+        Backend::Reqwest(_) => Notification::UsingReqwest,
+    });
+
+    let res = backend
+        .download_to_path(url, path, resume_from_partial, Some(callback))
+        .await;
+
+    notify_handler(Notification::DownloadFinished);
+
+    res
+}
 
 /// User agent header value for HTTP request.
 /// See: https://github.com/rust-lang/rustup/issues/2860.
@@ -25,7 +227,7 @@ const REQWEST_RUSTLS_TLS_USER_AGENT: &str =
     concat!("rustup/", env!("CARGO_PKG_VERSION"), " (reqwest; rustls)");
 
 #[derive(Debug, Copy, Clone)]
-pub enum Backend {
+enum Backend {
     #[cfg(feature = "curl-backend")]
     Curl,
     #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
@@ -33,13 +235,13 @@ pub enum Backend {
 }
 
 impl Backend {
-    pub async fn download_to_path(
+    async fn download_to_path(
         self,
         url: &Url,
         path: &Path,
         resume_from_partial: bool,
         callback: Option<DownloadCallback<'_>>,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         let Err(err) = self
             .download_impl(url, path, resume_from_partial, callback)
             .await
@@ -63,7 +265,7 @@ impl Backend {
         path: &Path,
         resume_from_partial: bool,
         callback: Option<DownloadCallback<'_>>,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         use std::cell::RefCell;
         use std::fs::OpenOptions;
         use std::io::{Read, Seek, SeekFrom, Write};
@@ -155,7 +357,7 @@ impl Backend {
         url: &Url,
         resume_from: u64,
         callback: DownloadCallback<'_>,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         match self {
             #[cfg(feature = "curl-backend")]
             Self::Curl => curl::download(url, resume_from, callback),
@@ -167,7 +369,7 @@ impl Backend {
 
 #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
 #[derive(Debug, Copy, Clone)]
-pub enum TlsBackend {
+enum TlsBackend {
     #[cfg(feature = "reqwest-rustls-tls")]
     Rustls,
     #[cfg(feature = "reqwest-native-tls")]
@@ -181,7 +383,7 @@ impl TlsBackend {
         url: &Url,
         resume_from: u64,
         callback: DownloadCallback<'_>,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         let client = match self {
             #[cfg(feature = "reqwest-rustls-tls")]
             Self::Rustls => &reqwest_be::CLIENT_RUSTLS_TLS,
@@ -194,7 +396,7 @@ impl TlsBackend {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub enum Event<'a> {
+enum Event<'a> {
     ResumingPartialDownload,
     /// Received the Content-Length of the to-be downloaded data.
     DownloadContentLengthReceived(u64),
@@ -202,12 +404,12 @@ pub enum Event<'a> {
     DownloadDataReceived(&'a [u8]),
 }
 
-type DownloadCallback<'a> = &'a dyn Fn(Event<'_>) -> Result<()>;
+type DownloadCallback<'a> = &'a dyn Fn(Event<'_>) -> anyhow::Result<()>;
 
 /// Download via libcurl; encrypt with the native (or OpenSSl) TLS
 /// stack via libcurl
 #[cfg(feature = "curl-backend")]
-pub mod curl {
+mod curl {
     use std::cell::RefCell;
     use std::str;
     use std::time::Duration;
@@ -218,7 +420,7 @@ pub mod curl {
 
     use super::{DownloadError, Event};
 
-    pub fn download(
+    pub(super) fn download(
         url: &Url,
         resume_from: u64,
         callback: &dyn Fn(Event<'_>) -> Result<()>,
@@ -319,7 +521,7 @@ pub mod curl {
 }
 
 #[cfg(any(feature = "reqwest-rustls-tls", feature = "reqwest-native-tls"))]
-pub mod reqwest_be {
+mod reqwest_be {
     use std::io;
     #[cfg(feature = "reqwest-rustls-tls")]
     use std::sync::Arc;
@@ -327,23 +529,24 @@ pub mod reqwest_be {
     use std::sync::LazyLock;
     use std::time::Duration;
 
-    use anyhow::{Context, Result, anyhow};
+    use anyhow::{Context, anyhow};
     use reqwest::{Client, ClientBuilder, Proxy, Response, header};
     #[cfg(feature = "reqwest-rustls-tls")]
     use rustls::crypto::aws_lc_rs;
     #[cfg(feature = "reqwest-rustls-tls")]
     use rustls_platform_verifier::BuilderVerifierExt;
     use tokio_stream::StreamExt;
+    use tracing::error;
     use url::Url;
 
     use super::{DownloadError, Event};
 
-    pub async fn download(
+    pub(super) async fn download(
         url: &Url,
         resume_from: u64,
-        callback: &dyn Fn(Event<'_>) -> Result<()>,
+        callback: &dyn Fn(Event<'_>) -> anyhow::Result<()>,
         client: &Client,
-    ) -> Result<()> {
+    ) -> anyhow::Result<()> {
         // Short-circuit reqwest for the "file:" URL scheme
         if download_from_file_url(url, resume_from, callback)? {
             return Ok(());
@@ -351,7 +554,8 @@ pub mod reqwest_be {
 
         let res = request(url, resume_from, client)
             .await
-            .context("failed to make network request")?;
+            .inspect_err(|error| error!(?error, "failed to download file"))
+            .context("error downloading file")?;
 
         if !res.status().is_success() {
             let code: u16 = res.status().into();
@@ -384,17 +588,17 @@ pub mod reqwest_be {
 
     #[cfg(feature = "reqwest-rustls-tls")]
     pub(super) static CLIENT_RUSTLS_TLS: LazyLock<Client> = LazyLock::new(|| {
+        let mut tls_config =
+            rustls::ClientConfig::builder_with_provider(Arc::new(aws_lc_rs::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_platform_verifier()
+                .with_no_client_auth();
+        tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
         let catcher = || {
             client_generic()
-                .use_preconfigured_tls(
-                    rustls::ClientConfig::builder_with_provider(Arc::new(
-                        aws_lc_rs::default_provider(),
-                    ))
-                    .with_safe_default_protocol_versions()
-                    .unwrap()
-                    .with_platform_verifier()
-                    .with_no_client_auth(),
-                )
+                .use_preconfigured_tls(tls_config)
                 .user_agent(super::REQWEST_RUSTLS_TLS_USER_AGENT)
                 .build()
         };
@@ -446,8 +650,8 @@ pub mod reqwest_be {
     fn download_from_file_url(
         url: &Url,
         resume_from: u64,
-        callback: &dyn Fn(Event<'_>) -> Result<()>,
-    ) -> Result<bool> {
+        callback: &dyn Fn(Event<'_>) -> anyhow::Result<()>,
+    ) -> anyhow::Result<bool> {
         use std::fs;
 
         // The file scheme is mostly for use by tests to mock the dist server
@@ -483,13 +687,11 @@ pub mod reqwest_be {
 }
 
 #[derive(Debug, Error)]
-pub enum DownloadError {
+enum DownloadError {
     #[error("http request returned an unsuccessful status code: {0}")]
     HttpStatus(u32),
     #[error("file not found")]
     FileNotFound,
-    #[error("download backend '{0}' unavailable")]
-    BackendUnavailable(&'static str),
     #[error("{0}")]
     Message(String),
     #[error(transparent)]

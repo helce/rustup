@@ -177,7 +177,7 @@ impl Notifier {
     }
 }
 
-#[tracing::instrument(level = "trace")]
+#[tracing::instrument(level = "trace", skip(process))]
 pub(crate) fn set_globals(current_dir: PathBuf, quiet: bool, process: &Process) -> Result<Cfg<'_>> {
     let notifier = Notifier::new(quiet, process);
     Cfg::from_env(current_dir, Arc::new(move |n| notifier.handle(n)), process)
@@ -418,7 +418,7 @@ pub(crate) async fn list_toolchains(
         let default_toolchain_name = cfg.get_default()?;
         let active_toolchain_name: Option<ToolchainName> =
             if let Ok(Some((LocalToolchainName::Named(toolchain), _reason))) =
-                cfg.find_active_toolchain(None).await
+                cfg.maybe_ensure_active_toolchain(None).await
             {
                 Some(toolchain)
             } else {

@@ -39,19 +39,8 @@ pub(crate) struct ShellScript {
     name: &'static str,
 }
 
-impl ShellScript {
-    pub(crate) fn write(&self, process: &Process) -> Result<()> {
-        let home = process.cargo_home()?;
-        let cargo_bin = format!("{}/bin", cargo_home_str(process)?);
-        let env_name = home.join(self.name);
-        let env_file = self.content.replace("{cargo_bin}", &cargo_bin);
-        utils::write_file(self.name, &env_name, &env_file)?;
-        Ok(())
-    }
-}
-
 // TODO: Update into a bytestring.
-pub(crate) fn cargo_home_str(process: &Process) -> Result<Cow<'static, str>> {
+fn cargo_home_str_with_home(home: &str, process: &Process) -> Result<Cow<'static, str>> {
     let path = process.cargo_home()?;
 
     let default_cargo_home = process
@@ -59,7 +48,7 @@ pub(crate) fn cargo_home_str(process: &Process) -> Result<Cow<'static, str>> {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".cargo");
     Ok(if default_cargo_home == path {
-        "$HOME/.cargo".into()
+        Cow::Owned(format!("{home}/.cargo"))
     } else {
         match path.to_str() {
             Some(p) => p.to_owned().into(),
@@ -107,12 +96,30 @@ pub(crate) trait UnixShell {
         }
     }
 
+    fn cargo_home_str(&self, process: &Process) -> Result<Cow<'static, str>> {
+        #[cfg(windows)]
+        let home = "%USERPROFILE%";
+        #[cfg(not(windows))]
+        let home = "$HOME";
+        cargo_home_str_with_home(home, process)
+    }
+
     fn source_string(&self, process: &Process) -> Result<String> {
-        Ok(format!(r#". "{}/env""#, cargo_home_str(process)?))
+        Ok(format!(r#". "{}/env""#, self.cargo_home_str(process)?))
+    }
+
+    fn write_script(&self, script: &ShellScript, process: &Process) -> Result<()> {
+        let home = process.cargo_home()?;
+        let cargo_bin = format!("{}/bin", self.cargo_home_str(process)?);
+        let env_name = home.join(script.name);
+        let env_file = script.content.replace("{cargo_bin}", &cargo_bin);
+        utils::write_file(script.name, &env_name, &env_file)?;
+        Ok(())
     }
 }
 
-struct Posix;
+pub(super) struct Posix;
+
 impl UnixShell for Posix {
     fn does_exist(&self, _: &Process) -> bool {
         true
@@ -252,11 +259,14 @@ impl UnixShell for Fish {
     }
 
     fn source_string(&self, process: &Process) -> Result<String> {
-        Ok(format!(r#"source "{}/env.fish""#, cargo_home_str(process)?))
+        Ok(format!(
+            r#"source "{}/env.fish""#,
+            self.cargo_home_str(process)?
+        ))
     }
 }
 
-struct Nu;
+pub(super) struct Nu;
 
 impl UnixShell for Nu {
     fn does_exist(&self, process: &Process) -> bool {
@@ -269,26 +279,24 @@ impl UnixShell for Nu {
         let mut paths = vec![];
 
         if let Ok(p) = process.var("XDG_CONFIG_HOME") {
-            let path = PathBuf::from(p).join("nushell/");
-            paths.push(path.join("env.nu"));
-            paths.push(path.join("config.nu"));
+            let mut p = PathBuf::from(p);
+            p.extend(["nushell", "config.nu"]);
+            paths.push(p)
         }
 
-        if let Some(p) = process.home_dir() {
-            let path = p.join(".config/nushell/");
-            paths.push(path.join("env.nu"));
-            paths.push(path.join("config.nu"));
+        if let Some(mut p) = process.home_dir() {
+            p.extend([".config", "nushell", "config.nu"]);
+            paths.push(p)
         }
         paths
     }
 
     fn update_rcs(&self, process: &Process) -> Vec<PathBuf> {
-        let mut rcs = self.rcfiles(process);
-        if rcs.len() == 4 {
-            // The first two rcfile takes precedence (XDG_CONFIG_HOME).
-            rcs.truncate(2);
+        // The first rcfile in XDG_CONFIG_HOME takes precedence.
+        match self.rcfiles(process).into_iter().next() {
+            Some(path) => vec![path],
+            None => vec![],
         }
-        rcs
     }
 
     fn env_script(&self) -> ShellScript {
@@ -299,7 +307,14 @@ impl UnixShell for Nu {
     }
 
     fn source_string(&self, process: &Process) -> Result<String> {
-        Ok(format!(r#"source "{}/env.nu""#, cargo_home_str(process)?))
+        Ok(format!(
+            r#"source $"{}/env.nu""#,
+            self.cargo_home_str(process)?
+        ))
+    }
+
+    fn cargo_home_str(&self, process: &Process) -> Result<Cow<'static, str>> {
+        cargo_home_str_with_home("($nu.home-path)", process)
     }
 }
 

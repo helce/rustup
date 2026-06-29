@@ -33,7 +33,7 @@ RUSTUP_QUIET=no
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
     cat <<EOF
-rustup-init 1.28.1 (bb9441b61 2025-03-05)
+rustup-init 1.28.2 (d1f31992a 2025-04-28)
 
 The installer for rustup
 
@@ -87,7 +87,15 @@ main() {
             ;;
     esac
 
-    local _url="${RUSTUP_UPDATE_ROOT}/dist/${_arch}/rustup-init${_ext}"
+    local _url
+    if [ "${RUSTUP_VERSION+set}" = 'set' ]; then
+        say "\`RUSTUP_VERSION\` has been set to \`${RUSTUP_VERSION}\`"
+        _url="${RUSTUP_UPDATE_ROOT}/archive/${RUSTUP_VERSION}"
+    else
+        _url="${RUSTUP_UPDATE_ROOT}/dist"
+    fi
+    _url="${_url}/${_arch}/rustup-init${_ext}"
+
 
     local _dir
     if ! _dir="$(ensure mktemp -d)"; then

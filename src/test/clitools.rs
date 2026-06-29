@@ -137,7 +137,12 @@ impl Config {
 
     /// Expect an ok status
     pub async fn expect_ok(&mut self, args: &[&str]) {
-        let out = self.run(args[0], &args[1..], &[]).await;
+        self.expect_ok_env(args, &[]).await
+    }
+
+    /// Expect an ok status with extra environment variables
+    pub async fn expect_ok_env(&self, args: &[&str], env: &[(&str, &str)]) {
+        let out = self.run(args[0], &args[1..], env).await;
         if !out.ok {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -215,7 +220,19 @@ impl Config {
 
     /// Expect an exact strings on stdout/stderr with an ok status code
     pub async fn expect_ok_ex(&mut self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
+        self.expect_ok_ex_env(args, &[], stdout, stderr).await;
+    }
+
+    /// Expect an exact strings on stdout/stderr with an ok status code,
+    /// with extra environment variables
+    pub async fn expect_ok_ex_env(
+        &mut self,
+        args: &[&str],
+        env: &[(&str, &str)],
+        stdout: &str,
+        stderr: &str,
+    ) {
+        let out = self.run(args[0], &args[1..], env).await;
         if !out.ok || out.stdout != stdout || out.stderr != stderr {
             print_command(args, &out);
             println!("expected.ok: true");
@@ -667,6 +684,7 @@ async fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDi
     //   **in this process** when the tests are still running.
     unsafe {
         // Unset env variables that will break our testing
+        env::remove_var("CARGO");
         env::remove_var("RUSTUP_UPDATE_ROOT");
         env::remove_var("RUSTUP_TOOLCHAIN");
         env::remove_var("SHELL");

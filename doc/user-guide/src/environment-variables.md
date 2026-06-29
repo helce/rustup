@@ -25,6 +25,9 @@
 - `RUSTUP_UPDATE_ROOT` (default `https://static.rust-lang.org/rustup`). Sets
   the root URL for downloading self-update.
 
+- `RUSTUP_VERSION` (default: none). Overrides the rustup version (e.g. `1.27.1`)
+  to be downloaded when executing `rustup-init.sh` or `rustup self update`.
+
 - `RUSTUP_IO_THREADS` *unstable* (defaults to reported cpu count). Sets the
   number of threads to perform close IO in. Set to `1` to force
   single-threaded IO for troubleshooting, or an arbitrary number to override
@@ -50,7 +53,16 @@
   feature sacrifices some transactions protections and may be removed at any
   point. Linux only.
 
+- `RUSTUP_AUTO_INSTALL` (default: 1) When set to `1`, installs the active
+  toolchain when it is absent. Set this value to `0` to disable automatic
+  installation.
+
+- `RUSTUP_HARDLINK_PROXIES` *unstable*. When set, rustup will not attempt to
+  symlink proxies and instead always use hardlinks. If you find this fixes
+  a problem, then please report the issue on the [rustup issue tracker].
+
 [directive syntax]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives
 [dc]: https://docs.docker.com/storage/storagedriver/overlayfs-driver/#modifying-files-or-directories
 [override]: overrides.md
 [tracing viewer]: https://github.com/catapult-project/catapult/blob/master/tracing/README.md
+[rustup issue tracker]: https://github.com/rust-lang/rustup/issues

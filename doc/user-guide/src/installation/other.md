@@ -63,13 +63,16 @@ After installing rustup with your favorite package manager, there are usually tw
   ```
 
   This will allow you to perform the initial setup of `rustup`, populate all the proxies
-  managed by rustup, and install a default toolchain. When the installation is completed,
-  please make sure that these proxies (usually under `$HOME/.cargo/bin`) are exposed via your `$PATH`.
+  managed by rustup, and install a default toolchain.
 
   > As of 2024/12/23, this is the case for
   > [DNF](https://developer.fedoraproject.org/tech/languages/rust/further-reading.html).
 
-Now you should be able to run `rustup`, `rustc`, `cargo`, etc. normally.
+When the installation is completed, please make sure that the rustup proxies
+(usually under `$HOME/.cargo/bin`) are [correctly exposed] via your `$PATH`,
+and you should be able to run `rustup`, `rustc`, `cargo`, etc. normally.
+
+[correctly exposed]: ./already-installed-rust.html#ensure-the-correct-path-configuration
 
 ### APT
 
@@ -152,6 +155,8 @@ You can manually download `rustup-init` for a given target from
   - [sha256 file](https://static.rust-lang.org/rustup/dist/powerpc64-unknown-linux-gnu/rustup-init.sha256)
 - [powerpc64le-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-gnu/rustup-init.sha256)
+- [powerpc64le-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-musl/rustup-init)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-musl/rustup-init.sha256)
 - [s390x-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/s390x-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/s390x-unknown-linux-gnu/rustup-init.sha256)
 - [x86_64-apple-darwin](https://static.rust-lang.org/rustup/dist/x86_64-apple-darwin/rustup-init)

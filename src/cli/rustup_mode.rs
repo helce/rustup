@@ -13,6 +13,7 @@ use itertools::Itertools;
 use tracing::{info, trace, warn};
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
+use crate::dist::AutoInstallMode;
 use crate::{
     cli::{
         common::{self, PackageUpdate, update_console_filter},
@@ -124,6 +125,23 @@ enum RustupSubcmd {
     #[command(hide = true)]
     DumpTestament,
 
+    /// Install, uninstall, or list toolchains
+    Toolchain {
+        #[command(subcommand)]
+        subcmd: ToolchainSubcmd,
+    },
+
+    /// Set the default toolchain
+    #[command(after_help = DEFAULT_HELP)]
+    Default {
+        #[arg(help = MAYBE_RESOLVABLE_TOOLCHAIN_ARG_HELP)]
+        toolchain: Option<MaybeResolvableToolchainName>,
+
+        /// Install toolchains that require an emulator. See https://github.com/rust-lang/rustup/wiki/Non-host-toolchains
+        #[arg(long)]
+        force_non_host: bool,
+    },
+
     /// Show the active and installed toolchains or profiles
     #[command(after_help = SHOW_HELP)]
     Show {
@@ -160,23 +178,6 @@ enum RustupSubcmd {
 
     /// Check for updates to Rust toolchains and rustup
     Check,
-
-    /// Set the default toolchain
-    #[command(after_help = DEFAULT_HELP)]
-    Default {
-        #[arg(help = MAYBE_RESOLVABLE_TOOLCHAIN_ARG_HELP)]
-        toolchain: Option<MaybeResolvableToolchainName>,
-
-        /// Install toolchains that require an emulator. See https://github.com/rust-lang/rustup/wiki/Non-host-toolchains
-        #[arg(long)]
-        force_non_host: bool,
-    },
-
-    /// Modify or query the installed toolchains
-    Toolchain {
-        #[command(subcommand)]
-        subcmd: ToolchainSubcmd,
-    },
 
     /// Modify a toolchain's supported targets
     Target {
@@ -456,6 +457,7 @@ enum ComponentSubcmd {
     },
 
     /// Remove a component from a Rust toolchain
+    #[command(aliases = ["uninstall", "rm", "delete", "del"])]
     Remove {
         #[arg(required = true, num_args = 1..)]
         component: Vec<String>,
@@ -539,9 +541,15 @@ enum SetSubcmd {
         #[arg(value_enum, default_value_t)]
         auto_self_update_mode: SelfUpdateMode,
     },
+
+    /// The auto toolchain install mode
+    AutoInstall {
+        #[arg(value_enum, default_value_t)]
+        auto_install_mode: AutoInstallMode,
+    },
 }
 
-#[tracing::instrument(level = "trace", fields(args = format!("{:?}", process.args_os().collect::<Vec<_>>())))]
+#[tracing::instrument(level = "trace", fields(args = format!("{:?}", process.args_os().collect::<Vec<_>>())), skip(process, console_filter))]
 pub async fn main(
     current_dir: PathBuf,
     process: &Process,
@@ -715,6 +723,9 @@ pub async fn main(
             SetSubcmd::AutoSelfUpdate {
                 auto_self_update_mode,
             } => set_auto_self_update(cfg, auto_self_update_mode),
+            SetSubcmd::AutoInstall { auto_install_mode } => cfg
+                .set_auto_install(auto_install_mode)
+                .map(|_| utils::ExitCode(0)),
         },
         RustupSubcmd::Completions { shell, command } => {
             output_completion_script(shell, command, process)
@@ -753,7 +764,7 @@ async fn default_(
             }
         };
 
-        if let Some((toolchain, reason)) = cfg.find_active_toolchain(None).await? {
+        if let Some((toolchain, reason)) = cfg.active_toolchain()? {
             if !matches!(reason, ActiveReason::Default) {
                 info!("note that the toolchain '{toolchain}' is currently in use ({reason})");
             }
@@ -889,9 +900,7 @@ async fn update(
             exit_code &= common::self_update(|| Ok(()), cfg.process).await?;
         }
     } else if ensure_active_toolchain {
-        let (toolchain, reason) = cfg
-            .find_or_install_active_toolchain(force_non_host, true)
-            .await?;
+        let (toolchain, reason) = cfg.ensure_active_toolchain(force_non_host, true).await?;
         info!("the active toolchain `{toolchain}` has been installed");
         info!("it's active because: {reason}");
     } else {
@@ -964,7 +973,7 @@ async fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
     let installed_toolchains = cfg.list_toolchains()?;
     let active_toolchain_and_reason: Option<(ToolchainName, ActiveReason)> =
         if let Ok(Some((LocalToolchainName::Named(toolchain_name), reason))) =
-            cfg.find_active_toolchain(None).await
+            cfg.maybe_ensure_active_toolchain(None).await
         {
             Some((toolchain_name, reason))
         } else {
@@ -999,7 +1008,6 @@ async fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
         print_header::<Error>(&mut t, "installed toolchains")?;
 
         let default_toolchain_name = cfg.get_default()?;
-
         let last_index = installed_toolchains.len().wrapping_sub(1);
         for (n, toolchain_name) in installed_toolchains.into_iter().enumerate() {
             let is_default_toolchain = default_toolchain_name.as_ref() == Some(&toolchain_name);
@@ -1018,11 +1026,10 @@ async fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
                 let toolchain = Toolchain::new(cfg, toolchain_name.into())?;
                 writeln!(
                     cfg.process.stdout().lock(),
-                    "  {}",
-                    toolchain.rustc_version()
+                    "  {}\n  path: {}",
+                    toolchain.rustc_version(),
+                    toolchain.path().display()
                 )?;
-                // To make it easy to see which rustc belongs to which
-                // toolchain, we separate each pair with an extra newline.
                 if n != last_index {
                     writeln!(cfg.process.stdout().lock())?;
                 }
@@ -1084,7 +1091,7 @@ async fn show(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
 
 #[tracing::instrument(level = "trace", skip_all)]
 async fn show_active_toolchain(cfg: &Cfg<'_>, verbose: bool) -> Result<utils::ExitCode> {
-    match cfg.find_active_toolchain(None).await? {
+    match cfg.maybe_ensure_active_toolchain(None).await? {
         Some((toolchain_name, reason)) => {
             let toolchain = Toolchain::with_reason(cfg, toolchain_name.clone(), &reason)?;
             if verbose {
@@ -1322,7 +1329,7 @@ async fn toolchain_link(
 async fn toolchain_remove(cfg: &mut Cfg<'_>, opts: UninstallOpts) -> Result<utils::ExitCode> {
     let default_toolchain = cfg.get_default().ok().flatten();
     let active_toolchain = cfg
-        .find_active_toolchain(Some(false))
+        .maybe_ensure_active_toolchain(Some(false))
         .await
         .ok()
         .flatten()
