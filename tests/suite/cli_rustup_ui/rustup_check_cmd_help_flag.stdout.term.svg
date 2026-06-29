@@ -1,0 +1,51 @@
+<svg width="785px" height="254px" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .fg { fill: #AAAAAA }
+    .bg { fill: #000000 }
+    .fg-bright-cyan { fill: #55FFFF }
+    .fg-bright-green { fill: #55FF55 }
+    .fg-cyan { fill: #00AAAA }
+    .container {
+      padding: 0 10px;
+      line-height: 18px;
+    }
+    .bold { font-weight: bold; }
+    tspan {
+      font: 14px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+      white-space: pre;
+      line-height: 18px;
+    }
+  </style>
+
+  <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
+
+  <text xml:space="preserve" class="container fg">
+    <tspan x="10px" y="28px"><tspan>Check for updates to Rust toolchains and rustup</tspan>
+</tspan>
+    <tspan x="10px" y="46px">
+</tspan>
+    <tspan x="10px" y="64px"><tspan class="fg-bright-green bold">Usage:</tspan><tspan> </tspan><tspan class="fg-bright-cyan bold">rustup[EXE] check</tspan><tspan> </tspan><tspan class="fg-cyan">[OPTIONS]</tspan>
+</tspan>
+    <tspan x="10px" y="82px">
+</tspan>
+    <tspan x="10px" y="100px"><tspan class="fg-bright-green bold">Options:</tspan>
+</tspan>
+    <tspan x="10px" y="118px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--no-self-update</tspan><tspan>  Don't check for self update when running the `rustup check` command</tspan>
+</tspan>
+    <tspan x="10px" y="136px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">-h</tspan><tspan>, </tspan><tspan class="fg-bright-cyan bold">--help</tspan><tspan>            Print help</tspan>
+</tspan>
+    <tspan x="10px" y="154px">
+</tspan>
+    <tspan x="10px" y="172px"><tspan class="fg-bright-green bold">Exit status:</tspan>
+</tspan>
+    <tspan x="10px" y="190px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">0</tspan><tspan>   Everything is up to date.</tspan>
+</tspan>
+    <tspan x="10px" y="208px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">100</tspan><tspan> At least one update is available.</tspan>
+</tspan>
+    <tspan x="10px" y="226px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">1</tspan><tspan>   An error occurred.</tspan>
+</tspan>
+    <tspan x="10px" y="244px">
+</tspan>
+  </text>
+
+</svg>

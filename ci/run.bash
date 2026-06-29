@@ -8,12 +8,12 @@ rustc -vV
 cargo -vV
 
 if [ -n "$INSTALL_BINDGEN" ]; then
-  if ! curl --proto '=https' --tlsv1.2 -LsSf https://github.com/rust-lang/rust-bindgen/releases/latest/download/bindgen-cli-installer.sh | sh -s -- --no-modify-path \
-    | grep "everything's installed!";
-    # Ignoring exit code since the script might fail to write the receipt after a successful installation.
-  then
-    cargo install --force --locked bindgen-cli
-  fi
+  # Install `cargo-binstall` first for faster installation.
+  curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash
+  # An explicit `--target` is required to ensure that `bindgen-cli` is built for the
+  # same target as the rest of the toolchain.
+  # See: <https://github.com/rust-lang/rustup/issues/4396>
+  cargo binstall -y --force --locked bindgen-cli "--target=$(rustc --print host-tuple)"
   mkdir "$CARGO_HOME"/bin/bindgen-cli
   mv "$CARGO_HOME"/bin/bindgen "$CARGO_HOME"/bin/bindgen-cli/
   export PATH="$CARGO_HOME/bin/bindgen-cli:$PATH"
@@ -33,6 +33,7 @@ case "$TARGET" in
   loongarch* ) ;;
   *netbsd* ) ;;
   *illumos* ) ;;
+  *solaris* ) ;;
   # default case, build with rustls enabled
   * ) FEATURES+=('--features' 'reqwest-rustls-tls') ;;
 esac

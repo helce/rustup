@@ -3,12 +3,12 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use tracing::debug;
 
 use crate::{
     config::Cfg,
-    dist::{self, DistOptions, Notification, prefix::InstallPrefix},
+    dist::{DistOptions, prefix::InstallPrefix},
     errors::RustupError,
-    notifications::Notification as RootNotification,
     toolchain::{CustomToolchainName, LocalToolchainName, Toolchain},
     utils,
 };
@@ -20,47 +20,50 @@ pub(crate) enum UpdateStatus {
     Unchanged,
 }
 
-#[derive(Clone)]
-pub(crate) enum InstallMethod<'a> {
+pub(crate) enum InstallMethod<'cfg, 'a> {
     Copy {
         src: &'a Path,
         dest: &'a CustomToolchainName,
-        cfg: &'a Cfg<'a>,
+        cfg: &'cfg Cfg<'cfg>,
     },
     Link {
         src: &'a Path,
         dest: &'a CustomToolchainName,
-        cfg: &'a Cfg<'a>,
+        cfg: &'cfg Cfg<'cfg>,
     },
-    Dist(DistOptions<'a>),
+    Dist(DistOptions<'cfg, 'a>),
 }
 
-impl InstallMethod<'_> {
+impl InstallMethod<'_, '_> {
     // Install a toolchain
     #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
-    pub(crate) async fn install(&self) -> Result<UpdateStatus> {
-        let nh = &self.cfg().notify_handler;
-        match self {
+    pub(crate) async fn install(self) -> Result<UpdateStatus> {
+        // Initialize rayon for use by the remove_dir_all crate limiting the number of threads.
+        // This will error if rayon is already initialized but it's fine to ignore that.
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(self.cfg().process.io_thread_count()?.into())
+            .build_global();
+        match &self {
             InstallMethod::Copy { .. }
             | InstallMethod::Link { .. }
             | InstallMethod::Dist(DistOptions {
                 old_date_version: None,
                 ..
-            }) => nh(RootNotification::InstallingToolchain(&self.dest_basename())),
-            _ => nh(RootNotification::UpdatingToolchain(&self.dest_basename())),
+            }) => debug!("installing toolchain {}", self.dest_basename()),
+            _ => debug!("updating existing install for '{}'", self.dest_basename()),
         }
 
-        nh(RootNotification::ToolchainDirectory(&self.dest_path()));
-        let updated = self.run(&self.dest_path(), &|n| nh(n.into())).await?;
+        debug!("toolchain directory: {}", self.dest_path().display());
+        let updated = self.run(&self.dest_path()).await?;
 
         let status = match updated {
             false => {
-                nh(RootNotification::UpdateHashMatches);
+                debug!("toolchain is already up to date");
                 UpdateStatus::Unchanged
             }
             true => {
-                nh(RootNotification::InstalledToolchain(&self.dest_basename()));
-                match self {
+                debug!("toolchain {} installed", self.dest_basename());
+                match &self {
                     InstallMethod::Dist(DistOptions {
                         old_date_version: Some((_, v)),
                         ..
@@ -79,35 +82,32 @@ impl InstallMethod<'_> {
         }
     }
 
-    async fn run(&self, path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<bool> {
+    async fn run(&self, path: &Path) -> Result<bool> {
         if path.exists() {
             // Don't uninstall first for Dist method
             match self {
                 InstallMethod::Dist { .. } => {}
                 _ => {
-                    uninstall(path, notify_handler)?;
+                    uninstall(path)?;
                 }
             }
         }
 
         match self {
             InstallMethod::Copy { src, .. } => {
-                utils::copy_dir(src, path, notify_handler)?;
+                utils::copy_dir(src, path)?;
                 Ok(true)
             }
             InstallMethod::Link { src, .. } => {
-                utils::symlink_dir(src, path, notify_handler)?;
+                utils::symlink_dir(src, path)?;
                 Ok(true)
             }
             InstallMethod::Dist(opts) => {
                 let prefix = &InstallPrefix::from(path.to_owned());
-                let maybe_new_hash = dist::update_from_dist(prefix, opts).await?;
+                let maybe_new_hash = opts.install_into(prefix).await?;
 
                 if let Some(hash) = maybe_new_hash {
-                    if let Some(hash_file) = opts.update_hash {
-                        utils::write_file("update hash", hash_file, &hash)?;
-                    }
-
+                    utils::write_file("update hash", &opts.update_hash, &hash)?;
                     Ok(true)
                 } else {
                     Ok(false)
@@ -151,6 +151,6 @@ impl InstallMethod<'_> {
     }
 }
 
-pub(crate) fn uninstall(path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> Result<()> {
-    utils::remove_dir("install", path, notify_handler)
+pub(crate) fn uninstall(path: &Path) -> Result<()> {
+    utils::remove_dir("install", path)
 }

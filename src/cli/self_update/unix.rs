@@ -7,7 +7,7 @@ use tracing::{error, warn};
 use super::install_bins;
 use super::shell::{self, Posix, UnixShell};
 use crate::process::Process;
-use crate::utils::{self, Notification};
+use crate::utils;
 
 // If the user is trying to install with sudo, on some systems this will
 // result in writing root-owned files to the user's home directory, because
@@ -49,7 +49,7 @@ pub(crate) fn do_anti_sudo_check(no_prompt: bool, process: &Process) -> Result<u
 
 pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
     let cargo_home = process.cargo_home()?;
-    utils::remove_dir("cargo_home", &cargo_home, &|_: Notification<'_>| ())
+    utils::remove_dir("cargo_home", &cargo_home)
 }
 
 pub(crate) fn do_remove_from_path(process: &Process) -> Result<()> {
@@ -97,7 +97,7 @@ pub(crate) fn do_add_to_path(process: &Process) -> Result<()> {
                     rc.display()
                 )
             })?;
-            utils::ensure_dir_exists("rcfile dir", rc_dir, &|_: Notification<'_>| ())?;
+            utils::ensure_dir_exists("rcfile dir", rc_dir)?;
             utils::append_file("rcfile", &rc, cmd_to_write)
                 .with_context(|| format!("could not amend shell profile: '{}'", rc.display()))?;
         }

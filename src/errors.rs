@@ -2,11 +2,11 @@
 
 use std::ffi::OsString;
 use std::fmt::Debug;
-#[cfg(not(windows))]
 use std::io;
 use std::io::Write;
 use std::path::PathBuf;
 
+use platforms::Platform;
 use thiserror::Error as ThisError;
 use url::Url;
 
@@ -27,6 +27,8 @@ pub struct OperationError(pub anyhow::Error);
 pub enum RustupError {
     #[error("partially downloaded file may have been damaged and was removed, please try again")]
     BrokenPartialFile,
+    #[error("partially downloaded file was kept for resumption, please try again")]
+    IncompletePartialFile,
     #[error("component download failed for {0}")]
     ComponentDownloadFailed(String),
     #[error("failure removing component '{name}', directory does not exist: '{}'", .path.display())]
@@ -76,6 +78,13 @@ pub enum RustupError {
     RemovingDirectory { name: &'static str, path: PathBuf },
     #[error("could not remove '{name}' file: '{}'", .path.display())]
     RemovingFile { name: &'static str, path: PathBuf },
+    #[error("could not rename '{name}' file from '{src}' to '{dest}': {source}")]
+    RenamingFile {
+        name: &'static str,
+        src: PathBuf,
+        dest: PathBuf,
+        source: io::Error,
+    },
     #[error("{}", component_unavailable_msg(.components, .manifest, .toolchain))]
     RequestedComponentsUnavailable {
         components: Vec<Component>,
@@ -125,6 +134,15 @@ pub enum RustupError {
         component: String,
         suggestion: Option<String>,
     },
+    #[error(
+        "toolchain '{desc}' has no prebuilt artifacts available for target '{platform}'\n\
+        note: this may happen to a low-tier target as per https://doc.rust-lang.org/nightly/rustc/platform-support.html\n\
+        note: you can find instructions on that page to build the target support from source"
+    )]
+    UnavailableTarget {
+        desc: ToolchainDesc,
+        platform: &'static Platform,
+    },
     #[error("toolchain '{}' does not support target '{}'{}\n\
     note: you can see a list of supported targets with `rustc --print=target-list`\n\
     note: if you are adding support for a new target to rustc itself, see https://rustc-dev-guide.rust-lang.org/building/new-target.html", .desc, .target,
@@ -141,6 +159,12 @@ pub enum RustupError {
         target: TargetTriple,
         suggestion: Option<String>,
     },
+    #[error(
+        "rustup executable proxies don't seem to work\n\
+        help: this might be a bug in rustup, please open a new issue here:\n\
+        help: https://github.com/rust-lang/rustup/issues/new"
+    )]
+    BrokenProxy,
     #[error("unknown metadata version: '{0}'")]
     UnknownMetadataVersion(String),
     #[error("manifest version '{0}' is not supported")]
@@ -148,16 +172,19 @@ pub enum RustupError {
     #[error("could not write {name} file: '{}'", .path.display())]
     WritingFile { name: &'static str, path: PathBuf },
     #[error("I/O Error")]
-    IOError(#[from] std::io::Error),
+    IOError(#[from] io::Error),
 }
 
 fn suggest_message(suggestion: &Option<String>) -> String {
     if let Some(suggestion) = suggestion {
-        format!("; did you mean '{}'?", suggestion)
+        format!("; did you mean '{suggestion}'?")
     } else {
         String::new()
     }
 }
+
+pub(crate) const NIGHTLY_COMPONENT_NOTE: &str =
+    "note: sometimes not all components are available in any given nightly";
 
 /// Returns a error message indicating that certain [`Component`]s are unavailable.
 ///
@@ -176,15 +203,12 @@ fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &
             let _ = writeln!(
                 buf,
                 "component {} is unavailable for download for channel '{}'",
-                c.description(manifest),
+                manifest.description(c),
                 toolchain,
             );
 
             if toolchain.starts_with("nightly") {
-                let _ = write!(
-                    buf,
-                    "Sometimes not all components are available in any given nightly. "
-                );
+                let _ = write!(buf, "{NIGHTLY_COMPONENT_NOTE}");
             }
         }
         cs => {
@@ -195,26 +219,23 @@ fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &
 
             let cs_str = if same_target {
                 cs.iter()
-                    .map(|c| format!("'{}'", c.short_name(manifest)))
+                    .map(|c| format!("'{}'", manifest.short_name(c)))
                     .collect::<Vec<_>>()
                     .join(", ")
             } else {
                 cs.iter()
-                    .map(|c| c.description(manifest))
+                    .map(|c| manifest.description(c))
                     .collect::<Vec<_>>()
                     .join(", ")
             };
 
-            let _ = write!(
+            let _ = writeln!(
                 buf,
-                "some components are unavailable for download for channel '{toolchain}': {cs_str}"
+                "some components are unavailable for download for channel '{toolchain}': {cs_str}",
             );
 
             if toolchain.starts_with("nightly") {
-                let _ = write!(
-                    buf,
-                    "Sometimes not all components are available in any given nightly. "
-                );
+                let _ = write!(buf, "{NIGHTLY_COMPONENT_NOTE}");
             }
         }
     }

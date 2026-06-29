@@ -24,7 +24,8 @@ fn test_incremental_file(io_threads: &str) -> Result<()> {
 
     let mut written = 0;
     let mut file_finished = false;
-    let mut io_executor: Box<dyn Executor> = get_executor(None, 32 * 1024 * 1024, &tp.process)?;
+    let mut io_executor: Box<dyn Executor> =
+        get_executor(32 * 1024 * 1024, tp.process.io_thread_count()?);
     let (item, mut sender) = Item::write_file_segmented(
         work_dir.path().join("scratch"),
         0o666,
@@ -90,7 +91,8 @@ fn test_complete_file(io_threads: &str) -> Result<()> {
     vars.insert("RUSTUP_IO_THREADS".to_string(), io_threads.to_string());
     let tp = TestProcess::with_vars(vars);
 
-    let mut io_executor: Box<dyn Executor> = get_executor(None, 32 * 1024 * 1024, &tp.process)?;
+    let mut io_executor: Box<dyn Executor> =
+        get_executor(32 * 1024 * 1024, tp.process.io_thread_count()?);
     let mut chunk = io_executor.get_buffer(10);
     chunk.extend(b"0123456789");
     assert_eq!(chunk.len(), 10);
@@ -160,4 +162,47 @@ fn test_complete_file_immediate() {
 #[test]
 fn test_complete_file_threaded() {
     test_complete_file("2").unwrap()
+}
+
+#[test]
+fn test_effective_thread_count() {
+    use super::{LOW_MEMORY_THRESHOLD, effective_thread_count};
+    use crate::process::IoThreadCount::{Default, UserSpecified};
+
+    // Already single-threaded: no change regardless of budget
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 16, Default(1)),
+        1
+    );
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 16, Default(0)),
+        0
+    );
+
+    // Below threshold: forced to single-threaded
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 2, Default(8)),
+        1
+    );
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 2, Default(4)),
+        1
+    );
+
+    // At or above threshold: thread count unchanged
+    assert_eq!(effective_thread_count(LOW_MEMORY_THRESHOLD, Default(4)), 4);
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD * 2, Default(8)),
+        8
+    );
+
+    // User-specified threads are always respected
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 16, UserSpecified(4)),
+        4
+    );
+    assert_eq!(
+        effective_thread_count(LOW_MEMORY_THRESHOLD / 2, UserSpecified(8)),
+        8
+    );
 }

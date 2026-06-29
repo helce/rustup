@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Result, format_err};
 use clap::Parser;
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
@@ -10,6 +10,7 @@ use crate::{
         common::{self, update_console_filter},
         self_update::{self, InstallOpts},
     },
+    config::Cfg,
     dist::Profile,
     process::Process,
     toolchain::MaybeOfficialToolchainName,
@@ -23,6 +24,7 @@ use crate::{
     bin_name = "rustup-init[EXE]",
     version = common::version(),
     before_help = format!("rustup-init {}", common::version()),
+    styles = clap_cargo::style::CLAP_STYLING
 )]
 struct RustupInit {
     /// Set log level to 'DEBUG' if 'RUSTUP_LOG' is unset
@@ -97,10 +99,11 @@ pub async fn main(
     } = match RustupInit::try_parse() {
         Ok(args) => args,
         Err(e) if [ErrorKind::DisplayHelp, ErrorKind::DisplayVersion].contains(&e.kind()) => {
-            write!(process.stdout().lock(), "{e}")?;
-            return Ok(utils::ExitCode(0));
+            use std::io::Write as _;
+            write!(process.stdout().lock(), "{}", e.render().ansi())?;
+            return Ok(utils::ExitCode::SUCCESS);
         }
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(format_err!("{}", e.render().ansi())),
     };
 
     if self_replace {
@@ -127,5 +130,6 @@ pub async fn main(
         targets: &target.iter().map(|s| &**s).collect::<Vec<_>>(),
     };
 
-    self_update::install(current_dir, no_prompt, quiet, opts, process).await
+    let mut cfg = Cfg::from_env(current_dir, quiet, process)?;
+    self_update::install(no_prompt, opts, &mut cfg).await
 }

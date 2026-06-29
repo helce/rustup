@@ -1,26 +1,22 @@
 use std::fmt::{self, Debug, Display};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::{env, io};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use thiserror::Error as ThisError;
-use tokio_stream::StreamExt;
-use tracing::trace;
+use tracing::{debug, info, trace, warn};
 
-use crate::dist::AutoInstallMode;
 use crate::{
     cli::{common, self_update::SelfUpdateMode},
     dist::{
-        self, PartialToolchainDesc, Profile, TargetTriple, ToolchainDesc, download::DownloadCfg,
-        temp,
+        self, AutoInstallMode, DistOptions, PartialToolchainDesc, Profile, TargetTriple,
+        ToolchainDesc,
     },
     errors::RustupError,
     fallback_settings::FallbackSettings,
-    install::UpdateStatus,
-    notifications::*,
+    install::{InstallMethod, UpdateStatus},
     process::Process,
     settings::{MetadataVersion, Settings, SettingsFile},
     toolchain::{
@@ -92,25 +88,39 @@ impl<T: Into<String>> From<T> for OverrideFile {
     }
 }
 
-// Represents the reason why the active toolchain is active.
-#[derive(Debug)]
-pub(crate) enum ActiveReason {
+// Represents the source that determined the current active toolchain.
+#[derive(Clone, Debug)]
+pub(crate) enum ActiveSource {
     Default,
     Environment,
     CommandLine,
-    OverrideDB(PathBuf),
+    OverrideDb(PathBuf),
     ToolchainFile(PathBuf),
 }
 
-impl Display for ActiveReason {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::result::Result<(), fmt::Error> {
+impl ActiveSource {
+    pub fn to_reason(&self) -> String {
         match self {
-            Self::Default => write!(f, "it's the default toolchain"),
-            Self::Environment => write!(f, "overridden by environment variable RUSTUP_TOOLCHAIN"),
-            Self::CommandLine => write!(f, "overridden by +toolchain on the command line"),
-            Self::OverrideDB(path) => write!(f, "directory override for '{}'", path.display()),
-            Self::ToolchainFile(path) => write!(f, "overridden by '{}'", path.display()),
+            Self::Default => String::from("it's the default toolchain"),
+            Self::Environment => {
+                String::from("overridden by environment variable RUSTUP_TOOLCHAIN")
+            }
+            Self::CommandLine => String::from("overridden by +toolchain on the command line"),
+            Self::OverrideDb(path) => format!("directory override for '{}'", path.display()),
+            Self::ToolchainFile(path) => format!("overridden by '{}'", path.display()),
         }
+    }
+}
+
+impl Display for ActiveSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Default => "default",
+            Self::Environment => "env",
+            Self::CommandLine => "cli",
+            Self::OverrideDb(_) => "path-override",
+            Self::ToolchainFile(_) => "toolchain-file",
+        })
     }
 }
 
@@ -190,7 +200,7 @@ impl OverrideCfg {
         match self {
             Self::PathBased(path_based_name) => path_based_name.into(),
             Self::Custom(custom_name) => custom_name.into(),
-            Self::Official { ref toolchain, .. } => toolchain.into(),
+            Self::Official { toolchain, .. } => (&toolchain).into(),
         }
     }
 }
@@ -222,18 +232,18 @@ impl From<LocalToolchainName> for OverrideCfg {
 pub(crate) const UNIX_FALLBACK_SETTINGS: &str = "/etc/rustup/settings.toml";
 
 pub(crate) struct Cfg<'a> {
-    profile_override: Option<Profile>,
+    pub profile_override: Option<Profile>,
     pub rustup_dir: PathBuf,
     pub settings_file: SettingsFile,
-    pub fallback_settings: Option<FallbackSettings>,
+    fallback_settings: Option<FallbackSettings>,
     pub toolchains_dir: PathBuf,
-    pub update_hash_dir: PathBuf,
+    update_hash_dir: PathBuf,
     pub download_dir: PathBuf,
-    pub tmp_cx: temp::Context,
     pub toolchain_override: Option<ResolvableToolchainName>,
-    pub env_override: Option<LocalToolchainName>,
+    env_override: Option<LocalToolchainName>,
+    pub(crate) dist_root_server: String,
     pub dist_root_url: String,
-    pub notify_handler: Arc<dyn Fn(Notification<'_>)>,
+    pub quiet: bool,
     pub current_dir: PathBuf,
     pub process: &'a Process,
 }
@@ -241,17 +251,17 @@ pub(crate) struct Cfg<'a> {
 impl<'a> Cfg<'a> {
     pub(crate) fn from_env(
         current_dir: PathBuf,
-        notify_handler: Arc<dyn Fn(Notification<'_>)>,
+        quiet: bool,
         process: &'a Process,
     ) -> Result<Self> {
         // Set up the rustup home directory
         let rustup_dir = process.rustup_home()?;
 
-        utils::ensure_dir_exists("home", &rustup_dir, notify_handler.as_ref())?;
+        utils::ensure_dir_exists("home", &rustup_dir)?;
 
         let settings_file = SettingsFile::new(rustup_dir.join("settings.toml"));
         settings_file.with(|s| {
-            (notify_handler)(Notification::ReadMetadataVersion(s.version));
+            debug!("read metadata version: {}", s.version);
             if s.version == MetadataVersion::default() {
                 Ok(())
             } else {
@@ -282,21 +292,15 @@ impl<'a> Cfg<'a> {
         let default_host_triple =
             settings_file.with(|s| Ok(get_default_host_triple(s, process)))?;
         // Environment override
-        let env_override = non_empty_env_var("RUSTUP_TOOLCHAIN", process)?
-            .map(ResolvableLocalToolchainName::try_from)
-            .transpose()?
-            .map(|t| t.resolve(&default_host_triple))
-            .transpose()?;
+        let env_override = match process.var_opt("RUSTUP_TOOLCHAIN")? {
+            Some(tc) => {
+                Some(ResolvableLocalToolchainName::try_from(&tc)?.resolve(&default_host_triple)?)
+            }
+            None => None,
+        };
 
         let dist_root_server = dist_root_server(process)?;
-
-        let notify_clone = notify_handler.clone();
-        let tmp_cx = temp::Context::new(
-            rustup_dir.join("tmp"),
-            dist_root_server.as_str(),
-            Box::new(move |n| (notify_clone)(n.into())),
-        );
-        let dist_root = dist_root_server + "/dist";
+        let dist_root = dist_root_server.clone() + "/dist";
 
         let cfg = Self {
             profile_override: None,
@@ -306,11 +310,11 @@ impl<'a> Cfg<'a> {
             toolchains_dir,
             update_hash_dir,
             download_dir,
-            tmp_cx,
-            notify_handler,
             toolchain_override: None,
             env_override,
+            dist_root_server,
             dist_root_url: dist_root,
+            quiet,
             current_dir,
             process,
         };
@@ -326,30 +330,17 @@ impl<'a> Cfg<'a> {
         Ok(cfg)
     }
 
-    /// construct a download configuration
-    pub(crate) fn download_cfg(
-        &'a self,
-        notify_handler: &'a dyn Fn(crate::dist::Notification<'_>),
-    ) -> DownloadCfg<'a> {
-        DownloadCfg {
-            dist_root: &self.dist_root_url,
-            tmp_cx: &self.tmp_cx,
-            download_dir: &self.download_dir,
-            notify_handler,
-            process: self.process,
-        }
-    }
-
-    pub(crate) fn set_profile_override(&mut self, profile: Profile) {
-        self.profile_override = Some(profile);
-    }
-
     pub(crate) fn set_default(&self, toolchain: Option<&ToolchainName>) -> Result<()> {
         self.settings_file.with_mut(|s| {
             s.default_toolchain = toolchain.map(|t| t.to_string());
             Ok(())
         })?;
-        (self.notify_handler)(Notification::SetDefaultToolchain(toolchain));
+
+        match toolchain {
+            Some(t) => info!("default toolchain set to {t}"),
+            None => info!("default toolchain unset"),
+        }
+
         Ok(())
     }
 
@@ -359,7 +350,7 @@ impl<'a> Cfg<'a> {
             s.profile = Some(profile);
             Ok(())
         })?;
-        (self.notify_handler)(Notification::SetProfile(profile.as_str()));
+        info!("profile set to {}", profile.as_str());
         Ok(())
     }
 
@@ -368,12 +359,8 @@ impl<'a> Cfg<'a> {
             s.auto_self_update = Some(mode);
             Ok(())
         })?;
-        (self.notify_handler)(Notification::SetSelfUpdate(mode.as_str()));
+        info!("auto-self-update mode set to {}", mode.as_str());
         Ok(())
-    }
-
-    pub(crate) fn set_toolchain_override(&mut self, toolchain_override: &ResolvableToolchainName) {
-        self.toolchain_override = Some(toolchain_override.to_owned());
     }
 
     pub(crate) fn set_auto_install(&mut self, mode: AutoInstallMode) -> Result<()> {
@@ -381,7 +368,7 @@ impl<'a> Cfg<'a> {
             s.auto_install = Some(mode);
             Ok(())
         })?;
-        (self.notify_handler)(Notification::SetAutoInstall(mode.as_str()));
+        info!("setting auto install mode to {}", mode.as_str());
         Ok(())
     }
 
@@ -409,25 +396,8 @@ impl<'a> Cfg<'a> {
             .with(|s| Ok(s.profile.unwrap_or_default()))
     }
 
-    pub(crate) fn get_self_update_mode(&self) -> Result<SelfUpdateMode> {
-        if self.process.var("CI").is_ok() && self.process.var("RUSTUP_CI").is_err() {
-            // If we're in CI (but not rustup's own CI, which wants to test this stuff!),
-            // disable automatic self updates.
-            return Ok(SelfUpdateMode::Disable);
-        }
-
-        self.settings_file.with(|s| {
-            Ok(match s.auto_self_update {
-                Some(mode) => mode,
-                None => SelfUpdateMode::Enable,
-            })
-        })
-    }
-
     pub(crate) fn ensure_toolchains_dir(&self) -> Result<(), anyhow::Error> {
-        utils::ensure_dir_exists("toolchains", &self.toolchains_dir, &|n| {
-            (self.notify_handler)(n)
-        })?;
+        utils::ensure_dir_exists("toolchains", &self.toolchains_dir)?;
         Ok(())
     }
 
@@ -435,7 +405,7 @@ impl<'a> Cfg<'a> {
         &self,
         desc: &ToolchainDesc,
         path: &'b Path,
-    ) -> anyhow::Result<Vec<InstalledPath<'b>>> {
+    ) -> Result<Vec<InstalledPath<'b>>> {
         Ok(vec![
             InstalledPath::File {
                 name: "update hash",
@@ -451,11 +421,7 @@ impl<'a> Cfg<'a> {
         create_parent: bool,
     ) -> Result<PathBuf> {
         if create_parent {
-            utils::ensure_dir_exists(
-                "update-hash",
-                &self.update_hash_dir,
-                self.notify_handler.as_ref(),
-            )?;
+            utils::ensure_dir_exists("update-hash", &self.update_hash_dir)?;
         }
 
         Ok(self.update_hash_dir.join(toolchain.to_string()))
@@ -465,24 +431,25 @@ impl<'a> Cfg<'a> {
     pub(crate) fn upgrade_data(&self) -> Result<()> {
         let current_version = self.settings_file.with(|s| Ok(s.version))?;
         if current_version == MetadataVersion::default() {
-            (self.notify_handler)(Notification::MetadataUpgradeNotNeeded(current_version));
+            info!("nothing to upgrade: metadata version is already '{current_version}'");
             return Ok(());
         }
 
-        (self.notify_handler)(Notification::UpgradingMetadata(
-            current_version,
-            MetadataVersion::default(),
-        ));
-
+        info!(
+            "upgrading metadata version from {current_version} to {}",
+            MetadataVersion::default()
+        );
         match current_version {
             MetadataVersion::V2 => {
                 // The toolchain installation format changed. Just delete them all.
-                (self.notify_handler)(Notification::UpgradeRemovesToolchains);
+                warn!(
+                    "this upgrade will remove all existing toolchains; you will need to reinstall them"
+                );
 
                 let dirs = utils::read_dir("toolchains", &self.toolchains_dir)?;
                 for dir in dirs {
                     let dir = dir.context("IO Error reading toolchains")?;
-                    utils::remove_dir("toolchain", &dir.path(), self.notify_handler.as_ref())?;
+                    utils::remove_dir("toolchain", &dir.path())?;
                 }
 
                 // Also delete the update hashes
@@ -510,13 +477,16 @@ impl<'a> Cfg<'a> {
 
     pub(crate) async fn toolchain_from_partial(
         &self,
-        toolchain: Option<PartialToolchainDesc>,
-    ) -> anyhow::Result<Toolchain<'_>> {
+        toolchain: Option<(PartialToolchainDesc, ActiveSource)>,
+    ) -> Result<(Toolchain<'_>, ActiveSource)> {
         let toolchain = toolchain
-            .map(|desc| {
-                anyhow::Ok(LocalToolchainName::Named(ToolchainName::Official(
-                    desc.resolve(&self.get_default_host_triple()?)?,
-                )))
+            .map(|(desc, source)| {
+                anyhow::Ok((
+                    LocalToolchainName::Named(ToolchainName::Official(
+                        desc.resolve(&self.get_default_host_triple()?)?,
+                    )),
+                    source,
+                ))
             })
             .transpose()?;
         self.local_toolchain(toolchain).await
@@ -525,7 +495,7 @@ impl<'a> Cfg<'a> {
     pub(crate) async fn maybe_ensure_active_toolchain(
         &self,
         force_ensure: Option<bool>,
-    ) -> Result<Option<(LocalToolchainName, ActiveReason)>> {
+    ) -> Result<Option<(LocalToolchainName, ActiveSource)>> {
         let should_ensure = if let Some(force) = force_ensure {
             force
         } else {
@@ -544,39 +514,39 @@ impl<'a> Cfg<'a> {
         }
     }
 
-    pub(crate) fn active_toolchain(&self) -> Result<Option<(LocalToolchainName, ActiveReason)>> {
+    pub(crate) fn active_toolchain(&self) -> Result<Option<(LocalToolchainName, ActiveSource)>> {
         Ok(
-            if let Some((override_config, reason)) = self.find_override_config()? {
-                Some((override_config.into_local_toolchain_name(), reason))
+            if let Some((override_config, source)) = self.find_override_config()? {
+                Some((override_config.into_local_toolchain_name(), source))
             } else {
                 self.get_default()?
-                    .map(|x| (x.into(), ActiveReason::Default))
+                    .map(|x| (x.into(), ActiveSource::Default))
             },
         )
     }
 
-    fn find_override_config(&self) -> Result<Option<(OverrideCfg, ActiveReason)>> {
-        let override_config: Option<(OverrideCfg, ActiveReason)> =
+    fn find_override_config(&self) -> Result<Option<(OverrideCfg, ActiveSource)>> {
+        let override_config: Option<(OverrideCfg, ActiveSource)> =
             // First check +toolchain override from the command line
-            if let Some(ref name) = self.toolchain_override {
+            if let Some(name) = &self.toolchain_override {
                 let override_config = name.resolve(&self.get_default_host_triple()?)?.into();
-                Some((override_config, ActiveReason::CommandLine))
+                Some((override_config, ActiveSource::CommandLine))
             }
             // Then check the RUSTUP_TOOLCHAIN environment variable
-            else if let Some(ref name) = self.env_override {
+            else if let Some(name) = &self.env_override {
                 // Because path based toolchain files exist, this has to support
                 // custom, distributable, and absolute path toolchains otherwise
                 // rustup's export of a RUSTUP_TOOLCHAIN when running a process will
                 // error when a nested rustup invocation occurs
-                Some((name.clone().into(), ActiveReason::Environment))
+                Some((name.clone().into(), ActiveSource::Environment))
             }
             // Then walk up the directory tree from 'path' looking for either the
             // directory in the override database, or a `rust-toolchain{.toml}` file,
             // in that order.
-            else if let Some((override_cfg, active_reason)) = self.settings_file.with(|s| {
+            else if let Some((override_cfg, active_source)) = self.settings_file.with(|s| {
                     self.find_override_from_dir_walk(&self.current_dir, s)
                 })? {
-                Some((override_cfg, active_reason))
+                Some((override_cfg, active_source))
             }
             // Otherwise, there is no override.
             else {
@@ -590,14 +560,13 @@ impl<'a> Cfg<'a> {
         &self,
         dir: &Path,
         settings: &Settings,
-    ) -> Result<Option<(OverrideCfg, ActiveReason)>> {
-        let notify = self.notify_handler.as_ref();
+    ) -> Result<Option<(OverrideCfg, ActiveSource)>> {
         let mut dir = Some(dir);
 
         while let Some(d) = dir {
             // First check the override database
-            if let Some(name) = settings.dir_override(d, notify) {
-                let reason = ActiveReason::OverrideDB(d.to_owned());
+            if let Some(name) = settings.dir_override(d) {
+                let source = ActiveSource::OverrideDb(d.to_owned());
                 // Note that `rustup override set` fully resolves it's input
                 // before writing to settings.toml, so resolving here may not
                 // be strictly necessary (could instead model as ToolchainName).
@@ -607,7 +576,7 @@ impl<'a> Cfg<'a> {
                 let toolchain_name = ResolvableToolchainName::try_from(name)?
                     .resolve(&get_default_host_triple(settings, self.process))?;
                 let override_cfg = toolchain_name.into();
-                return Ok(Some((override_cfg, reason)));
+                return Ok(Some((override_cfg, source)));
             }
 
             // Then look for 'rust-toolchain' or 'rust-toolchain.toml'
@@ -629,10 +598,17 @@ impl<'a> Cfg<'a> {
                 (Ok(contents), Ok(_)) => {
                     // both `rust-toolchain` and `rust-toolchain.toml` exist
 
-                    notify(Notification::DuplicateToolchainFile {
-                        rust_toolchain: &path_rust_toolchain,
-                        rust_toolchain_toml: &path_rust_toolchain_toml,
-                    });
+                    warn!(
+                        "both {} and {} exist; using contents of {0}",
+                        path_rust_toolchain
+                            .canonicalize()
+                            .unwrap_or_else(|_| PathBuf::from(&path_rust_toolchain))
+                            .display(),
+                        path_rust_toolchain_toml
+                            .canonicalize()
+                            .unwrap_or_else(|_| PathBuf::from(&path_rust_toolchain_toml))
+                            .display(),
+                    );
 
                     (path_rust_toolchain, Ok(contents), ParseMode::Both)
                 }
@@ -659,17 +635,15 @@ impl<'a> Cfg<'a> {
                     let default_host_triple = get_default_host_triple(settings, self.process);
                     // Do not permit architecture/os selection in channels as
                     // these are host specific and toolchain files are portable.
-                    if let ResolvableToolchainName::Official(ref name) = toolchain_name {
-                        if name.has_triple() {
-                            // Permit fully qualified names IFF the toolchain is installed. TODO(robertc): consider
-                            // disabling this and backing out https://github.com/rust-lang/rustup/pull/2141 (but provide
-                            // the base name in the error to help users)
-                            let resolved_name = &ToolchainName::try_from(toolchain_name_str)?;
-                            if !self.list_toolchains()?.iter().any(|s| s == resolved_name) {
-                                return Err(anyhow!(format!(
-                                    "target triple in channel name '{name}'"
-                                )));
-                            }
+                    if let ResolvableToolchainName::Official(name) = &toolchain_name
+                        && name.has_triple()
+                    {
+                        // Permit fully qualified names IFF the toolchain is installed. TODO(robertc): consider
+                        // disabling this and backing out https://github.com/rust-lang/rustup/pull/2141 (but provide
+                        // the base name in the error to help users)
+                        let resolved_name = &ToolchainName::try_from(toolchain_name_str)?;
+                        if !self.list_toolchains()?.iter().any(|s| s == resolved_name) {
+                            return Err(anyhow!(format!("target tuple in channel name '{name}'")));
                         }
                     }
 
@@ -686,9 +660,9 @@ impl<'a> Cfg<'a> {
                     }
                 }
 
-                let reason = ActiveReason::ToolchainFile(toolchain_file);
+                let source = ActiveSource::ToolchainFile(toolchain_file);
                 let override_cfg = OverrideCfg::from_file(self, override_file)?;
-                return Ok(Some((override_cfg, reason)));
+                return Ok(Some((override_cfg, source)));
             }
 
             dir = d.parent();
@@ -727,52 +701,24 @@ impl<'a> Cfg<'a> {
         }
     }
 
-    #[tracing::instrument(level = "trace")]
-    pub(crate) async fn active_rustc_version(&mut self) -> Result<Option<String>> {
-        if let Some(t) = self.process.args().find(|x| x.starts_with('+')) {
-            trace!("Fetching rustc version from toolchain `{}`", t);
-            self.set_toolchain_override(&ResolvableToolchainName::try_from(&t[1..])?);
-        }
-
-        let Some((name, _)) = self.maybe_ensure_active_toolchain(None).await? else {
-            return Ok(None);
-        };
-        Ok(Some(Toolchain::new(self, name)?.rustc_version()))
-    }
-
-    pub(crate) async fn resolve_toolchain(
+    pub(crate) async fn local_toolchain(
         &self,
-        name: Option<ResolvableToolchainName>,
-    ) -> Result<Toolchain<'_>> {
-        let toolchain = name
-            .map(|name| anyhow::Ok(name.resolve(&self.get_default_host_triple()?)?.into()))
-            .transpose()?;
-        self.local_toolchain(toolchain).await
-    }
-
-    pub(crate) async fn resolve_local_toolchain(
-        &self,
-        name: Option<ResolvableLocalToolchainName>,
-    ) -> Result<Toolchain<'_>> {
-        let local = name
-            .map(|name| name.resolve(&self.get_default_host_triple()?))
-            .transpose()?;
-        self.local_toolchain(local).await
-    }
-
-    async fn local_toolchain(&self, name: Option<LocalToolchainName>) -> Result<Toolchain<'_>> {
+        name: Option<(LocalToolchainName, ActiveSource)>,
+    ) -> Result<(Toolchain<'_>, ActiveSource)> {
         match name {
-            Some(tc) => {
+            Some((tc, source)) => {
                 let install_if_missing = self.should_auto_install()?;
-                Toolchain::from_local(tc, install_if_missing, self).await
+                Ok((
+                    Toolchain::from_local(tc, install_if_missing, self).await?,
+                    source,
+                ))
             }
             None => {
-                let tc = self
+                let (tc, source) = self
                     .maybe_ensure_active_toolchain(None)
                     .await?
-                    .ok_or_else(|| no_toolchain_error(self.process))?
-                    .0;
-                Ok(Toolchain::new(self, tc)?)
+                    .ok_or_else(|| no_toolchain_error(self.process))?;
+                Ok((Toolchain::new(self, tc)?, source))
             }
         }
     }
@@ -782,8 +728,8 @@ impl<'a> Cfg<'a> {
         &self,
         force_non_host: bool,
         verbose: bool,
-    ) -> Result<(LocalToolchainName, ActiveReason)> {
-        if let Some((override_config, reason)) = self.find_override_config()? {
+    ) -> Result<(LocalToolchainName, ActiveSource)> {
+        if let Some((override_config, source)) = self.find_override_config()? {
             let toolchain = override_config.clone().into_local_toolchain_name();
             if let OverrideCfg::Official {
                 toolchain,
@@ -802,18 +748,18 @@ impl<'a> Cfg<'a> {
                 )
                 .await?;
             } else {
-                Toolchain::with_reason(self, toolchain.clone(), &reason)?;
+                Toolchain::with_source(self, toolchain.clone(), &source)?;
             }
-            Ok((toolchain, reason))
+            Ok((toolchain, source))
         } else if let Some(toolchain) = self.get_default()? {
-            let reason = ActiveReason::Default;
+            let source = ActiveSource::Default;
             if let ToolchainName::Official(desc) = &toolchain {
                 self.ensure_installed(desc, vec![], vec![], None, force_non_host, verbose)
                     .await?;
             } else {
-                Toolchain::with_reason(self, toolchain.clone().into(), &reason)?;
+                Toolchain::with_source(self, toolchain.clone().into(), &source)?;
             }
-            Ok((toolchain.into(), reason))
+            Ok((toolchain.into(), source))
         } else {
             Err(no_toolchain_error(self.process))
         }
@@ -838,32 +784,35 @@ impl<'a> Cfg<'a> {
             force_non_host,
         )?;
         if verbose {
-            (self.notify_handler)(Notification::LookingForToolchain(toolchain));
+            debug!("looking for installed toolchain {toolchain}");
         }
         let components: Vec<_> = components.iter().map(AsRef::as_ref).collect();
         let targets: Vec<_> = targets.iter().map(AsRef::as_ref).collect();
-        let profile = match profile {
-            Some(profile) => profile,
-            None => self.get_profile()?,
-        };
+        let mut options = DistOptions::new(
+            &components,
+            &targets,
+            toolchain,
+            match profile {
+                Some(p) => p,
+                None => self.get_profile()?,
+            },
+            false,
+            self,
+        )?;
+
         let (status, toolchain) = match DistributableToolchain::new(self, toolchain.clone()) {
             Err(RustupError::ToolchainNotInstalled { .. }) => {
-                DistributableToolchain::install(
-                    self,
-                    toolchain,
-                    &components,
-                    &targets,
-                    profile,
-                    false,
-                )
-                .await?
+                DistributableToolchain::install(options).await?
             }
-            Ok(mut distributable) => {
+            Ok(distributable) => {
                 if verbose {
-                    (self.notify_handler)(Notification::UsingExistingToolchain(toolchain));
+                    info!("using existing install for {toolchain}");
                 }
                 let status = if !distributable.components_exist(&components, &targets)? {
-                    distributable.update(&components, &targets, profile).await?
+                    options.force = true;
+                    InstallMethod::Dist(options.for_update(&distributable, false))
+                        .install()
+                        .await?
                 } else {
                     UpdateStatus::Unchanged
                 };
@@ -942,38 +891,16 @@ impl<'a> Cfg<'a> {
     /// Create an override for a toolchain
     pub(crate) fn make_override(&self, path: &Path, toolchain: &ToolchainName) -> Result<()> {
         self.settings_file.with_mut(|s| {
-            s.add_override(path, toolchain.to_string(), self.notify_handler.as_ref());
+            s.add_override(path, toolchain.to_string());
             Ok(())
         })
-    }
-
-    pub(crate) async fn update_all_channels(
-        &self,
-        force_update: bool,
-    ) -> Result<Vec<(ToolchainDesc, Result<UpdateStatus>)>> {
-        let channels = self.list_channels()?;
-        let channels = channels.into_iter();
-        let profile = self.get_profile()?;
-
-        // Update toolchains and collect the results
-        let channels = tokio_stream::iter(channels).then(|(desc, mut distributable)| async move {
-            let st = distributable
-                .update_extra(&[], &[], profile, force_update, false)
-                .await;
-            if let Err(ref e) = st {
-                (self.notify_handler)(Notification::NonFatalError(e));
-            }
-            (desc, st)
-        });
-
-        Ok(channels.collect().await)
     }
 
     pub(crate) fn set_default_host_triple(&self, host_triple: String) -> Result<()> {
         // Ensure that the provided host_triple is capable of resolving
         // against the 'stable' toolchain.  This provides early errors
         // if the supplied triple is insufficient / bad.
-        dist::PartialToolchainDesc::from_str("stable")?
+        PartialToolchainDesc::from_str("stable")?
             .resolve(&TargetTriple::new(host_triple.clone()))?;
         self.settings_file.with_mut(|s| {
             s.default_host_triple = Some(host_triple);
@@ -998,23 +925,22 @@ impl<'a> Cfg<'a> {
 
 /// The root path of the release server, without the `/dist` suffix.
 /// By default, it points to [`dist::DEFAULT_DIST_SERVER`].
-pub(crate) fn dist_root_server(process: &Process) -> Result<String> {
-    Ok(
-        if let Some(s) = non_empty_env_var("RUSTUP_DIST_SERVER", process)? {
-            trace!("`RUSTUP_DIST_SERVER` has been set to `{s}`");
-            s
-        }
-        // For backwards compatibility
-        else if let Some(mut root) = non_empty_env_var("RUSTUP_DIST_ROOT", process)? {
-            trace!("`RUSTUP_DIST_ROOT` has been set to `{root}`");
-            if let Some(stripped) = root.strip_suffix("/dist") {
-                root.truncate(stripped.len());
-            }
-            root
-        } else {
-            dist::DEFAULT_DIST_SERVER.to_owned()
-        },
-    )
+fn dist_root_server(process: &Process) -> Result<String> {
+    if let Some(s) = process.var_opt("RUSTUP_DIST_SERVER")? {
+        trace!("`RUSTUP_DIST_SERVER` has been set to `{s}`");
+        return Ok(s);
+    }
+
+    // For backwards compatibility
+    let Some(mut root) = process.var_opt("RUSTUP_DIST_ROOT")? else {
+        return Ok(dist::DEFAULT_DIST_SERVER.to_owned());
+    };
+
+    trace!("`RUSTUP_DIST_ROOT` has been set to `{root}`");
+    if let Some(stripped) = root.strip_suffix("/dist") {
+        root.truncate(stripped.len());
+    }
+    Ok(root)
 }
 
 impl Debug for Cfg<'_> {
@@ -1027,11 +953,11 @@ impl Debug for Cfg<'_> {
             toolchains_dir,
             update_hash_dir,
             download_dir,
-            tmp_cx,
             toolchain_override,
             env_override,
+            dist_root_server,
             dist_root_url,
-            notify_handler: _,
+            quiet,
             current_dir,
             process: _,
         } = self;
@@ -1044,10 +970,11 @@ impl Debug for Cfg<'_> {
             .field("toolchains_dir", toolchains_dir)
             .field("update_hash_dir", update_hash_dir)
             .field("download_dir", download_dir)
-            .field("tmp_cx", tmp_cx)
             .field("toolchain_override", toolchain_override)
             .field("env_override", env_override)
+            .field("dist_root_server", dist_root_server)
             .field("dist_root_url", dist_root_url)
+            .field("quiet", quiet)
             .field("current_dir", current_dir)
             .finish()
     }
@@ -1058,15 +985,6 @@ fn get_default_host_triple(s: &Settings, process: &Process) -> TargetTriple {
         .as_ref()
         .map(TargetTriple::new)
         .unwrap_or_else(|| TargetTriple::from_host_or_build(process))
-}
-
-pub(crate) fn non_empty_env_var(name: &str, process: &Process) -> anyhow::Result<Option<String>> {
-    match process.var(name) {
-        Ok(s) if !s.is_empty() => Ok(Some(s)),
-        Ok(_) => Ok(None),
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(err) => Err(err.into()),
-    }
 }
 
 fn no_toolchain_error(process: &Process) -> anyhow::Error {

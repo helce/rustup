@@ -4,23 +4,28 @@
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll, ready};
+use std::vec;
 
-use anyhow::{Context, Result, anyhow, bail};
-use tokio_retry::{RetryIf, strategy::FixedInterval};
+use anyhow::{Context as _, Result, anyhow, bail};
+use futures_util::Stream;
+use futures_util::stream::{FuturesUnordered, StreamExt};
+use tokio::task::{JoinHandle, spawn_blocking};
+use tracing::{debug, info, warn};
 
-use crate::dist::component::{
-    Components, Package, TarGzPackage, TarXzPackage, TarZStdPackage, Transaction,
-};
+use crate::diskio::{Executor, IO_CHUNK_SIZE, get_executor, unpack_ram};
+use crate::dist::component::{Components, DirectoryPackage, Transaction};
 use crate::dist::config::Config;
-use crate::dist::download::{DownloadCfg, File};
-use crate::dist::manifest::{Component, CompressionKind, Manifest, TargetedPackage};
-use crate::dist::notifications::*;
+use crate::dist::download::{DownloadCfg, DownloadStatus, File};
+use crate::dist::manifest::{Component, CompressionKind, HashedBinary, Manifest};
 use crate::dist::prefix::InstallPrefix;
 use crate::dist::temp;
 use crate::dist::{DEFAULT_DIST_SERVER, Profile, TargetTriple};
 use crate::errors::RustupError;
-use crate::process::Process;
 use crate::utils;
 
 pub(crate) const DIST_MANIFEST: &str = "multirust-channel-manifest.toml";
@@ -102,36 +107,29 @@ impl Manifestation {
     /// It is *not* safe to run two updates concurrently. See
     /// https://github.com/rust-lang/rustup/issues/988 for the details.
     pub async fn update(
-        &self,
-        new_manifest: &Manifest,
+        self,
+        new_manifest: Manifest,
         changes: Changes,
         force_update: bool,
         download_cfg: &DownloadCfg<'_>,
-        toolchain_str: &str,
+        toolchain_str: String,
         implicit_modify: bool,
     ) -> Result<UpdateStatus> {
         // Some vars we're going to need a few times
-        let tmp_cx = download_cfg.tmp_cx;
         let prefix = self.installation.prefix();
         let rel_installed_manifest_path = prefix.rel_manifest_file(DIST_MANIFEST);
         let installed_manifest_path = prefix.path().join(&rel_installed_manifest_path);
 
         // Create the lists of components needed for installation
         let config = self.read_config()?;
-        let mut update = Update::build_update(
-            self,
-            new_manifest,
-            &changes,
-            &config,
-            &download_cfg.notify_handler,
-        )?;
+        let mut update = Update::new(&self, &new_manifest, &changes, &config)?;
 
         if update.nothing_changes() {
             return Ok(UpdateStatus::Unchanged);
         }
 
         // Validate that the requested components are available
-        if let Err(e) = update.unavailable_components(new_manifest, toolchain_str) {
+        if let Err(e) = update.unavailable_components(&new_manifest, &toolchain_str) {
             if !force_update {
                 return Err(e);
             }
@@ -139,20 +137,34 @@ impl Manifestation {
                 e.downcast::<RustupError>()
             {
                 for component in &components {
-                    (download_cfg.notify_handler)(Notification::ForcingUnavailableComponent(
-                        &component.name(new_manifest),
-                    ));
+                    match &component.target {
+                        Some(t) if t != &self.target_triple => warn!(
+                            "skipping unavailable component {} for target {}",
+                            new_manifest.short_name(component),
+                            t
+                        ),
+                        _ => warn!(
+                            "skipping unavailable component {}",
+                            new_manifest.short_name(component)
+                        ),
+                    }
                 }
                 update.drop_components_to_install(&components);
             }
         }
 
-        let altered = tmp_cx.dist_server != DEFAULT_DIST_SERVER;
-
         // Download component packages and validate hashes
-        let mut things_to_install: Vec<(Component, CompressionKind, File)> = Vec::new();
-        let mut things_downloaded: Vec<String> = Vec::new();
-        let components = update.components_urls_and_hashes(new_manifest)?;
+        let components = update
+            .components_to_install
+            .into_iter()
+            .filter_map(|component| ComponentBinary::new(component, &new_manifest, download_cfg))
+            .collect::<Result<Vec<_>>>()?;
+
+        const DEFAULT_CONCURRENT_DOWNLOADS: usize = 2;
+        let concurrent_downloads = download_cfg
+            .process
+            .concurrent_downloads()
+            .unwrap_or(DEFAULT_CONCURRENT_DOWNLOADS);
 
         const DEFAULT_MAX_RETRIES: usize = 3;
         let max_retries: usize = download_cfg
@@ -162,138 +174,92 @@ impl Manifestation {
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_MAX_RETRIES);
 
-        for (component, format, url, hash) in components {
-            (download_cfg.notify_handler)(Notification::DownloadingComponent(
-                &component.short_name(new_manifest),
-                &self.target_triple,
-                component.target.as_ref(),
-            ));
-            let url = if altered {
-                url.replace(DEFAULT_DIST_SERVER, tmp_cx.dist_server.as_str())
-            } else {
-                url
-            };
-
-            let url_url = utils::parse_url(&url)?;
-
-            let downloaded_file = RetryIf::spawn(
-                FixedInterval::from_millis(0).take(max_retries),
-                || download_cfg.download(&url_url, &hash),
-                |e: &anyhow::Error| {
-                    // retry only known retriable cases
-                    match e.downcast_ref::<RustupError>() {
-                        Some(RustupError::BrokenPartialFile)
-                        | Some(RustupError::DownloadingFile { .. }) => {
-                            (download_cfg.notify_handler)(Notification::RetryingDownload(&url));
-                            true
-                        }
-                        _ => false,
-                    }
-                },
-            )
-            .await
-            .with_context(|| RustupError::ComponentDownloadFailed(component.name(new_manifest)))?;
-
-            things_downloaded.push(hash);
-
-            things_to_install.push((component, format, downloaded_file));
-        }
-
         // Begin transaction
         let mut tx = Transaction::new(
             prefix.clone(),
-            tmp_cx,
-            download_cfg.notify_handler,
-            download_cfg.process,
+            download_cfg.tmp_cx.clone(),
+            download_cfg.permit_copy_rename,
         );
 
         // If the previous installation was from a v1 manifest we need
         // to uninstall it first.
-        tx = self.maybe_handle_v2_upgrade(&config, tx, download_cfg.process)?;
+        tx = self.maybe_handle_v2_upgrade(&config, tx)?;
 
-        // Uninstall components
-        for component in &update.components_to_uninstall {
-            let notification = if implicit_modify {
-                Notification::RemovingOldComponent
-            } else {
-                Notification::RemovingComponent
-            };
-            (download_cfg.notify_handler)(notification(
-                &component.short_name(new_manifest),
-                &self.target_triple,
-                component.target.as_ref(),
-            ));
-
-            tx = self.uninstall_component(
-                component,
-                new_manifest,
-                tx,
-                &download_cfg.notify_handler,
-                download_cfg.process,
-            )?;
+        // If there are no components installed, and we are recovering from
+        // a partial installation, we can provide a more informative message.
+        if !update.components_to_uninstall.is_empty() && self.installation.list()?.is_empty() {
+            info!("recovering from a partially installed toolchain");
         }
 
-        // Install components
-        for (component, format, installer_file) in things_to_install {
-            // For historical reasons, the rust-installer component
-            // names are not the same as the dist manifest component
-            // names. Some are just the component name some are the
-            // component name plus the target triple.
-            let pkg_name = component.name_in_manifest();
-            let short_pkg_name = component.short_name_in_manifest();
-            let short_name = component.short_name(new_manifest);
-
-            (download_cfg.notify_handler)(Notification::InstallingComponent(
-                &short_name,
-                &self.target_triple,
-                component.target.as_ref(),
-            ));
-
-            let notification_converter = |notification: crate::utils::Notification<'_>| {
-                (download_cfg.notify_handler)(notification.into());
-            };
-            let gz;
-            let xz;
-            let zst;
-            let reader =
-                utils::FileReaderWithProgress::new_file(&installer_file, &notification_converter)?;
-            let package: &dyn Package = match format {
-                CompressionKind::GZip => {
-                    gz = TarGzPackage::new(
-                        reader,
-                        tmp_cx,
-                        Some(&notification_converter),
-                        download_cfg.process,
-                    )?;
-                    &gz
+        // Uninstall components
+        for component in update.components_to_uninstall {
+            match (implicit_modify, &component.target) {
+                (true, Some(t)) if t != &self.target_triple => {
+                    info!(
+                        "removing previous version of component {} for target {}",
+                        new_manifest.short_name(&component),
+                        t
+                    );
                 }
-                CompressionKind::XZ => {
-                    xz = TarXzPackage::new(
-                        reader,
-                        tmp_cx,
-                        Some(&notification_converter),
-                        download_cfg.process,
-                    )?;
-                    &xz
+                (false, Some(t)) if t != &self.target_triple => {
+                    info!(
+                        "removing component {} for target {}",
+                        new_manifest.short_name(&component),
+                        t
+                    );
                 }
-                CompressionKind::ZStd => {
-                    zst = TarZStdPackage::new(
-                        reader,
-                        tmp_cx,
-                        Some(&notification_converter),
-                        download_cfg.process,
-                    )?;
-                    &zst
+                (true, _) => {
+                    info!(
+                        "removing previous version of component {}",
+                        new_manifest.short_name(&component),
+                    );
                 }
-            };
-
-            // If the package doesn't contain the component that the
-            // manifest says it does then somebody must be playing a joke on us.
-            if !package.contains(&pkg_name, Some(short_pkg_name)) {
-                return Err(RustupError::CorruptComponent(short_name).into());
+                (false, _) => {
+                    info!("removing component {}", new_manifest.short_name(&component));
+                }
             }
 
-            tx = package.install(&self.installation, &pkg_name, Some(short_pkg_name), tx)?;
+            tx = self.uninstall_component(component, &new_manifest, tx)?;
+        }
+
+        if !components.is_empty() {
+            if components.len() > 2 {
+                info!("downloading {} components", components.len());
+            } else {
+                info!(
+                    "downloading component {}",
+                    components[0].manifest.short_name(&components[0].component),
+                );
+            };
+
+            let mut stream = InstallEvents::new(components.into_iter(), Arc::new(self));
+            let mut transaction = Some(tx);
+            tx = loop {
+                // Refill downloads when there's capacity
+                // Must live outside of `InstallEvents` because we can't write the type of future
+                while stream.components.len() > 0 && stream.downloads.len() < concurrent_downloads {
+                    if let Some(bin) = stream.components.next() {
+                        stream.downloads.push(bin.download(max_retries));
+                    }
+                }
+
+                // Trigger another installation if no other installation is in progress, as evidenced
+                // by whether `transaction` is `Some` (not held by another installation task).
+                stream.try_install(&mut transaction);
+                match stream.next().await {
+                    // Completed an installation, yielding the transaction back
+                    Some(Ok(tx)) => match stream.is_done() {
+                        true => break tx,
+                        false => transaction = Some(tx),
+                    },
+                    Some(Err(e)) => return Err(e),
+                    // A download completed, so we can trigger another one
+                    None => {}
+                }
+            };
+
+            download_cfg.clean(&stream.cleanup_downloads)?;
+            drop(stream);
         }
 
         // Install new distribution manifest
@@ -320,22 +286,19 @@ impl Manifestation {
         // End transaction
         tx.commit();
 
-        download_cfg.clean(&things_downloaded)?;
-
         Ok(UpdateStatus::Changed)
     }
 
     #[cfg(test)]
-    pub fn uninstall(
+    pub(crate) fn uninstall(
         &self,
         manifest: &Manifest,
-        tmp_cx: &temp::Context,
-        notify_handler: &dyn Fn(Notification<'_>),
-        process: &Process,
+        tmp_cx: Arc<temp::Context>,
+        permit_copy_rename: bool,
     ) -> Result<()> {
         let prefix = self.installation.prefix();
 
-        let mut tx = Transaction::new(prefix.clone(), tmp_cx, notify_handler, process);
+        let mut tx = Transaction::new(prefix.clone(), tmp_cx, permit_copy_rename);
 
         // Read configuration and delete it
         let rel_config_path = prefix.rel_manifest_file(CONFIG_FILE);
@@ -348,35 +311,34 @@ impl Manifestation {
         tx.remove_file("dist config", rel_config_path)?;
 
         for component in config.components {
-            tx = self.uninstall_component(&component, manifest, tx, notify_handler, process)?;
+            tx = self.uninstall_component(component, manifest, tx)?;
         }
         tx.commit();
 
         Ok(())
     }
 
-    fn uninstall_component<'a>(
+    fn uninstall_component(
         &self,
-        component: &Component,
+        component: Component,
         manifest: &Manifest,
-        mut tx: Transaction<'a>,
-        notify_handler: &dyn Fn(Notification<'_>),
-        process: &Process,
-    ) -> Result<Transaction<'a>> {
+        mut tx: Transaction,
+    ) -> Result<Transaction> {
         // For historical reasons, the rust-installer component
         // names are not the same as the dist manifest component
         // names. Some are just the component name some are the
-        // component name plus the target triple.
+        // component name plus the target tuple.
         let name = component.name_in_manifest();
         let short_name = component.short_name_in_manifest();
         if let Some(c) = self.installation.find(&name)? {
-            tx = c.uninstall(tx, process)?;
+            tx = c.uninstall(tx)?;
         } else if let Some(c) = self.installation.find(short_name)? {
-            tx = c.uninstall(tx, process)?;
+            tx = c.uninstall(tx)?;
         } else {
-            notify_handler(Notification::MissingInstalledComponent(
-                &component.short_name(manifest),
-            ));
+            debug!(
+                "component {} not found during uninstall",
+                manifest.short_name(&component),
+            );
         }
 
         Ok(tx)
@@ -422,10 +384,8 @@ impl Manifestation {
     pub(crate) async fn update_v1(
         &self,
         new_manifest: &[String],
-        update_hash: Option<&Path>,
-        tmp_cx: &temp::Context,
-        notify_handler: &dyn Fn(Notification<'_>),
-        process: &Process,
+        update_hash: &Path,
+        dl_cfg: &DownloadCfg<'_>,
     ) -> Result<Option<String>> {
         // If there's already a v2 installation then something has gone wrong
         if self.read_config()?.is_some() {
@@ -440,32 +400,17 @@ impl Manifestation {
         if url.is_none() {
             return Err(anyhow!(
                 "binary package was not provided for '{}'",
-                self.target_triple.to_string()
+                self.target_triple,
             ));
         }
         // Only replace once. The cost is inexpensive.
         let url = url
             .unwrap()
-            .replace(DEFAULT_DIST_SERVER, tmp_cx.dist_server.as_str());
+            .replace(DEFAULT_DIST_SERVER, dl_cfg.tmp_cx.dist_server.as_str());
 
-        notify_handler(Notification::DownloadingComponent(
-            "rust",
-            &self.target_triple,
-            Some(&self.target_triple),
-        ));
-
-        use std::path::PathBuf;
-        let dld_dir = PathBuf::from("bogus");
-        let dlcfg = DownloadCfg {
-            dist_root: "bogus",
-            download_dir: &dld_dir,
-            tmp_cx,
-            notify_handler,
-            process,
-        };
-
-        let dl = dlcfg
-            .download_and_check(&url, update_hash, ".tar.gz")
+        let status = dl_cfg.status_for("rust");
+        let dl = dl_cfg
+            .download_and_check(&url, Some(update_hash), Some(&status), ".tar.gz")
             .await?;
         if dl.is_none() {
             return Ok(None);
@@ -473,31 +418,26 @@ impl Manifestation {
         let (installer_file, installer_hash) = dl.unwrap();
 
         let prefix = self.installation.prefix();
-
-        notify_handler(Notification::InstallingComponent(
-            "rust",
-            &self.target_triple,
-            Some(&self.target_triple),
-        ));
+        info!("installing component rust");
 
         // Begin transaction
-        let mut tx = Transaction::new(prefix, tmp_cx, notify_handler, process);
+        let mut tx = Transaction::new(prefix, dl_cfg.tmp_cx.clone(), dl_cfg.permit_copy_rename);
 
         // Uninstall components
         let components = self.installation.list()?;
         for component in components {
-            tx = component.uninstall(tx, process)?;
+            tx = component.uninstall(tx)?;
         }
 
         // Install all the components in the installer
-        let notification_converter = |notification: crate::utils::Notification<'_>| {
-            notify_handler(notification.into());
-        };
-        let reader =
-            utils::FileReaderWithProgress::new_file(&installer_file, &notification_converter)?;
-        let package: &dyn Package =
-            &TarGzPackage::new(reader, tmp_cx, Some(&notification_converter), process)?;
-
+        let reader = utils::buffered(&installer_file)?;
+        let temp_dir = dl_cfg.tmp_cx.new_directory()?;
+        let io_executor = get_executor(
+            unpack_ram(IO_CHUNK_SIZE, dl_cfg.process.unpack_ram()?),
+            dl_cfg.process.io_thread_count()?,
+        );
+        let package =
+            DirectoryPackage::compressed(reader, CompressionKind::GZip, temp_dir, io_executor)?;
         for component in package.components() {
             tx = package.install(&self.installation, &component, None, tx)?;
         }
@@ -512,12 +452,11 @@ impl Manifestation {
     // doesn't have a configuration or manifest-derived list of
     // component/target pairs. Uninstall it using the installer's
     // component list before upgrading.
-    fn maybe_handle_v2_upgrade<'a>(
+    fn maybe_handle_v2_upgrade(
         &self,
         config: &Option<Config>,
-        mut tx: Transaction<'a>,
-        process: &Process,
-    ) -> Result<Transaction<'a>> {
+        mut tx: Transaction,
+    ) -> Result<Transaction> {
         let installed_components = self.installation.list()?;
         let looks_like_v1 = config.is_none() && !installed_components.is_empty();
 
@@ -526,14 +465,97 @@ impl Manifestation {
         }
 
         for component in installed_components {
-            tx = component.uninstall(tx, process)?;
+            tx = component.uninstall(tx)?;
         }
 
         Ok(tx)
     }
 }
 
-#[derive(Debug)]
+struct InstallEvents<'a, F> {
+    manifestation: Arc<Manifestation>,
+    components: vec::IntoIter<ComponentBinary<'a>>,
+    cleanup_downloads: Vec<&'a str>,
+    install_queue: VecDeque<ComponentInstall>,
+    installing: Option<JoinHandle<Result<Transaction>>>,
+    downloads: FuturesUnordered<F>,
+}
+
+impl<'a, F> InstallEvents<'a, F> {
+    fn new(
+        components: vec::IntoIter<ComponentBinary<'a>>,
+        manifestation: Arc<Manifestation>,
+    ) -> Self {
+        Self {
+            manifestation,
+            cleanup_downloads: Vec::with_capacity(components.len()),
+            components,
+            install_queue: VecDeque::new(),
+            installing: None,
+            downloads: FuturesUnordered::new(),
+        }
+    }
+
+    fn try_install(&mut self, tx: &mut Option<Transaction>) {
+        let Some(installable) = self.install_queue.pop_front() else {
+            return;
+        };
+
+        if let Some(tx) = tx.take() {
+            let manifestation = self.manifestation.clone();
+            self.installing = Some(spawn_blocking(|| installable.install(tx, manifestation)));
+        } else {
+            self.install_queue.push_front(installable);
+        }
+    }
+
+    fn is_done(&self) -> bool {
+        self.components.len() == 0 && self.downloads.is_empty() && self.install_queue.is_empty()
+    }
+}
+
+impl<'a, F: Future<Output = Result<(ComponentInstall, &'a str)>>> Stream for InstallEvents<'a, F> {
+    type Item = Result<Transaction>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.as_mut();
+
+        // First, see if any of the downloads is complete; if so, yield `None`
+        // to the caller so it can trigger another download.
+        match Pin::new(&mut this.downloads).poll_next(cx) {
+            Poll::Ready(Some(Ok((installable, hash)))) => {
+                this.cleanup_downloads.push(hash);
+                this.install_queue.push_back(installable);
+                return Poll::Ready(None);
+            }
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) | Poll::Pending => {}
+        }
+
+        let Some(handle) = &mut this.installing else {
+            return match self.install_queue.is_empty() {
+                // Nothing to do, yield control to the runtime
+                true => Poll::Pending,
+                // Can try to start the next installation
+                false => Poll::Ready(None),
+            };
+        };
+
+        match ready!(Pin::new(handle).poll(cx)) {
+            Ok(Ok(tx)) => {
+                // Current `handle` must not be polled again
+                this.installing = None;
+                Poll::Ready(Some(Ok(tx)))
+            }
+            Ok(Err(e)) => Poll::Ready(Some(Err(e))),
+            Err(e) => Poll::Ready(Some(Err(anyhow!(
+                "internal error during installation: {e}"
+            )))),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct Update {
     components_to_uninstall: Vec<Component>,
     components_to_install: Vec<Component>,
@@ -544,12 +566,11 @@ struct Update {
 impl Update {
     /// Returns components to uninstall, install, and the list of all
     /// components that will be up to date after the update.
-    fn build_update(
+    fn new(
         manifestation: &Manifestation,
         new_manifest: &Manifest,
         changes: &Changes,
         config: &Option<Config>,
-        notify_handler: &dyn Fn(Notification<'_>),
     ) -> Result<Self> {
         // The package to install.
         let rust_package = new_manifest.get_package("rust")?;
@@ -571,22 +592,57 @@ impl Update {
             starting_list.append(&mut profile_components);
         }
 
-        let mut result = Self {
-            components_to_uninstall: vec![],
-            components_to_install: vec![],
-            final_component_list: vec![],
-            missing_components: vec![],
-        };
+        let mut result = Self::default();
 
         // Find the final list of components we want to be left with when
         // we're done: required components, added components, and existing
         // installed components.
-        result.build_final_component_list(
-            &starting_list,
-            rust_target_package,
-            new_manifest,
-            changes,
-        );
+
+        // Add requested components
+        for component in &changes.explicit_add_components {
+            result.final_component_list.push(component.clone());
+        }
+
+        // Add components that are already installed
+        for existing_component in &starting_list {
+            if changes.remove_components.contains(existing_component) {
+                continue;
+            }
+
+            // If there is a rename in the (new) manifest, then we uninstall the component with the
+            // old name and install a component with the new name
+            if let Some(renamed_component) = new_manifest.rename_component(existing_component) {
+                if !result.final_component_list.contains(&renamed_component) {
+                    result.final_component_list.push(renamed_component);
+                }
+                continue;
+            }
+
+            if result.final_component_list.contains(existing_component) {
+                continue;
+            }
+
+            if rust_target_package.components.contains(existing_component) {
+                result.final_component_list.push(existing_component.clone());
+                continue;
+            }
+
+            // Component not available, check if this is a case of
+            // where rustup brokenly installed `rust-src` during
+            // the 1.20.x series
+            if !existing_component.contained_within(&rust_target_package.components) {
+                result.missing_components.push(existing_component.clone());
+                continue;
+            }
+
+            // It is the case, so we need to create a fresh wildcard
+            // component using the package name and add it to the final
+            // component list
+            let wildcarded = existing_component.wildcard();
+            if !result.final_component_list.contains(&wildcarded) {
+                result.final_component_list.push(wildcarded);
+            }
+        }
 
         // If this is a full upgrade then the list of components to
         // uninstall is all that are currently installed, and those
@@ -611,9 +667,17 @@ impl Update {
                 if !starting_list.contains(component) {
                     result.components_to_install.push(component.clone());
                 } else if changes.explicit_add_components.contains(component) {
-                    notify_handler(Notification::ComponentAlreadyInstalled(
-                        &component.description(new_manifest),
-                    ));
+                    match &component.target {
+                        Some(t) if t != &manifestation.target_triple => info!(
+                            "component {} for target {} is up to date",
+                            new_manifest.short_name(component),
+                            t,
+                        ),
+                        _ => info!(
+                            "component {} is up to date",
+                            new_manifest.short_name(component)
+                        ),
+                    }
                 }
             }
         } else {
@@ -626,64 +690,6 @@ impl Update {
         Ok(result)
     }
 
-    /// Build the list of components we'll have installed at the end
-    fn build_final_component_list(
-        &mut self,
-        starting_list: &[Component],
-        rust_target_package: &TargetedPackage,
-        new_manifest: &Manifest,
-        changes: &Changes,
-    ) {
-        // Add requested components
-        for component in &changes.explicit_add_components {
-            self.final_component_list.push(component.clone());
-        }
-
-        // Add components that are already installed
-        for existing_component in starting_list {
-            let removed = changes.remove_components.contains(existing_component);
-
-            if !removed {
-                // If there is a rename in the (new) manifest, then we uninstall the component with the
-                // old name and install a component with the new name
-                if let Some(renamed_component) = new_manifest.rename_component(existing_component) {
-                    let is_already_included =
-                        self.final_component_list.contains(&renamed_component);
-                    if !is_already_included {
-                        self.final_component_list.push(renamed_component);
-                    }
-                } else {
-                    let is_already_included =
-                        self.final_component_list.contains(existing_component);
-                    if !is_already_included {
-                        let component_is_present =
-                            rust_target_package.components.contains(existing_component);
-
-                        if component_is_present {
-                            self.final_component_list.push(existing_component.clone());
-                        } else {
-                            // Component not available, check if this is a case of
-                            // where rustup brokenly installed `rust-src` during
-                            // the 1.20.x series
-                            if existing_component.contained_within(&rust_target_package.components)
-                            {
-                                // It is the case, so we need to create a fresh wildcard
-                                // component using the package name and add it to the final
-                                // component list
-                                let wildcarded = existing_component.wildcard();
-                                if !self.final_component_list.contains(&wildcarded) {
-                                    self.final_component_list.push(wildcarded);
-                                }
-                            } else {
-                                self.missing_components.push(existing_component.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn nothing_changes(&self) -> bool {
         self.components_to_uninstall.is_empty() && self.components_to_install.is_empty()
     }
@@ -693,7 +699,7 @@ impl Update {
             .components_to_install
             .iter()
             .filter(|c| {
-                use crate::dist::manifest::*;
+                use crate::dist::manifest::{Package, TargetedPackage};
                 let pkg: Option<&Package> =
                     new_manifest.get_package(c.short_name_in_manifest()).ok();
                 let target_pkg: Option<&TargetedPackage> =
@@ -720,31 +726,119 @@ impl Update {
         self.components_to_install.retain(|c| !to_drop.contains(c));
         self.final_component_list.retain(|c| !to_drop.contains(c));
     }
+}
 
-    /// Map components to urls and hashes
-    fn components_urls_and_hashes(
-        &self,
-        new_manifest: &Manifest,
-    ) -> Result<Vec<(Component, CompressionKind, String, String)>> {
-        let mut components_urls_and_hashes = Vec::new();
-        for component in &self.components_to_install {
-            let package = new_manifest.get_package(component.short_name_in_manifest())?;
-            let target_package = package.get_target(component.target.as_ref())?;
+struct ComponentBinary<'a> {
+    component: Component,
+    binary: &'a HashedBinary,
+    status: DownloadStatus,
+    manifest: &'a Manifest,
+    download_cfg: &'a DownloadCfg<'a>,
+}
 
-            if target_package.bins.is_empty() {
-                // This package is not available, no files to download.
-                continue;
-            }
-            // We prefer the first format in the list, since the parsing of the
-            // manifest leaves us with the files/hash pairs in preference order.
-            components_urls_and_hashes.push((
-                component.clone(),
-                target_package.bins[0].compression,
-                target_package.bins[0].url.clone(),
-                target_package.bins[0].hash.clone(),
-            ));
+impl<'a> ComponentBinary<'a> {
+    fn new(
+        component: Component,
+        manifest: &'a Manifest,
+        download_cfg: &'a DownloadCfg<'a>,
+    ) -> Option<Result<Self>> {
+        Some(Ok(ComponentBinary {
+            binary: match manifest.binary(&component) {
+                Ok(Some(b)) => b,
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            },
+            status: download_cfg.status_for(manifest.short_name(&component).to_owned()),
+            component,
+            manifest,
+            download_cfg,
+        }))
+    }
+
+    async fn download(self, max_retries: usize) -> Result<(ComponentInstall, &'a str)> {
+        use tokio_retry::{RetryIf, strategy::FixedInterval};
+
+        let url = self.download_cfg.url(&self.binary.url)?;
+        let installer = RetryIf::spawn(
+            FixedInterval::from_millis(0).take(max_retries),
+            || {
+                self.download_cfg
+                    .download(&url, &self.binary.hash, &self.status)
+            },
+            |e: &anyhow::Error| {
+                // retry only known retriable cases
+                match e.downcast_ref::<RustupError>() {
+                    Some(RustupError::BrokenPartialFile)
+                    | Some(RustupError::DownloadingFile { .. }) => {
+                        self.status.retrying();
+                        true
+                    }
+                    _ => false,
+                }
+            },
+        )
+        .await
+        .with_context(|| {
+            RustupError::ComponentDownloadFailed(self.manifest.name(&self.component))
+        })?;
+
+        let install = ComponentInstall {
+            status: self.status,
+            compression: self.binary.compression,
+            installer,
+            short_name: self.manifest.short_name(&self.component).to_owned(),
+            component: self.component,
+            temp_dir: self.download_cfg.tmp_cx.new_directory()?,
+            io_executor: get_executor(
+                unpack_ram(IO_CHUNK_SIZE, self.download_cfg.process.unpack_ram()?),
+                self.download_cfg.process.io_thread_count()?,
+            ),
+        };
+
+        Ok((install, &self.binary.hash))
+    }
+}
+
+struct ComponentInstall {
+    component: Component,
+    status: DownloadStatus,
+    compression: CompressionKind,
+    installer: File,
+    short_name: String,
+    temp_dir: temp::Dir,
+    io_executor: Box<dyn Executor>,
+}
+
+impl ComponentInstall {
+    fn install(self, tx: Transaction, manifestation: Arc<Manifestation>) -> Result<Transaction> {
+        // For historical reasons, the rust-installer component
+        // names are not the same as the dist manifest component
+        // names. Some are just the component name some are the
+        // component name plus the target tuple.
+        let pkg_name = self.component.name_in_manifest();
+        let short_pkg_name = self.component.short_name_in_manifest();
+        let reader = self.status.unpack(utils::buffered(&self.installer)?);
+        let package = DirectoryPackage::compressed(
+            reader,
+            self.compression,
+            self.temp_dir,
+            self.io_executor,
+        )?;
+
+        // If the package doesn't contain the component that the
+        // manifest says it does then somebody must be playing a joke on us.
+        if !package.contains(&pkg_name, Some(short_pkg_name)) {
+            return Err(RustupError::CorruptComponent(self.short_name).into());
         }
 
-        Ok(components_urls_and_hashes)
+        self.status.installing();
+        let tx = package.install(
+            &manifestation.installation,
+            &pkg_name,
+            Some(short_pkg_name),
+            tx,
+        );
+        self.status.installed();
+        tx
     }
 }

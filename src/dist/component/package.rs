@@ -3,75 +3,91 @@
 //! prefix, represented by a `Components` instance.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::io::{self, ErrorKind as IOErrorKind, Read};
 use std::mem;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use tar::EntryType;
 use tracing::warn;
 
-use crate::diskio::{CompletedIo, Executor, FileBuffer, IO_CHUNK_SIZE, Item, Kind, get_executor};
-use crate::dist::component::components::*;
-use crate::dist::component::transaction::*;
+use crate::diskio::{CompletedIo, Executor, FileBuffer, IO_CHUNK_SIZE, Item, Kind};
+use crate::dist::component::components::{ComponentPart, ComponentPartKind, Components};
+use crate::dist::component::transaction::Transaction;
+use crate::dist::manifest::CompressionKind;
 use crate::dist::temp;
-use crate::errors::*;
-use crate::process::Process;
-use crate::utils::{self, Notification};
+use crate::errors::RustupError;
+use crate::utils;
 
 /// The current metadata revision used by rust-installer
 pub(crate) const INSTALLER_VERSION: &str = "3";
 pub(crate) const VERSION_FILE: &str = "rust-installer-version";
 
-pub trait Package: fmt::Debug {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool;
-    fn install<'a>(
-        &self,
-        target: &Components,
-        component: &str,
-        short_name: Option<&str>,
-        tx: Transaction<'a>,
-    ) -> Result<Transaction<'a>>;
-    fn components(&self) -> Vec<String>;
-}
-
 #[derive(Debug)]
-pub struct DirectoryPackage {
-    path: PathBuf,
+pub struct DirectoryPackage<P> {
+    path: P,
     components: HashSet<String>,
     copy: bool,
 }
 
-impl DirectoryPackage {
-    pub fn new(path: PathBuf, copy: bool) -> Result<Self> {
-        validate_installer_version(&path)?;
+impl DirectoryPackage<temp::Dir> {
+    pub(crate) fn compressed<R: Read>(
+        stream: R,
+        kind: CompressionKind,
+        temp_dir: temp::Dir,
+        io_executor: Box<dyn Executor>,
+    ) -> Result<Self> {
+        match kind {
+            CompressionKind::GZip => {
+                Self::from_tar(flate2::read::GzDecoder::new(stream), temp_dir, io_executor)
+            }
+            CompressionKind::ZStd => Self::from_tar(
+                zstd::stream::read::Decoder::new(stream)?,
+                temp_dir,
+                io_executor,
+            ),
+            CompressionKind::XZ => {
+                Self::from_tar(xz2::read::XzDecoder::new(stream), temp_dir, io_executor)
+            }
+        }
+    }
+
+    fn from_tar(
+        stream: impl Read,
+        temp_dir: temp::Dir,
+        io_executor: Box<dyn Executor>,
+    ) -> Result<Self> {
+        let mut archive = tar::Archive::new(stream);
+
+        // The rust-installer packages unpack to a directory called
+        // $pkgname-$version-$target. Skip that directory when
+        // unpacking.
+        unpack_without_first_dir(&mut archive, &temp_dir, io_executor)
+            .context("failed to extract package")?;
+
+        Self::new(temp_dir, false)
+    }
+}
+
+impl<P: Deref<Target = Path>> DirectoryPackage<P> {
+    pub fn new(path: P, copy: bool) -> Result<Self> {
+        let file = utils::read_file("installer version", &path.join(VERSION_FILE))?;
+        let v = file.trim();
+        if v != INSTALLER_VERSION {
+            return Err(anyhow!(format!("unsupported installer version: {v}")));
+        }
 
         let content = utils::read_file("package components", &path.join("components"))?;
-        let components = content
-            .lines()
-            .map(std::borrow::ToOwned::to_owned)
-            .collect();
+        let components = content.lines().map(ToOwned::to_owned).collect();
         Ok(Self {
             path,
             components,
             copy,
         })
     }
-}
 
-fn validate_installer_version(path: &Path) -> Result<()> {
-    let file = utils::read_file("installer version", &path.join(VERSION_FILE))?;
-    let v = file.trim();
-    if v == INSTALLER_VERSION {
-        Ok(())
-    } else {
-        Err(anyhow!(format!("unsupported installer version: {v}")))
-    }
-}
-
-impl Package for DirectoryPackage {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
+    pub fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
         self.components.contains(component)
             || if let Some(n) = short_name {
                 self.components.contains(n)
@@ -79,13 +95,14 @@ impl Package for DirectoryPackage {
                 false
             }
     }
-    fn install<'a>(
+
+    pub fn install(
         &self,
         target: &Components,
         name: &str,
         short_name: Option<&str>,
-        tx: Transaction<'a>,
-    ) -> Result<Transaction<'a>> {
+        tx: Transaction,
+    ) -> Result<Transaction> {
         let actual_name = if self.components.contains(name) {
             name
         } else if let Some(n) = short_name {
@@ -130,90 +147,8 @@ impl Package for DirectoryPackage {
         Ok(tx)
     }
 
-    fn components(&self) -> Vec<String> {
+    pub(crate) fn components(&self) -> Vec<String> {
         self.components.iter().cloned().collect()
-    }
-}
-
-#[derive(Debug)]
-#[allow(dead_code)] // temp::Dir is held for drop.
-pub(crate) struct TarPackage<'a>(DirectoryPackage, temp::Dir<'a>);
-
-impl<'a> TarPackage<'a> {
-    pub(crate) fn new<R: Read>(
-        stream: R,
-        tmp_cx: &'a temp::Context,
-        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
-        process: &Process,
-    ) -> Result<Self> {
-        let temp_dir = tmp_cx.new_directory()?;
-        let mut archive = tar::Archive::new(stream);
-        // The rust-installer packages unpack to a directory called
-        // $pkgname-$version-$target. Skip that directory when
-        // unpacking.
-        unpack_without_first_dir(&mut archive, &temp_dir, notify_handler, process)
-            .context("failed to extract package")?;
-
-        Ok(TarPackage(
-            DirectoryPackage::new(temp_dir.to_owned(), false)?,
-            temp_dir,
-        ))
-    }
-}
-
-// Probably this should live in diskio but ¯\_(ツ)_/¯
-fn unpack_ram(
-    io_chunk_size: usize,
-    effective_max_ram: Option<usize>,
-    notify_handler: Option<&dyn Fn(Notification<'_>)>,
-    process: &Process,
-) -> usize {
-    const RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS: usize = 200 * 1024 * 1024;
-    let minimum_ram = io_chunk_size * 2;
-    let default_max_unpack_ram = if let Some(effective_max_ram) = effective_max_ram {
-        if effective_max_ram > minimum_ram + RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS {
-            effective_max_ram - RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS
-        } else {
-            minimum_ram
-        }
-    } else {
-        // Rustup does not know how much RAM the machine has: use the minimum
-        minimum_ram
-    };
-    let unpack_ram = match process
-        .var("RUSTUP_UNPACK_RAM")
-        .ok()
-        .and_then(|budget_str| budget_str.parse::<usize>().ok())
-    {
-        Some(budget) => {
-            if budget < minimum_ram {
-                warn!(
-                    "Ignoring RUSTUP_UNPACK_RAM ({}) less than minimum of {}.",
-                    budget, minimum_ram
-                );
-                minimum_ram
-            } else if budget > default_max_unpack_ram {
-                warn!(
-                    "Ignoring RUSTUP_UNPACK_RAM ({}) greater than detected available RAM of {}.",
-                    budget, default_max_unpack_ram
-                );
-                default_max_unpack_ram
-            } else {
-                budget
-            }
-        }
-        None => {
-            if let Some(h) = notify_handler {
-                h(Notification::SetDefaultBufferSize(default_max_unpack_ram))
-            }
-            default_max_unpack_ram
-        }
-    };
-
-    if minimum_ram > unpack_ram {
-        panic!("RUSTUP_UNPACK_RAM must be larger than {minimum_ram}");
-    } else {
-        unpack_ram
     }
 }
 
@@ -254,26 +189,26 @@ fn trigger_children(
     op: CompletedIo,
 ) -> Result<usize> {
     let mut result = 0;
-    if let CompletedIo::Item(item) = op {
-        if let Kind::Directory = item.kind {
-            let mut pending = Vec::new();
-            directories
-                .entry(item.full_path)
-                .and_modify(|status| match status {
-                    DirStatus::Exists => unreachable!(),
-                    DirStatus::Pending(pending_inner) => {
-                        pending.append(pending_inner);
-                        *status = DirStatus::Exists;
-                    }
-                })
-                .or_insert_with(|| unreachable!());
-            result += pending.len();
-            for pending_item in pending.into_iter() {
-                for mut item in io_executor.execute(pending_item).collect::<Vec<_>>() {
-                    // TODO capture metrics
-                    filter_result(&mut item)?;
-                    result += trigger_children(io_executor, directories, item)?;
+    if let CompletedIo::Item(item) = op
+        && let Kind::Directory = item.kind
+    {
+        let mut pending = Vec::new();
+        directories
+            .entry(item.full_path)
+            .and_modify(|status| match status {
+                DirStatus::Exists => unreachable!(),
+                DirStatus::Pending(pending_inner) => {
+                    pending.append(pending_inner);
+                    *status = DirStatus::Exists;
                 }
+            })
+            .or_insert_with(|| unreachable!());
+        result += pending.len();
+        for pending_item in pending.into_iter() {
+            for mut item in io_executor.execute(pending_item).collect::<Vec<_>>() {
+                // TODO capture metrics
+                filter_result(&mut item)?;
+                result += trigger_children(io_executor, directories, item)?;
             }
         }
     };
@@ -289,22 +224,9 @@ enum DirStatus {
 fn unpack_without_first_dir<R: Read>(
     archive: &mut tar::Archive<R>,
     path: &Path,
-    notify_handler: Option<&dyn Fn(Notification<'_>)>,
-    process: &Process,
+    mut io_executor: Box<dyn Executor>,
 ) -> Result<()> {
     let entries = archive.entries()?;
-    let effective_max_ram = match effective_limits::memory_limit() {
-        Ok(ram) => Some(ram as usize),
-        Err(e) => {
-            if let Some(h) = notify_handler {
-                h(Notification::Error(e.to_string()))
-            }
-            None
-        }
-    };
-    let unpack_ram = unpack_ram(IO_CHUNK_SIZE, effective_max_ram, notify_handler, process);
-    let mut io_executor: Box<dyn Executor> = get_executor(notify_handler, unpack_ram, process)?;
-
     let mut directories: HashMap<PathBuf, DirStatus> = HashMap::new();
     // Path is presumed to exist. Call it a precondition.
     directories.insert(path.to_owned(), DirStatus::Exists);
@@ -343,14 +265,14 @@ fn unpack_without_first_dir<R: Read>(
             continue;
         }
 
-        struct SenderEntry<'a, 'b, R: std::io::Read> {
+        struct SenderEntry<'a, 'b, R: Read> {
             sender: Box<dyn FnMut(FileBuffer) -> bool + 'a>,
             entry: tar::Entry<'b, R>,
         }
 
         /// true if either no sender_entry was provided, or the incremental file
         /// has been fully dispatched.
-        fn flush_ios<R: std::io::Read, P: AsRef<Path>>(
+        fn flush_ios<R: Read, P: AsRef<Path>>(
             io_executor: &mut dyn Executor,
             directories: &mut HashMap<PathBuf, DirStatus>,
             mut sender_entry: Option<&mut SenderEntry<'_, '_, R>>,
@@ -363,24 +285,24 @@ fn unpack_without_first_dir<R: Read>(
                 trigger_children(&*io_executor, directories, op)?;
             }
             // Maybe stream a file incrementally
-            if let Some(sender) = sender_entry.as_mut() {
-                if io_executor.buffer_available(IO_CHUNK_SIZE) {
-                    let mut buffer = io_executor.get_buffer(IO_CHUNK_SIZE);
-                    let len = sender
-                        .entry
-                        .by_ref()
-                        .take(IO_CHUNK_SIZE as u64)
-                        .read_to_end(&mut buffer)?;
-                    buffer = buffer.finished();
-                    if len == 0 {
-                        result = true;
-                    }
-                    if !(sender.sender)(buffer) {
-                        bail!(format!(
-                            "IO receiver for '{}' disconnected",
-                            full_path.as_ref().display()
-                        ))
-                    }
+            if let Some(sender) = sender_entry.as_mut()
+                && io_executor.buffer_available(IO_CHUNK_SIZE)
+            {
+                let mut buffer = io_executor.get_buffer(IO_CHUNK_SIZE);
+                let len = sender
+                    .entry
+                    .by_ref()
+                    .take(IO_CHUNK_SIZE as u64)
+                    .read_to_end(&mut buffer)?;
+                buffer = buffer.finished();
+                if len == 0 {
+                    result = true;
+                }
+                if !(sender.sender)(buffer) {
+                    bail!(format!(
+                        "IO receiver for '{}' disconnected",
+                        full_path.as_ref().display()
+                    ))
                 }
             }
             Ok(result)
@@ -462,12 +384,11 @@ fn unpack_without_first_dir<R: Read>(
                 None => {
                     // Tar has item before containing directory
                     // Complain about this so we can see if these exist.
-                    writeln!(
-                        process.stderr().lock(),
-                        "Unexpected: missing parent '{}' for '{}'",
+                    warn!(
+                        "unexpected: missing parent '{}' for '{}'",
                         parent.display(),
                         entry.path()?.display()
-                    )?;
+                    );
                     directories.insert(parent.to_owned(), DirStatus::Pending(vec![item]));
                     item = Item::make_dir(parent.to_owned(), 0o755);
                     // Check the parent's parent
@@ -530,136 +451,4 @@ fn unpack_without_first_dir<R: Read>(
     }
 
     Ok(())
-}
-
-impl Package for TarPackage<'_> {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
-        self.0.contains(component, short_name)
-    }
-    fn install<'b>(
-        &self,
-        target: &Components,
-        component: &str,
-        short_name: Option<&str>,
-        tx: Transaction<'b>,
-    ) -> Result<Transaction<'b>> {
-        self.0.install(target, component, short_name, tx)
-    }
-    fn components(&self) -> Vec<String> {
-        self.0.components()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TarGzPackage<'a>(TarPackage<'a>);
-
-impl<'a> TarGzPackage<'a> {
-    pub(crate) fn new<R: Read>(
-        stream: R,
-        tmp_cx: &'a temp::Context,
-        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
-        process: &Process,
-    ) -> Result<Self> {
-        let stream = flate2::read::GzDecoder::new(stream);
-        Ok(TarGzPackage(TarPackage::new(
-            stream,
-            tmp_cx,
-            notify_handler,
-            process,
-        )?))
-    }
-}
-
-impl Package for TarGzPackage<'_> {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
-        self.0.contains(component, short_name)
-    }
-    fn install<'b>(
-        &self,
-        target: &Components,
-        component: &str,
-        short_name: Option<&str>,
-        tx: Transaction<'b>,
-    ) -> Result<Transaction<'b>> {
-        self.0.install(target, component, short_name, tx)
-    }
-    fn components(&self) -> Vec<String> {
-        self.0.components()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TarXzPackage<'a>(TarPackage<'a>);
-
-impl<'a> TarXzPackage<'a> {
-    pub(crate) fn new<R: Read>(
-        stream: R,
-        tmp_cx: &'a temp::Context,
-        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
-        process: &Process,
-    ) -> Result<Self> {
-        let stream = xz2::read::XzDecoder::new(stream);
-        Ok(TarXzPackage(TarPackage::new(
-            stream,
-            tmp_cx,
-            notify_handler,
-            process,
-        )?))
-    }
-}
-
-impl Package for TarXzPackage<'_> {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
-        self.0.contains(component, short_name)
-    }
-    fn install<'b>(
-        &self,
-        target: &Components,
-        component: &str,
-        short_name: Option<&str>,
-        tx: Transaction<'b>,
-    ) -> Result<Transaction<'b>> {
-        self.0.install(target, component, short_name, tx)
-    }
-    fn components(&self) -> Vec<String> {
-        self.0.components()
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct TarZStdPackage<'a>(TarPackage<'a>);
-
-impl<'a> TarZStdPackage<'a> {
-    pub(crate) fn new<R: Read>(
-        stream: R,
-        tmp_cx: &'a temp::Context,
-        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
-        process: &Process,
-    ) -> Result<Self> {
-        let stream = zstd::stream::read::Decoder::new(stream)?;
-        Ok(TarZStdPackage(TarPackage::new(
-            stream,
-            tmp_cx,
-            notify_handler,
-            process,
-        )?))
-    }
-}
-
-impl Package for TarZStdPackage<'_> {
-    fn contains(&self, component: &str, short_name: Option<&str>) -> bool {
-        self.0.contains(component, short_name)
-    }
-    fn install<'b>(
-        &self,
-        target: &Components,
-        component: &str,
-        short_name: Option<&str>,
-        tx: Transaction<'b>,
-    ) -> Result<Transaction<'b>> {
-        self.0.install(target, component, short_name, tx)
-    }
-    fn components(&self) -> Vec<String> {
-        self.0.components()
-    }
 }

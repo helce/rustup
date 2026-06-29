@@ -38,7 +38,7 @@ impl ImmediateUnpacker {
     fn deque(&self) -> Box<dyn Iterator<Item = CompletedIo>> {
         let mut guard = self.incremental_state.lock().unwrap();
         // incremental file in progress
-        if let Some(ref mut state) = *guard {
+        if let Some(state) = &mut *guard {
             // Case 1: pending errors
             if state.finished {
                 let mut item = state.item.take().unwrap();
@@ -70,7 +70,7 @@ impl Executor for ImmediateUnpacker {
         item.result = match &mut item.kind {
             super::Kind::Directory => super::create_dir(&item.full_path),
             super::Kind::File(contents) => {
-                if let super::FileBuffer::Immediate(contents) = &contents {
+                if let FileBuffer::Immediate(contents) = &contents {
                     super::write_file(&item.full_path, contents, item.mode)
                 } else {
                     unreachable!()
@@ -81,7 +81,7 @@ impl Executor for ImmediateUnpacker {
                     // If there is a pending error, return it, otherwise stash the
                     // Item for eventual return when the file is finished.
                     let mut guard = self.incremental_state.lock().unwrap();
-                    let Some(ref mut state) = *guard else {
+                    let Some(state) = &mut *guard else {
                         unreachable!()
                     };
                     if state.err.is_some() {
@@ -128,8 +128,8 @@ impl Executor for ImmediateUnpacker {
         }
     }
 
-    fn get_buffer(&mut self, capacity: usize) -> super::FileBuffer {
-        super::FileBuffer::Immediate(Vec::with_capacity(capacity))
+    fn get_buffer(&mut self, capacity: usize) -> FileBuffer {
+        FileBuffer::Immediate(Vec::with_capacity(capacity))
     }
 
     fn buffer_available(&self, _len: usize) -> bool {
@@ -156,7 +156,7 @@ impl IncrementalFileWriter {
         path: P,
         mode: u32,
         state: IncrementalFileState,
-    ) -> std::result::Result<Self, io::Error> {
+    ) -> Result<Self, io::Error> {
         let mut opts = OpenOptions::new();
         #[cfg(unix)]
         {
@@ -187,7 +187,7 @@ impl IncrementalFileWriter {
             Ok(v) => v,
             Err(e) => {
                 let mut state = self.state.lock().unwrap();
-                if let Some(ref mut state) = *state {
+                if let Some(state) = &mut *state {
                     state.err.replace(Err(e));
                     state.finished = true;
                     false
@@ -198,12 +198,12 @@ impl IncrementalFileWriter {
         }
     }
 
-    fn write(&mut self, chunk: Vec<u8>) -> std::result::Result<bool, io::Error> {
+    fn write(&mut self, chunk: Vec<u8>) -> Result<bool, io::Error> {
         let mut state = self.state.lock().unwrap();
-        let Some(ref mut state) = *state else {
+        let Some(state) = &mut *state else {
             unreachable!()
         };
-        let Some(ref mut file) = self.file.as_mut() else {
+        let Some(file) = &mut self.file else {
             return Ok(false);
         };
         // Length 0 vector is used for clean EOF signalling.

@@ -8,20 +8,19 @@ use std::ops::{BitAnd, BitAndAssign};
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use retry::delay::{Fibonacci, jitter};
 use retry::{OperationResult, retry};
+use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::errors::*;
-use crate::process::Process;
+use crate::errors::RustupError;
 
 #[cfg(not(windows))]
 pub(crate) use crate::utils::raw::find_cmd;
+pub(crate) use crate::utils::raw::is_directory;
 pub use crate::utils::raw::{is_file, path_exists};
-pub(crate) use crate::utils::{notifications::Notification, raw::is_directory};
 
-pub(crate) mod notifications;
 pub(crate) mod notify;
 pub mod raw;
 pub(crate) mod units;
@@ -29,6 +28,17 @@ pub(crate) mod units;
 #[must_use]
 #[derive(Debug, PartialEq, Eq)]
 pub struct ExitCode(pub i32);
+
+impl ExitCode {
+    /// Successful execution.
+    pub const SUCCESS: Self = Self(0);
+
+    /// Generic failure.
+    pub const FAILURE: Self = Self(1);
+
+    /// Updates are available.
+    pub const UPDATES_AVAILABLE: Self = Self(100);
+}
 
 impl BitAnd for ExitCode {
     type Output = Self;
@@ -60,16 +70,9 @@ impl From<ExitStatus> for ExitCode {
     }
 }
 
-pub fn ensure_dir_exists<'a, N>(
-    name: &'static str,
-    path: &'a Path,
-    notify_handler: &'a dyn Fn(N),
-) -> Result<bool>
-where
-    N: From<Notification<'a>>,
-{
+pub fn ensure_dir_exists(name: &'static str, path: &Path) -> Result<bool> {
     raw::ensure_dir_exists(path, |_| {
-        notify_handler(Notification::CreatingDirectory(name, path).into())
+        debug!(name, path = %path.display(), "creating directory");
     })
     .with_context(|| RustupError::CreatingDirectory {
         name,
@@ -133,12 +136,9 @@ pub(crate) fn filter_file<F: FnMut(&str) -> bool>(
     })
 }
 
-pub(crate) fn canonicalize_path<'a, N>(path: &'a Path, notify_handler: &dyn Fn(N)) -> PathBuf
-where
-    N: From<Notification<'a>>,
-{
+pub(crate) fn canonicalize_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| {
-        notify_handler(Notification::NoCanonicalPath(path).into());
+        warn!("could not canonicalize path {}", path.display());
         PathBuf::from(path)
     })
 }
@@ -163,15 +163,8 @@ pub(crate) fn assert_is_directory(path: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn symlink_dir<'a, N>(
-    src: &'a Path,
-    dest: &'a Path,
-    notify_handler: &dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
-    notify_handler(Notification::LinkingDirectory(src, dest).into());
+pub(crate) fn symlink_dir(src: &Path, dest: &Path) -> Result<()> {
+    debug!(source = %src.display(), destination = %dest.display(), "linking directory");
     raw::symlink_dir(src, dest).with_context(|| {
         format!(
             "could not create link from '{}' to '{}'",
@@ -233,15 +226,8 @@ fn symlink_file(src: &Path, dest: &Path) -> Result<()> {
     })
 }
 
-pub(crate) fn copy_dir<'a, N>(
-    src: &'a Path,
-    dest: &'a Path,
-    notify_handler: &dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
-    notify_handler(Notification::CopyingDirectory(src, dest).into());
+pub(crate) fn copy_dir(src: &Path, dest: &Path) -> Result<()> {
+    debug!(source = %src.display(), destination = %dest.display(), "copying directory");
     raw::copy_dir(src, dest).with_context(|| {
         format!(
             "could not copy directory from '{}' to '{}'",
@@ -251,13 +237,34 @@ where
     })
 }
 
+/// Copy a file from `src` to `dst`, preserving the symlink target if `src` is a symlink.
+/// This is the default behavior for component installation.
 pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
+    copy_file_impl(src, dest, true)
+}
+
+/// Copy a file from `src` to `dst`, or if `src` is a symlink, create a new symlink
+/// at `dst` pointing to it.
+/// Used for self-update where we want to preserve the symlink to the original location.
+pub(crate) fn copy_file_symlink_to_source(src: &Path, dest: &Path) -> Result<()> {
+    copy_file_impl(src, dest, false)
+}
+
+fn copy_file_impl(src: &Path, dest: &Path, preserve_symlink: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(src).with_context(|| RustupError::ReadingFile {
         name: "metadata for",
         path: PathBuf::from(src),
     })?;
     if metadata.file_type().is_symlink() {
-        symlink_file(src, dest).map(|_| ())
+        let target = if preserve_symlink {
+            &fs::read_link(src).with_context(|| RustupError::ReadingFile {
+                name: "symlink target for",
+                path: PathBuf::from(src),
+            })?
+        } else {
+            src
+        };
+        symlink_file(target, dest).map(|_| ())
     } else {
         fs::copy(src, dest)
             .with_context(|| {
@@ -271,15 +278,8 @@ pub(crate) fn copy_file(src: &Path, dest: &Path) -> Result<()> {
     }
 }
 
-pub(crate) fn remove_dir<'a, N>(
-    name: &'static str,
-    path: &'a Path,
-    notify_handler: &dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
-    notify_handler(Notification::RemovingDirectory(name, path).into());
+pub(crate) fn remove_dir(name: &'static str, path: &Path) -> Result<()> {
+    debug!(name, path = %path.display(), "removing directory");
     raw::remove_dir(path).with_context(|| RustupError::RemovingDirectory {
         name,
         path: PathBuf::from(path),
@@ -310,12 +310,11 @@ pub fn remove_file(name: &'static str, path: &Path) -> Result<()> {
 
 pub(crate) fn ensure_file_removed(name: &'static str, path: &Path) -> Result<()> {
     let result = remove_file(name, path);
-    if let Err(err) = &result {
-        if let Some(retry::Error { error: e, .. }) = err.downcast_ref::<retry::Error<io::Error>>() {
-            if e.kind() == io::ErrorKind::NotFound {
-                return Ok(());
-            }
-        }
+    if let Err(err) = &result
+        && let Some(retry::Error { error: e, .. }) = err.downcast_ref::<retry::Error<io::Error>>()
+        && e.kind() == io::ErrorKind::NotFound
+    {
+        return Ok(());
     }
     result.with_context(|| RustupError::RemovingFile {
         name,
@@ -398,41 +397,29 @@ pub(crate) fn format_path_for_display(path: &str) -> String {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_and_delete<'a, N>(
-    name: &'static str,
-    src: &'a Path,
-    dest: &'a Path,
-    notify_handler: &'a dyn Fn(N),
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
+fn copy_and_delete(name: &'static str, src: &Path, dest: &Path) -> Result<()> {
     // https://github.com/rust-lang/rustup/issues/1239
     // This uses std::fs::copy() instead of the faster std::fs::rename() to
     // avoid cross-device link errors.
     if src.is_dir() {
-        copy_dir(src, dest, notify_handler).and(remove_dir_all::remove_dir_all(src).with_context(
-            || RustupError::RemovingDirectory {
+        copy_dir(src, dest).and(remove_dir_all::remove_dir_all(src).with_context(|| {
+            RustupError::RemovingDirectory {
                 name,
                 path: PathBuf::from(src),
-            },
-        ))
+            }
+        }))
     } else {
         copy_file(src, dest).and(remove_file(name, src))
     }
 }
 
-pub fn rename<'a, N>(
+pub fn rename(
     name: &'static str,
-    src: &'a Path,
-    dest: &'a Path,
-    notify_handler: &'a dyn Fn(N),
+    src: &Path,
+    dest: &Path,
     #[allow(unused_variables)] // Only used on Linux
-    process: &Process,
-) -> Result<()>
-where
-    N: From<Notification<'a>>,
-{
+    permit_copy_rename: bool,
+) -> Result<()> {
     // https://github.com/rust-lang/rustup/issues/1870
     // 21 fib steps from 1 sums to ~28 seconds, hopefully more than enough
     // for our previous poor performance that avoided the race condition with
@@ -445,14 +432,17 @@ where
             Ok(()) => OperationResult::Ok(()),
             Err(e) => match e.kind() {
                 io::ErrorKind::PermissionDenied => {
-                    notify_handler(Notification::RenameInUse(src, dest).into());
+                    // Renaming encountered a file in use error and is retrying.
+                    // The InUse aspect is a heuristic - the OS specifies
+                    // Permission denied, but as we work in users home dirs and
+                    // running programs like virus scanner are known to cause this
+                    // the heuristic is quite good.
+                    info!("retrying renaming {} to {}", src.display(), dest.display());
                     OperationResult::Retry(e)
                 }
                 #[cfg(target_os = "linux")]
-                _ if process.var_os("RUSTUP_PERMIT_COPY_RENAME").is_some()
-                    && Some(EXDEV) == e.raw_os_error() =>
-                {
-                    match copy_and_delete(name, src, dest, notify_handler) {
+                _ if permit_copy_rename && Some(EXDEV) == e.raw_os_error() => {
+                    match copy_and_delete(name, src, dest) {
                         Ok(()) => OperationResult::Ok(()),
                         Err(_) => OperationResult::Err(e),
                     }
@@ -461,13 +451,14 @@ where
             },
         },
     )
-    .with_context(|| {
-        format!(
-            "could not rename {} file from '{}' to '{}'",
+    .map_err(|e| {
+        RustupError::RenamingFile {
             name,
-            src.display(),
-            dest.display()
-        )
+            src: PathBuf::from(src),
+            dest: PathBuf::from(dest),
+            source: e.error,
+        }
+        .into()
     })
 }
 
@@ -476,64 +467,19 @@ pub(crate) fn delete_dir_contents_following_links(dir_path: &Path) {
 
     match raw::open_dir_following_links(dir_path).and_then(|mut p| p.remove_dir_contents(None)) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            panic!("Unable to clean up {}: {:?}", dir_path.display(), e);
+            warn!("unable to clean up {}: {e}", dir_path.display());
         }
         _ => {}
     }
 }
 
-pub(crate) struct FileReaderWithProgress<'a> {
-    fh: io::BufReader<File>,
-    notify_handler: &'a dyn Fn(Notification<'_>),
-    nbytes: u64,
-    flen: u64,
-}
-
-impl<'a> FileReaderWithProgress<'a> {
-    pub(crate) fn new_file(
-        path: &Path,
-        notify_handler: &'a dyn Fn(Notification<'_>),
-    ) -> Result<Self> {
-        let fh = match File::open(path) {
-            Ok(fh) => fh,
-            Err(_) => {
-                bail!(RustupError::ReadingFile {
-                    name: "downloaded",
-                    path: path.to_path_buf(),
-                })
-            }
-        };
-
-        // Inform the tracker of the file size
-        let flen = fh.metadata()?.len();
-        (notify_handler)(Notification::DownloadContentLengthReceived(flen));
-
-        let fh = BufReader::with_capacity(8 * 1024 * 1024, fh);
-
-        Ok(FileReaderWithProgress {
-            fh,
-            notify_handler,
-            nbytes: 0,
-            flen,
-        })
-    }
-}
-
-impl io::Read for FileReaderWithProgress<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self.fh.read(buf) {
-            Ok(nbytes) => {
-                self.nbytes += nbytes as u64;
-                if nbytes != 0 {
-                    (self.notify_handler)(Notification::DownloadDataReceived(&buf[0..nbytes]));
-                }
-                if (nbytes == 0) || (self.flen == self.nbytes) {
-                    (self.notify_handler)(Notification::DownloadFinished);
-                }
-                Ok(nbytes)
-            }
-            Err(e) => Err(e),
-        }
+pub(crate) fn buffered(path: &Path) -> Result<BufReader<File>, anyhow::Error> {
+    match File::open(path) {
+        Ok(fh) => Ok(BufReader::with_capacity(8 * 1024 * 1024, fh)),
+        Err(_) => Err(anyhow!(RustupError::ReadingFile {
+            name: "downloaded",
+            path: path.to_path_buf(),
+        })),
     }
 }
 

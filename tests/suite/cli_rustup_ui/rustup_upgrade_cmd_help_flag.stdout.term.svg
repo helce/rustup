@@ -1,0 +1,89 @@
+<svg width="852px" height="596px" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .fg { fill: #AAAAAA }
+    .bg { fill: #000000 }
+    .fg-bright-cyan { fill: #55FFFF }
+    .fg-bright-green { fill: #55FF55 }
+    .fg-cyan { fill: #00AAAA }
+    .container {
+      padding: 0 10px;
+      line-height: 18px;
+    }
+    .bold { font-weight: bold; }
+    tspan {
+      font: 14px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+      white-space: pre;
+      line-height: 18px;
+    }
+  </style>
+
+  <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
+
+  <text xml:space="preserve" class="container fg">
+    <tspan x="10px" y="28px"><tspan>Update Rust toolchains and rustup</tspan>
+</tspan>
+    <tspan x="10px" y="46px">
+</tspan>
+    <tspan x="10px" y="64px"><tspan class="fg-bright-green bold">Usage:</tspan><tspan> </tspan><tspan class="fg-bright-cyan bold">rustup[EXE] update</tspan><tspan> </tspan><tspan class="fg-cyan">[OPTIONS]</tspan><tspan> </tspan><tspan class="fg-cyan">[TOOLCHAIN]...</tspan>
+</tspan>
+    <tspan x="10px" y="82px">
+</tspan>
+    <tspan x="10px" y="100px"><tspan class="fg-bright-green bold">Arguments:</tspan>
+</tspan>
+    <tspan x="10px" y="118px"><tspan>  </tspan><tspan class="fg-cyan">[TOOLCHAIN]...</tspan><tspan>  Toolchain name, such as 'stable', 'nightly', or '1.8.0'. For more information see</tspan>
+</tspan>
+    <tspan x="10px" y="136px"><tspan>                  `rustup help toolchain`</tspan>
+</tspan>
+    <tspan x="10px" y="154px">
+</tspan>
+    <tspan x="10px" y="172px"><tspan class="fg-bright-green bold">Options:</tspan>
+</tspan>
+    <tspan x="10px" y="190px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--no-self-update</tspan><tspan>  Don't perform self update when running the `rustup update` command</tspan>
+</tspan>
+    <tspan x="10px" y="208px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--force</tspan><tspan>           Force an update, even if some components are missing</tspan>
+</tspan>
+    <tspan x="10px" y="226px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--force-non-host</tspan><tspan>  Install toolchains that require an emulator. See</tspan>
+</tspan>
+    <tspan x="10px" y="244px"><tspan>                        https://github.com/rust-lang/rustup/wiki/Non-host-toolchains</tspan>
+</tspan>
+    <tspan x="10px" y="262px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">-h</tspan><tspan>, </tspan><tspan class="fg-bright-cyan bold">--help</tspan><tspan>            Print help</tspan>
+</tspan>
+    <tspan x="10px" y="280px">
+</tspan>
+    <tspan x="10px" y="298px"><tspan class="fg-bright-green bold">Discussion:</tspan>
+</tspan>
+    <tspan x="10px" y="316px"><tspan>  With no toolchain specified, the `update` command updates each of</tspan>
+</tspan>
+    <tspan x="10px" y="334px"><tspan>  the installed toolchains from the official release channels, then</tspan>
+</tspan>
+    <tspan x="10px" y="352px"><tspan>  updates rustup itself.</tspan>
+</tspan>
+    <tspan x="10px" y="370px">
+</tspan>
+    <tspan x="10px" y="388px"><tspan>  If given a toolchain argument then `update` updates that</tspan>
+</tspan>
+    <tspan x="10px" y="406px"><tspan>  toolchain, the same as `rustup toolchain install`.</tspan>
+</tspan>
+    <tspan x="10px" y="424px">
+</tspan>
+    <tspan x="10px" y="442px"><tspan>  Some environment variables allow you to customize certain parameters</tspan>
+</tspan>
+    <tspan x="10px" y="460px"><tspan>  in toolchain installation, including:</tspan>
+</tspan>
+    <tspan x="10px" y="478px">
+</tspan>
+    <tspan x="10px" y="496px"><tspan>  - `RUSTUP_CONCURRENT_DOWNLOADS`: the number of concurrent downloads.</tspan>
+</tspan>
+    <tspan x="10px" y="514px"><tspan>  - `RUSTUP_DOWNLOAD_TIMEOUT`: the download timeout in seconds.</tspan>
+</tspan>
+    <tspan x="10px" y="532px">
+</tspan>
+    <tspan x="10px" y="550px"><tspan>  See &lt;https://rust-lang.github.io/rustup/devel/environment-variables.html&gt;</tspan>
+</tspan>
+    <tspan x="10px" y="568px"><tspan>  for more info.</tspan>
+</tspan>
+    <tspan x="10px" y="586px">
+</tspan>
+  </text>
+
+</svg>

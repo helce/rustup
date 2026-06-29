@@ -1,17 +1,19 @@
 #[cfg(windows)]
 use std::fs;
-use std::{convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, path::Path, process::Command};
+use std::{convert::Infallible, env::consts::EXE_SUFFIX, ffi::OsStr, process::Command};
 
 #[cfg(windows)]
 use anyhow::Context;
 use anyhow::anyhow;
+use platforms::Platform;
 
 use crate::{
     RustupError, component_for_bin,
-    config::Cfg,
+    config::{ActiveSource, Cfg},
     dist::{
-        DistOptions, PartialToolchainDesc, Profile, ToolchainDesc,
+        DistOptions, PartialToolchainDesc, ToolchainDesc,
         config::Config,
+        download::DownloadCfg,
         manifest::{Component, ComponentStatus, Manifest},
         manifestation::{Changes, Manifestation},
         prefix::InstallPrefix,
@@ -27,17 +29,26 @@ use super::{
 /// An official toolchain installed on the local disk
 #[derive(Debug)]
 pub(crate) struct DistributableToolchain<'a> {
-    pub(super) toolchain: Toolchain<'a>,
+    pub(crate) toolchain: Toolchain<'a>,
     desc: ToolchainDesc,
 }
 
 impl<'a> DistributableToolchain<'a> {
+    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
+    pub(crate) async fn install(
+        options: DistOptions<'a, '_>,
+    ) -> anyhow::Result<(UpdateStatus, Self)> {
+        let (cfg, toolchain) = (options.cfg, options.toolchain);
+        let status = InstallMethod::Dist(options).install().await?;
+        Ok((status, Self::new(cfg, toolchain.clone())?))
+    }
+
     pub(crate) async fn from_partial(
-        toolchain: Option<PartialToolchainDesc>,
+        toolchain: Option<(PartialToolchainDesc, ActiveSource)>,
         cfg: &'a Cfg<'a>,
     ) -> anyhow::Result<Self> {
         Ok(Self::try_from(
-            &cfg.toolchain_from_partial(toolchain).await?,
+            &cfg.toolchain_from_partial(toolchain).await?.0,
         )?)
     }
 
@@ -76,22 +87,27 @@ impl<'a> DistributableToolchain<'a> {
                 let config = manifestation.read_config()?.unwrap_or_default();
                 let suggestion =
                     self.get_component_suggestion(&component, &config, &manifest, false);
+                let desc = self.desc.clone();
                 // Check if the target is supported.
                 if !targ_pkg
                     .components
                     .iter()
                     .any(|c| c.target() == component.target())
                 {
+                    let target = component.target.expect("component target should be known");
+                    if let Some(platform) = Platform::find(&target) {
+                        return Err(RustupError::UnavailableTarget { desc, platform }.into());
+                    };
                     return Err(RustupError::UnknownTarget {
-                        desc: self.desc.clone(),
-                        target: component.target.expect("component target should be known"),
+                        desc,
+                        target,
                         suggestion,
                     }
                     .into());
                 }
                 return Err(RustupError::UnknownComponent {
-                    desc: self.desc.clone(),
-                    component: component.description(&manifest),
+                    desc,
+                    component: manifest.description(&component),
                     suggestion,
                 }
                 .into());
@@ -103,17 +119,14 @@ impl<'a> DistributableToolchain<'a> {
             remove_components: vec![],
         };
 
-        let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
-
+        let download_cfg = DownloadCfg::new(self.toolchain.cfg);
         manifestation
             .update(
-                &manifest,
+                manifest,
                 changes,
                 false,
                 &download_cfg,
-                &self.desc.manifest_name(),
+                self.desc.manifest_name(),
                 false,
             )
             .await?;
@@ -134,6 +147,12 @@ impl<'a> DistributableToolchain<'a> {
         components: &[&str],
         targets: &[&str],
     ) -> anyhow::Result<bool> {
+        // Performance optimization: avoid loading the manifest (which can be expensive)
+        // if there are no components/targets to check.
+        if components.is_empty() && targets.is_empty() {
+            return Ok(true);
+        }
+
         let manifestation = self.get_manifestation()?;
         let manifest = manifestation.load_manifest()?;
         let manifest = match manifest {
@@ -150,8 +169,7 @@ impl<'a> DistributableToolchain<'a> {
         // check if all the components we want are installed
         let wanted_components = components.iter().all(|name| {
             installed_components.iter().any(|status| {
-                let cname = status.component.short_name(&manifest);
-                let cname = cname.as_str();
+                let cname = manifest.short_name(&status.component);
                 let cnameim = status.component.short_name_in_manifest();
                 let cnameim = cnameim.as_str();
                 (cname == *name || cnameim == *name) && status.installed
@@ -240,8 +258,8 @@ impl<'a> DistributableToolchain<'a> {
                 .map(|c| {
                     (
                         damerau_levenshtein(
-                            &c.component.name(manifest)[..],
-                            &component.name(manifest)[..],
+                            &manifest.name(&c.component)[..],
+                            &manifest.name(component)[..],
                         ),
                         c,
                     )
@@ -256,7 +274,7 @@ impl<'a> DistributableToolchain<'a> {
                     (
                         damerau_levenshtein(
                             &c.component.name_in_manifest()[..],
-                            &component.name(manifest)[..],
+                            &manifest.name(component)[..],
                         ),
                         c,
                     )
@@ -265,7 +283,9 @@ impl<'a> DistributableToolchain<'a> {
                 .expect("There should be always at least one component");
 
             let mut closest_distance = short_name_distance;
-            let mut closest_match = short_name_distance.1.component.short_name(manifest);
+            let mut closest_match = manifest
+                .short_name(&short_name_distance.1.component)
+                .to_owned();
 
             // Find closer suggestion
             if short_name_distance.0 > long_name_distance.0 {
@@ -285,8 +305,8 @@ impl<'a> DistributableToolchain<'a> {
                 }
             } else {
                 // Check if only targets differ
-                if closest_distance.1.component.short_name(manifest)
-                    == component.short_name(manifest)
+                if manifest.short_name(&closest_distance.1.component)
+                    == manifest.short_name(component)
                 {
                     closest_match = short_name_distance.1.component.target();
                 }
@@ -326,93 +346,6 @@ impl<'a> DistributableToolchain<'a> {
         InstallPrefix::from(self.toolchain.path().to_owned()).guess_v1_manifest()
     }
 
-    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
-    pub(crate) async fn install(
-        cfg: &'a Cfg<'a>,
-        toolchain: &ToolchainDesc,
-        components: &[&str],
-        targets: &[&str],
-        profile: Profile,
-        force: bool,
-    ) -> anyhow::Result<(UpdateStatus, DistributableToolchain<'a>)> {
-        let hash_path = cfg.get_hash_file(toolchain, true)?;
-        let update_hash = Some(&hash_path as &Path);
-
-        let status = InstallMethod::Dist(DistOptions {
-            cfg,
-            toolchain,
-            profile,
-            update_hash,
-            dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
-            force,
-            allow_downgrade: false,
-            exists: false,
-            old_date_version: None,
-            components,
-            targets,
-        })
-        .install()
-        .await?;
-        Ok((status, Self::new(cfg, toolchain.clone())?))
-    }
-
-    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
-    pub(crate) async fn update(
-        &mut self,
-        components: &[&str],
-        targets: &[&str],
-        profile: Profile,
-    ) -> anyhow::Result<UpdateStatus> {
-        self.update_extra(components, targets, profile, true, false)
-            .await
-    }
-
-    /// Update a toolchain with control over the channel behaviour
-    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all)]
-    pub(crate) async fn update_extra(
-        &mut self,
-        components: &[&str],
-        targets: &[&str],
-        profile: Profile,
-        force: bool,
-        allow_downgrade: bool,
-    ) -> anyhow::Result<UpdateStatus> {
-        let old_date_version =
-            // Ignore a missing manifest: we can't report the old version
-            // correctly, and it probably indicates an incomplete install, so do
-            // not report an old rustc version either.
-            self.get_manifest()
-                .map(|m| {
-                    (
-                        m.date,
-                        // should rustc_version be a free function on a trait?
-                        // note that prev_version can be junk if the rustc component is missing ...
-                        self.toolchain.rustc_version(),
-                    )
-                })
-                .ok();
-
-        let cfg = self.toolchain.cfg;
-        let hash_path = cfg.get_hash_file(&self.desc, true)?;
-        let update_hash = Some(&hash_path as &Path);
-
-        InstallMethod::Dist(DistOptions {
-            cfg,
-            toolchain: &self.desc,
-            profile,
-            update_hash,
-            dl_cfg: cfg.download_cfg(&|n| (cfg.notify_handler)(n.into())),
-            force,
-            allow_downgrade,
-            exists: true,
-            old_date_version,
-            components,
-            targets,
-        })
-        .install()
-        .await
-    }
-
     pub fn recursion_error(&self, binary_lossy: String) -> Result<Infallible, anyhow::Error> {
         let prefix = InstallPrefix::from(self.toolchain.path());
         let manifestation = Manifestation::open(prefix, self.desc.target.clone())?;
@@ -423,9 +356,9 @@ impl<'a> DistributableToolchain<'a> {
         if let Some(component_name) = component_for_bin(&binary_lossy) {
             let component_status = component_statuses
                 .iter()
-                .find(|cs| cs.component.short_name(&manifest) == component_name)
+                .find(|cs| manifest.short_name(&cs.component) == component_name)
                 .ok_or_else(|| anyhow!("component {component_name} should be in the manifest"))?;
-            let short_name = component_status.component.short_name(&manifest);
+            let short_name = manifest.short_name(&component_status.component);
             if !component_status.available {
                 Err(anyhow!(
                     "the '{short_name}' component which provides the command '{binary_lossy}' is not available for the '{desc}' toolchain"
@@ -441,7 +374,7 @@ impl<'a> DistributableToolchain<'a> {
                     _ => format!("--toolchain {} ", self.toolchain.name()),
                 };
                 Err(anyhow!(
-                    "'{binary_lossy}' is not installed for the toolchain '{desc}'.\nTo install, run `rustup component add {selector}{component_name}`"
+                    "'{binary_lossy}' is not installed for the toolchain '{desc}'.\nhelp: run `rustup component add {selector}{component_name}` to install it"
                 ))
             }
         } else {
@@ -485,7 +418,7 @@ impl<'a> DistributableToolchain<'a> {
                 }
                 return Err(RustupError::UnknownComponent {
                     desc: self.desc.clone(),
-                    component: component.description(&manifest),
+                    component: manifest.description(&component),
                     suggestion,
                 }
                 .into());
@@ -497,17 +430,14 @@ impl<'a> DistributableToolchain<'a> {
             remove_components: vec![component],
         };
 
-        let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
-
+        let download_cfg = DownloadCfg::new(self.toolchain.cfg);
         manifestation
             .update(
-                &manifest,
+                manifest,
                 changes,
                 false,
                 &download_cfg,
-                &self.desc.manifest_name(),
+                self.desc.manifest_name(),
                 false,
             )
             .await?;
@@ -516,12 +446,14 @@ impl<'a> DistributableToolchain<'a> {
     }
 
     pub async fn show_dist_version(&self) -> anyhow::Result<Option<String>> {
-        let update_hash = self.toolchain.cfg.get_hash_file(&self.desc, false)?;
-        let notify_handler =
-            &|n: crate::dist::Notification<'_>| (self.toolchain.cfg.notify_handler)(n.into());
-        let download_cfg = self.toolchain.cfg.download_cfg(&notify_handler);
-
-        match crate::dist::dl_v2_manifest(download_cfg, Some(&update_hash), &self.desc).await? {
+        match DownloadCfg::new(self.toolchain.cfg)
+            .dl_v2_manifest(
+                Some(&self.toolchain.cfg.get_hash_file(&self.desc, false)?),
+                &self.desc,
+                self.toolchain.cfg,
+            )
+            .await?
+        {
             Some((manifest, _)) => Ok(Some(manifest.get_rust_version()?.to_string())),
             None => Ok(None),
         }

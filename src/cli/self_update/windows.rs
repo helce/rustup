@@ -5,9 +5,8 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
-use std::sync::{Arc, Mutex};
 #[cfg(any(test, feature = "test"))]
-use std::sync::{LockResult, MutexGuard};
+use std::sync::{LockResult, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
@@ -17,14 +16,16 @@ use windows_registry::{CURRENT_USER, HSTRING, Key};
 use windows_result::HRESULT;
 use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_INVALID_DATA};
 
-use super::super::errors::*;
+use super::super::errors::CliError;
 use super::common;
 use super::{InstallOpts, install_bins, report_error};
-use crate::cli::{download_tracker::DownloadTracker, markdown::md};
+use crate::cli::markdown::md;
+use crate::config::Cfg;
 use crate::dist::TargetTriple;
+use crate::dist::download::DownloadCfg;
 use crate::download::download_file;
-use crate::process::{Process, terminalsource::ColorableTerminal};
-use crate::utils::{self, Notification};
+use crate::process::{ColorableTerminal, Process};
+use crate::utils;
 
 pub(crate) fn ensure_prompt(process: &Process) -> Result<()> {
     writeln!(process.stdout().lock(),)?;
@@ -91,36 +92,35 @@ pub(crate) fn choose_vs_install(process: &Process) -> Result<Option<VsInstallPla
 pub(super) async fn maybe_install_msvc(
     term: &mut ColorableTerminal,
     no_prompt: bool,
-    quiet: bool,
     opts: &InstallOpts<'_>,
-    process: &Process,
+    cfg: &Cfg<'_>,
 ) -> Result<()> {
-    let Some(plan) = do_msvc_check(opts, process) else {
+    let Some(plan) = do_msvc_check(opts, cfg.process) else {
         return Ok(());
     };
 
     if no_prompt {
         warn!("installing msvc toolchain without its prerequisites");
-    } else if !quiet && plan == VsInstallPlan::Automatic {
+    } else if !cfg.quiet && plan == VsInstallPlan::Automatic {
         md(term, MSVC_AUTO_INSTALL_MESSAGE);
-        match choose_vs_install(process)? {
+        match choose_vs_install(cfg.process)? {
             Some(VsInstallPlan::Automatic) => {
-                match try_install_msvc(opts, process).await {
+                match try_install_msvc(opts, cfg).await {
                     Err(e) => {
                         // Make sure the console doesn't exit before the user can
                         // see the error and give the option to continue anyway.
-                        report_error(&e, process);
-                        if !common::question_bool("\nContinue?", false, process)? {
+                        report_error(&e, cfg.process);
+                        if !common::question_bool("\nContinue?", false, cfg.process)? {
                             info!("aborting installation");
                         }
                     }
-                    Ok(ContinueInstall::No) => ensure_prompt(process)?,
+                    Ok(ContinueInstall::No) => ensure_prompt(cfg.process)?,
                     _ => {}
                 }
             }
             Some(VsInstallPlan::Manual) => {
                 md(term, MSVC_MANUAL_INSTALL_MESSAGE);
-                if !common::question_bool("\nContinue?", false, process)? {
+                if !common::question_bool("\nContinue?", false, cfg.process)? {
                     info!("aborting installation");
                 }
             }
@@ -129,7 +129,7 @@ pub(super) async fn maybe_install_msvc(
     } else {
         md(term, MSVC_MESSAGE);
         md(term, MSVC_MANUAL_INSTALL_MESSAGE);
-        if !common::question_bool("\nContinue?", false, process)? {
+        if !common::question_bool("\nContinue?", false, cfg.process)? {
             info!("aborting installation");
         }
     }
@@ -260,7 +260,7 @@ pub(crate) enum ContinueInstall {
 /// but the rustup install should not be continued at this time.
 pub(crate) async fn try_install_msvc(
     opts: &InstallOpts<'_>,
-    process: &Process,
+    cfg: &Cfg<'_>,
 ) -> Result<ContinueInstall> {
     // download the installer
     let visual_studio_url = utils::parse_url("https://aka.ms/vs/17/release/vs_community.exe")?;
@@ -271,22 +271,14 @@ pub(crate) async fn try_install_msvc(
         .context("error creating temp directory")?;
 
     let visual_studio = tempdir.path().join("vs_setup.exe");
-    let download_tracker = Arc::new(Mutex::new(DownloadTracker::new_with_display_progress(
-        true, process,
-    )));
-    download_tracker.lock().unwrap().download_finished();
-
+    let dl_cfg = DownloadCfg::new(cfg);
     info!("downloading Visual Studio installer");
     download_file(
         &visual_studio_url,
         &visual_studio,
         None,
-        &move |n| {
-            download_tracker.lock().unwrap().handle_notification(
-                &crate::notifications::Notification::Install(crate::dist::Notification::Utils(n)),
-            );
-        },
-        process,
+        None,
+        dl_cfg.process,
     )
     .await?;
 
@@ -303,10 +295,10 @@ pub(crate) async fn try_install_msvc(
 
     // It's possible an earlier or later version of the Windows SDK has been
     // installed separately from Visual Studio so installing it can be skipped.
-    if !has_windows_sdk_libs(process) {
+    if !has_windows_sdk_libs(cfg.process) {
         cmd.args([
             "--add",
-            "Microsoft.VisualStudio.Component.Windows11SDK.22000",
+            "Microsoft.VisualStudio.Component.Windows11SDK.26100",
         ]);
     }
     info!("running the Visual Studio install");
@@ -336,8 +328,8 @@ pub(crate) async fn try_install_msvc(
                 // It's possible that the installer returned a non-zero exit code
                 // even though the required components were successfully installed.
                 // In that case we warn about the error but continue on.
-                let have_msvc = do_msvc_check(opts, process).is_none();
-                let has_libs = has_windows_sdk_libs(process);
+                let have_msvc = do_msvc_check(opts, cfg.process).is_none();
+                let has_libs = has_windows_sdk_libs(cfg.process);
                 if have_msvc && has_libs {
                     warn!("Visual Studio is installed but a problem occurred during installation");
                     warn!("{}", err);
@@ -371,7 +363,7 @@ pub fn complete_windows_uninstall(process: &Process) -> Result<utils::ExitCode> 
 
     // Now that the parent has exited there are hopefully no more files open in CARGO_HOME
     let cargo_home = process.cargo_home()?;
-    utils::remove_dir("cargo_home", &cargo_home, &|_: Notification<'_>| ())?;
+    utils::remove_dir("cargo_home", &cargo_home)?;
 
     // Now, run a *system* binary to inherit the DELETE_ON_CLOSE
     // handle to *this* process, then exit. The OS will delete the gc
@@ -383,7 +375,7 @@ pub fn complete_windows_uninstall(process: &Process) -> Result<utils::ExitCode> 
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .context(CLIError::WindowsUninstallMadness)?;
+        .context(CliError::WindowsUninstallMadness)?;
 
     Ok(utils::ExitCode(0))
 }
@@ -406,7 +398,7 @@ pub(crate) fn wait_for_parent() -> Result<()> {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
             let err = io::Error::last_os_error();
-            return Err(err).context(CLIError::WindowsUninstallMadness);
+            return Err(err).context(CliError::WindowsUninstallMadness);
         }
 
         let snapshot = scopeguard::guard(snapshot, |h| {
@@ -414,13 +406,13 @@ pub(crate) fn wait_for_parent() -> Result<()> {
         });
 
         let mut entry: PROCESSENTRY32 = mem::zeroed();
-        entry.dwSize = mem::size_of::<PROCESSENTRY32>() as u32;
+        entry.dwSize = size_of::<PROCESSENTRY32>() as u32;
 
         // Iterate over system processes looking for ours
         let success = Process32First(*snapshot, &mut entry);
         if success == 0 {
             let err = io::Error::last_os_error();
-            return Err(err).context(CLIError::WindowsUninstallMadness);
+            return Err(err).context(CliError::WindowsUninstallMadness);
         }
 
         let this_pid = GetCurrentProcessId();
@@ -428,7 +420,7 @@ pub(crate) fn wait_for_parent() -> Result<()> {
             let success = Process32Next(*snapshot, &mut entry);
             if success == 0 {
                 let err = io::Error::last_os_error();
-                return Err(err).context(CLIError::WindowsUninstallMadness);
+                return Err(err).context(CliError::WindowsUninstallMadness);
             }
         }
 
@@ -453,7 +445,7 @@ pub(crate) fn wait_for_parent() -> Result<()> {
 
         if res != WAIT_OBJECT_0 {
             let err = io::Error::last_os_error();
-            return Err(err).context(CLIError::WindowsUninstallMadness);
+            return Err(err).context(CliError::WindowsUninstallMadness);
         }
     }
 
@@ -468,7 +460,7 @@ pub(crate) fn do_add_to_path(process: &Process) -> Result<()> {
 
 fn _apply_new_path(new_path: Option<HSTRING>) -> Result<()> {
     use std::ptr;
-    use windows_sys::Win32::Foundation::*;
+    use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutA, WM_SETTINGCHANGE,
     };
@@ -522,7 +514,7 @@ fn get_windows_path_var() -> Result<Option<HSTRING>> {
             Ok(None)
         }
         Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND) => Ok(Some(HSTRING::new())),
-        Err(e) => Err(e).context(CLIError::WindowsUninstallMadness),
+        Err(e) => Err(e).context(CliError::WindowsUninstallMadness),
     }
 }
 
@@ -690,7 +682,6 @@ pub(crate) fn self_replace(process: &Process) -> Result<utils::ExitCode> {
 // https://stackoverflow.com/questions/10319526/understanding-a-self-deleting-program-in-c
 pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
     use std::io;
-    use std::mem;
     use std::ptr;
     use std::thread;
     use std::time::Duration;
@@ -715,12 +706,12 @@ pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
     let numbah: u32 = rand::random();
     let gc_exe = work_path.join(format!("rustup-gc-{numbah:x}.exe"));
     // Copy rustup (probably this process's exe) to the gc exe
-    utils::copy_file(&rustup_path, &gc_exe)?;
+    utils::copy_file_symlink_to_source(&rustup_path, &gc_exe)?;
     let gc_exe_win: Vec<_> = gc_exe.as_os_str().encode_wide().chain(Some(0)).collect();
 
     // Make the sub-process opened by gc exe inherit its attribute.
     let sa = SECURITY_ATTRIBUTES {
-        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: ptr::null_mut(),
         bInheritHandle: 1,
     };
@@ -740,7 +731,7 @@ pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
 
         if gc_handle == INVALID_HANDLE_VALUE {
             let err = io::Error::last_os_error();
-            return Err(err).context(CLIError::WindowsUninstallMadness);
+            return Err(err).context(CliError::WindowsUninstallMadness);
         }
 
         scopeguard::guard(gc_handle, |h| {
@@ -750,7 +741,7 @@ pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
 
     Command::new(gc_exe)
         .spawn()
-        .context(CLIError::WindowsUninstallMadness)?;
+        .context(CliError::WindowsUninstallMadness)?;
 
     // The catch 22 article says we must sleep here to give
     // Windows a chance to bump the processes file reference
@@ -842,7 +833,7 @@ mod tests {
     fn windows_install_does_not_add_path_twice() {
         assert_eq!(
             None,
-            super::_add_to_path(
+            _add_to_path(
                 HSTRING::from(r"c:\users\example\.cargo\bin;foo"),
                 HSTRING::from(r"c:\users\example\.cargo\bin")
             )
@@ -863,12 +854,11 @@ mod tests {
 
         assert_eq!(
             final_path,
-            super::_add_to_path(HSTRING::from_wide(&initial_path), HSTRING::from(cargo_home))
-                .unwrap()
+            _add_to_path(HSTRING::from_wide(&initial_path), HSTRING::from(cargo_home)).unwrap()
         );
         assert_eq!(
             HSTRING::from_wide(&initial_path),
-            super::_remove_from_path(HSTRING::from(final_path), HSTRING::from(cargo_home)).unwrap()
+            _remove_from_path(HSTRING::from(final_path), HSTRING::from(cargo_home)).unwrap()
         );
     }
 
@@ -882,10 +872,7 @@ mod tests {
         {
             // Can't compare the Results as Eq isn't derived; thanks error-chain.
             #![allow(clippy::unit_cmp)]
-            assert_eq!(
-                (),
-                super::_apply_new_path(Some(HSTRING::from("foo"))).unwrap()
-            );
+            assert_eq!((), _apply_new_path(Some(HSTRING::from("foo"))).unwrap());
         }
         let environment = CURRENT_USER.create("Environment").unwrap();
         let path = environment.get_value("PATH").unwrap();
@@ -907,7 +894,7 @@ mod tests {
         {
             // Can't compare the Results as Eq isn't derived; thanks error-chain.
             #![allow(clippy::unit_cmp)]
-            assert_eq!((), super::_apply_new_path(Some(HSTRING::new())).unwrap());
+            assert_eq!((), _apply_new_path(Some(HSTRING::new())).unwrap());
         }
         let reg_value = environment.get_value("PATH");
         match reg_value {
@@ -935,7 +922,7 @@ mod tests {
         // Ok(None) signals no change to the PATH setting layer
         assert_eq!(
             None,
-            super::_with_path_cargo_home_bin(|_, _| panic!("called"), &tp.process).unwrap()
+            _with_path_cargo_home_bin(|_, _| panic!("called"), &tp.process).unwrap()
         );
 
         assert_eq!(
@@ -952,14 +939,14 @@ mod tests {
         let environment = CURRENT_USER.create("Environment").unwrap();
         environment.remove_value("PATH").unwrap();
 
-        assert_eq!(Some(HSTRING::new()), super::get_windows_path_var().unwrap());
+        assert_eq!(Some(HSTRING::new()), get_windows_path_var().unwrap());
     }
 
     #[test]
     fn windows_uninstall_removes_semicolon_from_path_prefix() {
         assert_eq!(
             HSTRING::from("foo"),
-            super::_remove_from_path(
+            _remove_from_path(
                 HSTRING::from(r"c:\users\example\.cargo\bin;foo"),
                 HSTRING::from(r"c:\users\example\.cargo\bin"),
             )
@@ -971,7 +958,7 @@ mod tests {
     fn windows_uninstall_removes_semicolon_from_path_suffix() {
         assert_eq!(
             HSTRING::from("foo"),
-            super::_remove_from_path(
+            _remove_from_path(
                 HSTRING::from(r"foo;c:\users\example\.cargo\bin"),
                 HSTRING::from(r"c:\users\example\.cargo\bin"),
             )

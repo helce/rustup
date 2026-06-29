@@ -15,7 +15,6 @@ use crate::dist::component::package::{INSTALLER_VERSION, VERSION_FILE};
 use crate::dist::component::transaction::Transaction;
 use crate::dist::prefix::InstallPrefix;
 use crate::errors::RustupError;
-use crate::process::Process;
 use crate::utils;
 
 const COMPONENTS_FILE: &str = "components";
@@ -30,13 +29,13 @@ impl Components {
         let c = Self { prefix };
 
         // Validate that the metadata uses a format we know
-        if let Some(v) = c.read_version()? {
-            if v != INSTALLER_VERSION {
-                bail!(
-                    "unsupported metadata version in existing installation: {}",
-                    v
-                );
-            }
+        if let Some(v) = c.read_version()?
+            && v != INSTALLER_VERSION
+        {
+            bail!(
+                "unsupported metadata version in existing installation: {}",
+                v
+            );
         }
 
         Ok(c)
@@ -55,7 +54,7 @@ impl Components {
             Ok(None)
         }
     }
-    fn write_version(&self, tx: &mut Transaction<'_>) -> Result<()> {
+    fn write_version(&self, tx: &mut Transaction) -> Result<()> {
         tx.modify_file(self.prefix.rel_manifest_file(VERSION_FILE))?;
         utils::write_file(
             VERSION_FILE,
@@ -79,7 +78,7 @@ impl Components {
             })
             .collect())
     }
-    pub(crate) fn add<'a>(&self, name: &str, tx: Transaction<'a>) -> ComponentBuilder<'a> {
+    pub(crate) fn add(&self, name: &str, tx: Transaction) -> ComponentBuilder {
         ComponentBuilder {
             components: self.clone(),
             name: name.to_owned(),
@@ -89,21 +88,21 @@ impl Components {
     }
     pub fn find(&self, name: &str) -> Result<Option<Component>> {
         let result = self.list()?;
-        Ok(result.into_iter().find(|c| (c.name() == name)))
+        Ok(result.into_iter().find(|c| c.name() == name))
     }
     pub(crate) fn prefix(&self) -> InstallPrefix {
         self.prefix.clone()
     }
 }
 
-pub(crate) struct ComponentBuilder<'a> {
+pub(crate) struct ComponentBuilder {
     components: Components,
     name: String,
     parts: Vec<ComponentPart>,
-    tx: Transaction<'a>,
+    tx: Transaction,
 }
 
-impl<'a> ComponentBuilder<'a> {
+impl ComponentBuilder {
     pub(crate) fn copy_file(&mut self, path: PathBuf, src: &Path) -> Result<()> {
         self.parts.push(ComponentPart {
             kind: ComponentPartKind::File,
@@ -132,7 +131,7 @@ impl<'a> ComponentBuilder<'a> {
         });
         self.tx.move_dir(&self.name, path, src)
     }
-    pub(crate) fn finish(mut self) -> Result<Transaction<'a>> {
+    pub(crate) fn finish(mut self) -> Result<Transaction> {
         // Write component manifest
         let path = self.components.rel_component_manifest(&self.name);
         let abs_path = self.components.prefix.abs_path(&path);
@@ -255,18 +254,14 @@ impl Component {
         }
         Ok(result)
     }
-    pub fn uninstall<'a>(
-        &self,
-        mut tx: Transaction<'a>,
-        process: &Process,
-    ) -> Result<Transaction<'a>> {
+    pub fn uninstall(&self, mut tx: Transaction) -> Result<Transaction> {
         // Update components file
         let path = self.components.rel_components_file();
         let abs_path = self.components.prefix.abs_path(&path);
         let temp = tx.temp().new_file()?;
         utils::filter_file("components", &abs_path, &temp, |l| l != self.name)?;
         tx.modify_file(path)?;
-        utils::rename("components", &temp, &abs_path, tx.notify_handler(), process)?;
+        utils::rename("components", &temp, &abs_path, tx.permit_copy_rename)?;
 
         // TODO: If this is the last component remove the components file
         // and the version file.

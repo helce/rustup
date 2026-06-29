@@ -28,10 +28,11 @@ pub use crate::cli::self_update::{RegistryGuard, RegistryValueId, USER_PATH, get
 
 mod clitools;
 pub use clitools::{
-    CliTestContext, Config, SanitizedOutput, Scenario, SelfUpdateTestContext, output_release_file,
-    print_command, print_indented,
+    Assert, CliTestContext, Config, SanitizedOutput, Scenario, SelfUpdateTestContext,
+    output_release_file, print_command, print_indented,
 };
 pub(crate) mod dist;
+pub use dist::DistContext;
 pub(crate) mod mock;
 pub use mock::{MockComponentBuilder, MockFile, MockInstallerBuilder};
 
@@ -119,7 +120,7 @@ fn tempdir_in_with_prefix<P: AsRef<Path>>(path: P, prefix: &str) -> io::Result<P
     Ok(tempfile::Builder::new()
         .prefix(prefix)
         .tempdir_in(path.as_ref())?
-        .into_path())
+        .keep())
 }
 
 /// What is this host's triple - seems very redundant with from_host_or_build()
@@ -157,6 +158,8 @@ pub fn this_host_triple() -> String {
         "powerpc64le"
     } else if cfg!(target_arch = "s390x") {
         "s390x"
+    } else if cfg!(target_arch = "sparc64") {
+        "sparcv9"
     } else {
         unimplemented!()
     };
@@ -168,6 +171,12 @@ pub fn this_host_triple() -> String {
         "unknown-illumos"
     } else if cfg!(target_os = "freebsd") {
         "unknown-freebsd"
+    } else if cfg!(target_os = "solaris") {
+        if cfg!(target_arch = "sparc64") {
+            "sun-solaris"
+        } else {
+            "pc-solaris"
+        }
     } else {
         unimplemented!()
     };

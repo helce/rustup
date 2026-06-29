@@ -33,7 +33,7 @@ RUSTUP_QUIET=no
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
     cat <<EOF
-rustup-init 1.28.2 (d1f31992a 2025-04-28)
+rustup-init 1.29.0 (d243d7d4e 2026-03-04)
 
 The installer for rustup
 
@@ -79,6 +79,13 @@ main() {
     get_architecture || return 1
     local _arch="$RETVAL"
     assert_nz "$_arch" "arch"
+
+    local _default_host_override=""
+    case "$_arch" in
+        *windows*)
+            _default_host_override="--default-host=$_arch"
+            ;;
+    esac
 
     local _ext=""
     case "$_arch" in
@@ -177,9 +184,9 @@ main() {
             exit 1;
         fi
 
-        ignore "$_file" "$@" < /dev/tty
+        ignore "$_file" ${_default_host_override:+"$_default_host_override"} "$@" < /dev/tty
     else
-        ignore "$_file" "$@"
+        ignore "$_file" ${_default_host_override:+"$_default_host_override"} "$@"
     fi
 
     local _retval=$?
@@ -380,7 +387,7 @@ get_architecture() {
             # See: <https://support.apple.com/en-us/HT208436>
 
             # Avoid `sysctl: unknown oid` stderr output and/or non-zero exit code.
-            if sysctl hw.optional.x86_64 2> /dev/null || true | grep -q ': 1'; then
+            if (sysctl hw.optional.x86_64 2> /dev/null || true) | grep -q ': 1'; then
                 _cputype=x86_64
             fi
         elif [ "$_cputype" = x86_64 ]; then
@@ -389,7 +396,7 @@ get_architecture() {
             # Rosetta 2 is built exclusively for x86-64 and cannot run i386 binaries.
 
             # Avoid `sysctl: unknown oid` stderr output and/or non-zero exit code.
-            if sysctl hw.optional.arm64 2> /dev/null || true | grep -q ': 1'; then
+            if (sysctl hw.optional.arm64 2> /dev/null || true) | grep -q ': 1'; then
                 _cputype=arm64
             fi
         fi
@@ -444,6 +451,14 @@ get_architecture() {
 
         illumos)
             _ostype=unknown-illumos
+            ;;
+
+        SunOS)
+            if [ "$_cputype" = sun4v ]; then
+               _ostype=sun-solaris
+            else
+               _ostype=pc-solaris
+            fi
             ;;
 
         MINGW* | MSYS* | CYGWIN* | Windows_NT)
@@ -522,6 +537,9 @@ get_architecture() {
 
         s390x)
             _cputype=s390x
+            ;;
+        sun4v)
+            _cputype=sparcv9
             ;;
         riscv64)
             _cputype=riscv64gc
@@ -666,7 +684,22 @@ downloader() {
     local _status
     local _retry
     if check_cmd curl; then
-        _dld=curl
+        # Check if we have a broken snap curl
+        # https://github.com/boukendesho/curl-snap/issues/1
+        _curl_path=$(command -v curl)
+        if echo "$_curl_path" | grep "/snap/" > /dev/null 2>&1; then
+            if check_cmd wget; then
+                _dld=wget
+            else
+                err "curl installed with snap cannot be used to install Rust"
+                err "due to missing permissions. Please uninstall it and"
+                err "reinstall curl with a different package manager (e.g., apt)."
+                err "See https://github.com/boukendesho/curl-snap/issues/1"
+                exit 1
+            fi
+        else
+            _dld=curl
+        fi
     elif check_cmd wget; then
         _dld=wget
     else

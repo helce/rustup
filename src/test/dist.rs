@@ -1,25 +1,77 @@
 //! Tools for building and working with the filesystem of a mock Rust
 //! distribution server, with v1 and v2 manifests.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use url::Url;
-
-use crate::dist::{
-    Profile, TargetTriple,
-    manifest::{
-        Component, CompressionKind, HashedBinary, Manifest, ManifestVersion, Package,
-        PackageTargets, Renamed, TargetedPackage,
-    },
-};
 
 use super::clitools::hard_link;
 use super::mock::MockInstallerBuilder;
 use super::{CROSS_ARCH1, CROSS_ARCH2, MULTI_ARCH1, create_hash, this_host_triple};
+use crate::dist::{
+    DEFAULT_DIST_SERVER, Profile, TargetTriple,
+    component::{Components, DirectoryPackage, Transaction},
+    manifest::{
+        Component, CompressionKind, HashedBinary, Manifest, ManifestVersion, Package,
+        PackageTargets, Renamed, TargetedPackage,
+    },
+    prefix::InstallPrefix,
+    temp,
+};
+use crate::process::TestProcess;
+
+pub struct DistContext {
+    pub pkg_dir: tempfile::TempDir,
+    pub inst_dir: tempfile::TempDir,
+    pub prefix: InstallPrefix,
+    _tmp_dir: tempfile::TempDir,
+    pub cx: Arc<temp::Context>,
+    pub tp: TestProcess,
+}
+
+impl DistContext {
+    pub fn new(mock: Option<MockInstallerBuilder>) -> anyhow::Result<Self> {
+        let pkg_dir = tempfile::Builder::new().prefix("rustup").tempdir()?;
+        if let Some(mock) = mock {
+            mock.build(pkg_dir.path());
+        }
+
+        let inst_dir = tempfile::Builder::new().prefix("rustup").tempdir()?;
+        let prefix = InstallPrefix::from(inst_dir.path().to_owned());
+        let tmp_dir = tempfile::Builder::new().prefix("rustup").tempdir()?;
+
+        Ok(Self {
+            pkg_dir,
+            inst_dir,
+            prefix,
+            cx: Arc::new(temp::Context::new(
+                tmp_dir.path().to_owned(),
+                DEFAULT_DIST_SERVER,
+            )),
+            tp: TestProcess::default(),
+            _tmp_dir: tmp_dir,
+        })
+    }
+
+    pub fn start(&self) -> anyhow::Result<(Transaction, Components, DirectoryPackage<&Path>)> {
+        let tx = self.transaction();
+        let components = Components::open(self.prefix.clone())?;
+        let pkg = DirectoryPackage::new(self.pkg_dir.path(), true)?;
+        Ok((tx, components, pkg))
+    }
+
+    pub fn transaction(&self) -> Transaction {
+        Transaction::new(
+            self.prefix.clone(),
+            self.cx.clone(),
+            self.tp.process.permit_copy_rename(),
+        )
+    }
+}
 
 pub(super) struct Release {
     // Either "nightly", "stable", "beta", or an explicit version number
@@ -505,7 +557,7 @@ pub(crate) struct MockPackage {
 
 #[derive(Debug, Hash, Eq, PartialEq, Clone)]
 pub(crate) struct MockTargetedPackage {
-    // Target triple
+    // Target tuple
     pub target: String,
     // Whether the file actually exists (could be due to build failure)
     pub available: bool,
@@ -637,7 +689,7 @@ impl MockDistServer {
         );
         let tarballs = TARBALLS.lock().unwrap();
         let hash = if tarballs.contains_key(&key) {
-            let (ref contents, ref hash) = tarballs[&key];
+            let (contents, hash) = &tarballs[&key];
             File::create(&installer_tarball)
                 .unwrap()
                 .write_all(contents)
@@ -719,15 +771,15 @@ impl MockDistServer {
         let mut manifest = Manifest {
             manifest_version: ManifestVersion::V2,
             date: channel.date.clone(),
-            renames: HashMap::default(),
-            packages: HashMap::default(),
-            reverse_renames: HashMap::default(),
-            profiles: HashMap::default(),
+            renames: BTreeMap::default(),
+            packages: BTreeMap::default(),
+            reverse_renames: BTreeMap::default(),
+            profiles: BTreeMap::default(),
         };
 
         // [pkg.*]
         for package in &channel.packages {
-            let mut targets = HashMap::default();
+            let mut targets = BTreeMap::default();
 
             // [pkg.*.target.*]
             for target in &package.targets {

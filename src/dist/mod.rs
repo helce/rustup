@@ -1,23 +1,29 @@
 //! Installation from a Rust distribution server
 
 use std::{
-    collections::HashSet, env, fmt, io::Write, ops::Deref, path::Path, str::FromStr, sync::LazyLock,
+    collections::HashSet,
+    env, fmt,
+    io::Write,
+    ops::Deref,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::LazyLock,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::NaiveDate;
 use clap::{ValueEnum, builder::PossibleValue};
 use itertools::Itertools;
-use regex::Regex;
+use regex::{Match, Regex};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    config::{Cfg, dist_root_server},
-    errors::RustupError,
+    config::Cfg,
+    errors::{NIGHTLY_COMPONENT_NOTE, RustupError},
     process::Process,
-    toolchain::ToolchainName,
+    toolchain::{DistributableToolchain, ToolchainName},
     utils,
 };
 
@@ -32,9 +38,6 @@ use manifest::{Component, Manifest as ManifestV2};
 
 pub mod manifestation;
 use manifestation::{Changes, Manifestation, UpdateStatus};
-
-pub(crate) mod notifications;
-pub use notifications::Notification;
 
 pub mod prefix;
 use prefix::InstallPrefix;
@@ -64,17 +67,17 @@ fn components_missing_msg(cs: &[Component], manifest: &ManifestV2, toolchain: &s
             let _ = writeln!(
                 buf,
                 "component {} is unavailable for download for channel '{}'",
-                c.description(manifest),
+                manifest.description(c),
                 toolchain,
             );
         }
         cs => {
             let cs_str = cs
                 .iter()
-                .map(|c| c.description(manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let _ = write!(
+            let _ = writeln!(
                 buf,
                 "some components are unavailable for download for channel '{toolchain}': {cs_str}"
             );
@@ -84,22 +87,15 @@ fn components_missing_msg(cs: &[Component], manifest: &ManifestV2, toolchain: &s
     if toolchain.starts_with("nightly") {
         let _ = write!(
             buf,
-            "\
-Sometimes not all components are available in any given nightly.
-If you don't need these components, you could try a minimal installation with:
-
-    rustup toolchain add {toolchain} --profile minimal
-
-If you require these components, please install and use the latest successfully built version,
-which you can find at <https://rust-lang.github.io/rustup-components-history>.
-
-After determining the correct date, install it with a command such as:
-
-    rustup toolchain install nightly-2018-12-27
-
-Then you can use the toolchain with commands such as:
-
-    cargo +nightly-2018-12-27 build"
+            "{NIGHTLY_COMPONENT_NOTE}\n\
+        help: if you don't need these components, you could try a minimal installation with:\n\
+        help:     rustup toolchain add {toolchain} --profile minimal\n\
+        help: if you require these components, please install and use the latest successfully built version,\n\
+        help: which you can find at <https://rust-lang.github.io/rustup-components-history>\n\
+        help: after determining the correct date, install it with a command such as:\n\
+        help:     rustup toolchain install nightly-2018-12-27\n\
+        help: then you can use the toolchain with commands such as:\n\
+        help:     cargo +nightly-2018-12-27 build"
         );
     } else if ["beta", "stable"].iter().any(|&p| toolchain.starts_with(p)) {
         let _ = write!(
@@ -142,9 +138,9 @@ struct ParsedToolchainDesc {
 }
 
 /// A toolchain descriptor from rustup's perspective. These contain
-/// 'partial target triples', which allow toolchain names like
-/// 'stable-msvc' to work. Partial target triples though are parsed
-/// from a hardcoded set of known triples, whereas target triples
+/// 'partial target tuples', which allow toolchain names like
+/// 'stable-msvc' to work. Partial target tuples though are parsed
+/// from a hardcoded set of known triples, whereas target tuples
 /// are nearly-arbitrary strings.
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
 pub struct PartialToolchainDesc {
@@ -229,13 +225,13 @@ impl FromStr for PartialVersion {
         // `semver::Comparator::from_str` supports an optional operator
         // (e.g. `=`, `>`, `>=`, `<`, `<=`, `~`, `^`, `*`) before the
         // partial version, so we should exclude that case first.
-        if let Some(ch) = ver.chars().nth(0) {
-            if !ch.is_ascii_digit() {
-                return Err(anyhow!(
-                    "expected ASCII digit at the beginning of `{ver}`, found `{ch}`"
-                )
-                .context("error parsing `PartialVersion`"));
-            }
+        if let Some(ch) = ver.chars().nth(0)
+            && !ch.is_ascii_digit()
+        {
+            return Err(
+                anyhow!("expected ASCII digit at the beginning of `{ver}`, found `{ch}`")
+                    .context("error parsing `PartialVersion`"),
+            );
         }
         let (ver, pre) = ver.split_once('-').unwrap_or((ver, ""));
         let comparator =
@@ -267,6 +263,10 @@ const TRIPLE_AARCH64_UNKNOWN_LINUX: &str = "aarch64-unknown-linux-musl";
 const TRIPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-gnu";
 #[cfg(all(not(windows), target_env = "musl"))]
 const TRIPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TRIPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TRIPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-musl";
 #[cfg(all(not(windows), not(target_env = "musl")))]
 const TRIPLE_POWERPC64LE_UNKNOWN_LINUX: &str = "powerpc64le-unknown-linux-gnu";
 #[cfg(all(not(windows), target_env = "musl"))]
@@ -301,49 +301,43 @@ impl FromStr for ParsedToolchainDesc {
                     "stable",
                     // Allow from 1.0.0 through to 9.999.99 with optional patch version
                     // and optional beta tag
-                    r"[0-9]{1}\.[0-9]{1,3}(?:\.[0-9]{1,2})?(?:-beta(?:\.[0-9]{1,2})?)?",
+                    r"[0-9]{1}\.(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]?))?(?:-beta(?:\.[0-9]{1,2})?)?",
                 ]
                 .join("|")
             ))
             .unwrap()
         });
 
-        let d = TOOLCHAIN_CHANNEL_RE.captures(desc).map(|c| {
-            fn fn_map(s: &str) -> Option<String> {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_owned())
-                }
-            }
+        let d = TOOLCHAIN_CHANNEL_RE
+            .captures(desc)
+            .ok_or_else(|| RustupError::InvalidToolchainName(desc.to_string()))?;
 
-            // These versions don't have v2 manifests, but they don't have point releases either,
-            // so to make the two-part version numbers work for these versions, specially turn
-            // them into their corresponding ".0" version.
-            let channel = match c.get(1).unwrap().as_str() {
-                "1.0" => "1.0.0",
-                "1.1" => "1.1.0",
-                "1.2" => "1.2.0",
-                "1.3" => "1.3.0",
-                "1.4" => "1.4.0",
-                "1.5" => "1.5.0",
-                "1.6" => "1.6.0",
-                "1.7" => "1.7.0",
-                "1.8" => "1.8.0",
-                other => other,
-            };
+        // These versions don't have v2 manifests, but they don't have point releases either,
+        // so to make the two-part version numbers work for these versions, specially turn
+        // them into their corresponding ".0" version.
+        let channel = match d.get(1).unwrap().as_str() {
+            "1.0" => "1.0.0",
+            "1.1" => "1.1.0",
+            "1.2" => "1.2.0",
+            "1.3" => "1.3.0",
+            "1.4" => "1.4.0",
+            "1.5" => "1.5.0",
+            "1.6" => "1.6.0",
+            "1.7" => "1.7.0",
+            "1.8" => "1.8.0",
+            other => other,
+        };
 
-            Self {
-                channel: Channel::from_str(channel).unwrap(),
-                date: c.get(2).map(|s| s.as_str()).and_then(fn_map),
-                target: c.get(3).map(|s| s.as_str()).and_then(fn_map),
-            }
-        });
-
-        match d {
-            Some(d) => Ok(d),
-            None => Err(RustupError::InvalidToolchainName(desc.to_string()).into()),
+        fn non_empty_string(s: Option<Match<'_>>) -> Option<String> {
+            let s = s?.as_str();
+            (!s.is_empty()).then(|| s.to_owned())
         }
+
+        Ok(Self {
+            channel: Channel::from_str(channel)?,
+            date: non_empty_string(d.get(2)),
+            target: non_empty_string(d.get(3)),
+        })
     }
 }
 
@@ -400,7 +394,7 @@ impl TargetTriple {
     pub(crate) fn is_host_emulated() -> bool {
         unsafe {
             let mut ret: libc::c_int = 0;
-            let mut size = std::mem::size_of::<libc::c_int>() as libc::size_t;
+            let mut size = size_of::<libc::c_int>() as libc::size_t;
             let err = libc::sysctlbyname(
                 c"sysctl.proc_translated".as_ptr().cast(),
                 (&mut ret) as *mut _ as *mut libc::c_void,
@@ -422,10 +416,10 @@ impl TargetTriple {
             /// it is only available on Windows 10 1511+, so we use `GetProcAddress`
             /// to maintain backward compatibility with older Windows versions.
             fn arch_primary() -> Option<&'static str> {
-                use windows_sys::Win32::Foundation::{BOOL, HANDLE};
+                use windows_sys::Win32::Foundation::HANDLE;
                 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
                 use windows_sys::Win32::System::Threading::GetCurrentProcess;
-                use windows_sys::core::s;
+                use windows_sys::core::{BOOL, s};
 
                 const IMAGE_FILE_MACHINE_ARM64: u16 = 0xAA64;
                 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -497,7 +491,7 @@ impl TargetTriple {
             let mut sys_info;
             let (sysname, machine) = unsafe {
                 sys_info = mem::zeroed();
-                if libc::uname(&mut sys_info) != 0 {
+                if libc::uname(&mut sys_info) == -1 {
                     return None;
                 }
 
@@ -522,6 +516,7 @@ impl TargetTriple {
                     TRIPLE_AARCH64_UNKNOWN_LINUX
                 }),
                 (b"Linux", b"loongarch64") => Some(TRIPLE_LOONGARCH64_UNKNOWN_LINUX),
+                (b"Linux", b"ppc64") => Some(TRIPLE_POWERPC64_UNKNOWN_LINUX),
                 (b"Linux", b"ppc64le") => Some(TRIPLE_POWERPC64LE_UNKNOWN_LINUX),
                 (b"Darwin", b"x86_64") => Some("x86_64-apple-darwin"),
                 (b"Darwin", b"i686") => Some("i686-apple-darwin"),
@@ -532,7 +527,11 @@ impl TargetTriple {
                 (b"NetBSD", b"x86_64") => Some("x86_64-unknown-netbsd"),
                 (b"NetBSD", b"i686") => Some("i686-unknown-netbsd"),
                 (b"DragonFly", b"x86_64") => Some("x86_64-unknown-dragonfly"),
+                #[cfg(target_os = "illumos")]
                 (b"SunOS", b"i86pc") => Some("x86_64-unknown-illumos"),
+                #[cfg(target_os = "solaris")]
+                (b"SunOS", b"i86pc") => Some("x86_64-pc-solaris"),
+                (b"SunOS", b"sun4v") => Some("sparcv9-sun-solaris"),
                 _ => None,
             };
 
@@ -568,9 +567,9 @@ impl TargetTriple {
         }
         // Otherwise we need to parse things
         let partial_self = PartialTargetTriple::new(&self.0)
-            .ok_or_else(|| anyhow!(format!("Unable to parse target triple: {}", self.0)))?;
+            .ok_or_else(|| anyhow!(format!("Unable to parse target tuple: {}", self.0)))?;
         let partial_other = PartialTargetTriple::new(&other.0)
-            .ok_or_else(|| anyhow!(format!("Unable to parse target triple: {}", other.0)))?;
+            .ok_or_else(|| anyhow!(format!("Unable to parse target tuple: {}", other.0)))?;
         // First obvious check is OS, if that doesn't match there's no chance
         let ret = if partial_self.os != partial_other.os {
             false
@@ -690,16 +689,16 @@ impl ToolchainDesc {
     }
     /// Either "$channel" or "channel-$date"
     pub fn manifest_name(&self) -> String {
-        match self.date {
+        match &self.date {
             None => self.channel.to_string(),
-            Some(ref date) => format!("{}-{}", self.channel, date),
+            Some(date) => format!("{}-{}", self.channel, date),
         }
     }
 
     pub(crate) fn package_dir(&self, dist_root: &str) -> String {
-        match self.date {
+        match &self.date {
             None => dist_root.to_string(),
-            Some(ref date) => format!("{dist_root}/{date}"),
+            Some(date) => format!("{dist_root}/{date}"),
         }
     }
 
@@ -726,7 +725,9 @@ impl TryFrom<&ToolchainName> for ToolchainDesc {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize, PartialOrd, Ord,
+)]
 #[serde(rename_all = "kebab-case")]
 pub enum Profile {
     Minimal,
@@ -823,8 +824,8 @@ impl FromStr for AutoInstallMode {
     }
 }
 
-impl std::fmt::Display for AutoInstallMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for AutoInstallMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -839,16 +840,16 @@ impl fmt::Display for PartialToolchainDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", &self.channel)?;
 
-        if let Some(ref date) = self.date {
+        if let Some(date) = &self.date {
             write!(f, "-{date}")?;
         }
-        if let Some(ref arch) = self.target.arch {
+        if let Some(arch) = &self.target.arch {
             write!(f, "-{arch}")?;
         }
-        if let Some(ref os) = self.target.os {
+        if let Some(os) = &self.target.os {
             write!(f, "-{os}")?;
         }
-        if let Some(ref env) = self.target.env {
+        if let Some(env) = &self.target.env {
             write!(f, "-{env}")?;
         }
 
@@ -860,7 +861,7 @@ impl fmt::Display for ToolchainDesc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", &self.channel)?;
 
-        if let Some(ref date) = self.date {
+        if let Some(date) = &self.date {
             write!(f, "-{date}")?;
         }
         write!(f, "-{}", self.target)?;
@@ -875,189 +876,244 @@ impl fmt::Display for Profile {
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct DistOptions<'a> {
-    pub(crate) cfg: &'a Cfg<'a>,
-    pub(crate) toolchain: &'a ToolchainDesc,
-    pub(crate) profile: Profile,
-    pub(crate) update_hash: Option<&'a Path>,
-    pub(crate) dl_cfg: DownloadCfg<'a>,
+pub(crate) struct DistOptions<'cfg, 'a> {
+    pub(super) cfg: &'cfg Cfg<'cfg>,
+    pub(super) toolchain: &'a ToolchainDesc,
+    profile: Profile,
+    pub(super) update_hash: PathBuf,
+    dl_cfg: DownloadCfg<'cfg>,
     /// --force bool is whether to force an update/install
-    pub(crate) force: bool,
+    pub(super) force: bool,
     /// --allow-downgrade
-    pub(crate) allow_downgrade: bool,
+    pub(super) allow_downgrade: bool,
     /// toolchain already exists
-    pub(crate) exists: bool,
+    pub(super) exists: bool,
     /// currently installed date and version
-    pub(crate) old_date_version: Option<(String, String)>,
+    pub(super) old_date_version: Option<(String, String)>,
     /// Extra components to install from dist
-    pub(crate) components: &'a [&'a str],
+    components: &'a [&'a str],
     /// Extra targets to install from dist
-    pub(crate) targets: &'a [&'a str],
+    targets: &'a [&'a str],
 }
 
-// Installs or updates a toolchain from a dist server. If an initial
-// install then it will be installed with the default components. If
-// an upgrade then all the existing components will be upgraded.
-//
-// Returns the manifest's hash if anything changed.
-#[tracing::instrument(level = "trace", err(level = "trace"), skip_all, fields(profile=format!("{:?}", opts.profile), prefix=prefix.path().to_string_lossy().to_string()))]
-pub(crate) async fn update_from_dist(
-    prefix: &InstallPrefix,
-    opts: &DistOptions<'_>,
-) -> Result<Option<String>> {
-    let fresh_install = !prefix.path().exists();
-    if let Some(hash) = opts.update_hash {
-        // fresh_install means the toolchain isn't present, but hash_exists means there is a stray hash file
-        if fresh_install && Path::exists(hash) {
-            (opts.dl_cfg.notify_handler)(Notification::StrayHash(hash));
-            std::fs::remove_file(hash)?;
-        }
+impl<'cfg, 'a> DistOptions<'cfg, 'a> {
+    pub(super) fn new(
+        components: &'a [&'a str],
+        targets: &'a [&'a str],
+        toolchain: &'a ToolchainDesc,
+        profile: Profile,
+        force: bool,
+        cfg: &'cfg Cfg<'cfg>,
+    ) -> Result<Self> {
+        Ok(Self {
+            cfg,
+            toolchain,
+            profile,
+            update_hash: cfg.get_hash_file(toolchain, true)?,
+            dl_cfg: DownloadCfg::new(cfg),
+            force,
+            allow_downgrade: false,
+            exists: false,
+            old_date_version: None,
+            components,
+            targets,
+        })
     }
 
-    let mut fetched = String::new();
-    let mut first_err = None;
-    let backtrack = opts.toolchain.channel == Channel::Nightly && opts.toolchain.date.is_none();
-    // We want to limit backtracking if we do not already have a toolchain
-    let mut backtrack_limit: Option<i32> = if opts.toolchain.date.is_some() {
-        None
-    } else {
-        // We limit the backtracking to 21 days by default (half a release cycle).
-        // The limit of 21 days is an arbitrary selection, so we let the user override it.
-        const BACKTRACK_LIMIT_DEFAULT: i32 = 21;
-        let provided = opts
-            .dl_cfg
-            .process
-            .var("RUSTUP_BACKTRACK_LIMIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(BACKTRACK_LIMIT_DEFAULT);
-        Some(if provided < 1 { 1 } else { provided })
-    };
+    pub(super) fn for_update(
+        mut self,
+        toolchain: &'a DistributableToolchain<'cfg>,
+        allow_downgrade: bool,
+    ) -> Self {
+        self.allow_downgrade = allow_downgrade;
+        self.exists = true;
+        self.old_date_version =
+            // Ignore a missing manifest: we can't report the old version
+            // correctly, and it probably indicates an incomplete install, so do
+            // not report an old rustc version either.
+            toolchain.get_manifest()
+                .map(|m| {
+                    (
+                        m.date,
+                        // should rustc_version be a free function on a trait?
+                        // note that prev_version can be junk if the rustc component is missing ...
+                        toolchain.toolchain.rustc_version(),
+                    )
+                })
+                .ok();
 
-    // In case there is no allow-downgrade option set
-    // we never want to backtrack further back than the nightly that's already installed.
+        self
+    }
+
+    // Installs or updates a toolchain from a dist server. If an initial
+    // install then it will be installed with the default components. If
+    // an upgrade then all the existing components will be upgraded.
     //
-    // If no nightly is installed, it makes no sense to backtrack beyond the first ever manifest,
-    // which is 2014-12-20 according to
-    // https://static.rust-lang.org/cargo-dist/index.html.
-    //
-    // We could arguably use the date of the first rustup release here, but that would break a
-    // bunch of the tests, which (inexplicably) use 2015-01-01 as their manifest dates.
-    let first_manifest = date_from_manifest_date("2014-12-20").unwrap();
-    let old_manifest = opts
-        .old_date_version
-        .as_ref()
-        .and_then(|(d, _)| date_from_manifest_date(d))
-        .unwrap_or(first_manifest);
-    let last_manifest = if opts.allow_downgrade {
-        first_manifest
-    } else {
-        old_manifest
-    };
+    // Returns the manifest's hash if anything changed.
+    #[tracing::instrument(level = "trace", err(level = "trace"), skip_all, fields(profile = ?self.profile, prefix = %prefix.path().display()))]
+    pub(crate) async fn install_into(&self, prefix: &InstallPrefix) -> Result<Option<String>> {
+        let fresh_install = !prefix.path().exists();
+        // fresh_install means the toolchain isn't present, but hash_exists means there is a stray hash file
+        if fresh_install && self.update_hash.exists() {
+            warn!(
+                "removing stray hash file in order to continue: {}",
+                self.update_hash.display()
+            );
+            std::fs::remove_file(&self.update_hash)?;
+        }
 
-    let current_manifest = {
-        let manifestation = Manifestation::open(prefix.clone(), opts.toolchain.target.clone())?;
-        manifestation.load_manifest()?
-    };
-
-    let mut toolchain = opts.toolchain.clone();
-    let res = loop {
-        let result = try_update_from_dist_(
-            opts.dl_cfg,
-            opts.update_hash,
-            &toolchain,
-            match opts.exists {
-                false => Some(opts.profile),
-                true => None,
-            },
-            prefix,
-            opts.force,
-            opts.components,
-            opts.targets,
-            &mut fetched,
-        )
-        .await;
-
-        let e = match result {
-            Ok(v) => break Ok(v),
-            Err(e) if !backtrack => break Err(e),
-            Err(e) => e,
+        let mut fetched = String::new();
+        let mut first_err = None;
+        let backtrack = self.toolchain.channel == Channel::Nightly && self.toolchain.date.is_none();
+        // We want to limit backtracking if we do not already have a toolchain
+        let mut backtrack_limit: Option<i32> = if self.toolchain.date.is_some() {
+            None
+        } else {
+            // We limit the backtracking to 21 days by default (half a release cycle).
+            // The limit of 21 days is an arbitrary selection, so we let the user override it.
+            const BACKTRACK_LIMIT_DEFAULT: i32 = 21;
+            let provided = self
+                .dl_cfg
+                .process
+                .var("RUSTUP_BACKTRACK_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(BACKTRACK_LIMIT_DEFAULT);
+            Some(if provided < 1 { 1 } else { provided })
         };
 
-        let cause = e.downcast_ref::<DistError>();
-        match cause {
-            Some(DistError::ToolchainComponentsMissing(components, manifest, ..)) => {
-                (opts.dl_cfg.notify_handler)(Notification::SkippingNightlyMissingComponent(
-                    &toolchain,
-                    current_manifest.as_ref().unwrap_or(manifest),
-                    components,
-                ));
+        // In case there is no allow-downgrade option set
+        // we never want to backtrack further back than the nightly that's already installed.
+        //
+        // If no nightly is installed, it makes no sense to backtrack beyond the first ever manifest,
+        // which is 2014-12-20 according to
+        // https://static.rust-lang.org/cargo-dist/index.html.
+        //
+        // We could arguably use the date of the first rustup release here, but that would break a
+        // bunch of the tests, which (inexplicably) use 2015-01-01 as their manifest dates.
+        let first_manifest = date_from_manifest_date("2014-12-20").unwrap();
+        let old_manifest = self
+            .old_date_version
+            .as_ref()
+            .and_then(|(d, _)| date_from_manifest_date(d))
+            .unwrap_or(first_manifest);
+        let last_manifest = if self.allow_downgrade {
+            first_manifest
+        } else {
+            old_manifest
+        };
 
-                if first_err.is_none() {
-                    first_err = Some(e);
+        let current_manifest = {
+            let manifestation = Manifestation::open(prefix.clone(), self.toolchain.target.clone())?;
+            manifestation.load_manifest()?
+        };
+
+        let mut toolchain = self.toolchain.clone();
+        let res = loop {
+            let result = try_update_from_dist_(
+                &self.dl_cfg,
+                &self.update_hash,
+                &toolchain,
+                match self.exists {
+                    false => Some(self.profile),
+                    true => None,
+                },
+                prefix,
+                self.force,
+                self.components,
+                self.targets,
+                &mut fetched,
+                self.cfg,
+            )
+            .await;
+
+            let e = match result {
+                Ok(v) => break Ok(v),
+                Err(e) if !backtrack => break Err(e),
+                Err(e) => e,
+            };
+
+            let cause = e.downcast_ref::<DistError>();
+            match cause {
+                Some(DistError::ToolchainComponentsMissing(components, manifest, ..)) => {
+                    let plural = if components.len() > 1 { "s" } else { "" };
+                    let manifest = current_manifest.as_ref().unwrap_or(manifest);
+                    let components = components
+                        .iter()
+                        .map(|component| {
+                            match component.target.as_ref() == Some(&toolchain.target) {
+                                true => manifest.short_name(component).to_owned(),
+                                false => manifest.name(component),
+                            }
+                        })
+                        .join(", ");
+                    info!("skipping nightly with missing component{plural}: {components}");
+
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    // We decrement the backtrack count only on unavailable component errors
+                    // so that the limit only applies to nightlies that were indeed available,
+                    // and ignores missing ones.
+                    backtrack_limit = backtrack_limit.map(|n| n - 1);
                 }
-                // We decrement the backtrack count only on unavailable component errors
-                // so that the limit only applies to nightlies that were indeed available,
-                // and ignores missing ones.
-                backtrack_limit = backtrack_limit.map(|n| n - 1);
-            }
 
-            Some(DistError::MissingReleaseForToolchain(..)) => {
-                // no need to even print anything for missing nightlies,
-                // since we don't really "skip" them
-            }
-            _ => {
-                // All other errors break the loop
-                break Err(e);
-            }
-        };
+                Some(DistError::MissingReleaseForToolchain(..)) => {
+                    // no need to even print anything for missing nightlies,
+                    // since we don't really "skip" them
+                }
+                _ => {
+                    // All other errors break the loop
+                    break Err(e);
+                }
+            };
 
-        if let Some(backtrack_limit) = backtrack_limit {
-            if backtrack_limit < 1 {
+            if let Some(backtrack_limit) = backtrack_limit
+                && backtrack_limit < 1
+            {
                 // This unwrap is safe because we can only hit this if we've
                 // had a chance to set first_err
                 break Err(first_err.unwrap());
             }
-        }
 
-        // The user asked to update their nightly, but the latest nightly does not have all
-        // the components that the user currently has installed. Let's try the previous
-        // nightlies in reverse chronological order until we find a nightly that does,
-        // starting at one date earlier than the current manifest's date.
-        let toolchain_date = toolchain.date.as_ref().unwrap_or(&fetched);
-        let try_next = date_from_manifest_date(toolchain_date)
-            .unwrap_or_else(|| panic!("Malformed manifest date: {toolchain_date:?}"))
-            .pred_opt()
-            .unwrap();
+            // The user asked to update their nightly, but the latest nightly does not have all
+            // the components that the user currently has installed. Let's try the previous
+            // nightlies in reverse chronological order until we find a nightly that does,
+            // starting at one date earlier than the current manifest's date.
+            let toolchain_date = toolchain.date.as_ref().unwrap_or(&fetched);
+            let try_next = date_from_manifest_date(toolchain_date)
+                .unwrap_or_else(|| panic!("Malformed manifest date: {toolchain_date:?}"))
+                .pred_opt()
+                .unwrap();
 
-        if try_next < last_manifest {
-            // Wouldn't be an update if we go further back than the user's current nightly.
-            if let Some(e) = first_err {
-                break Err(e);
-            } else {
-                // In this case, all newer nightlies are missing, which means there are no
-                // updates, so the user is already at the latest nightly.
-                break Ok(None);
+            if try_next < last_manifest {
+                // Wouldn't be an update if we go further back than the user's current nightly.
+                if let Some(e) = first_err {
+                    break Err(e);
+                } else {
+                    // In this case, all newer nightlies are missing, which means there are no
+                    // updates, so the user is already at the latest nightly.
+                    break Ok(None);
+                }
             }
+
+            toolchain.date = Some(try_next.format("%Y-%m-%d").to_string());
+        };
+
+        // Don't leave behind an empty / broken installation directory
+        if res.is_err() && fresh_install {
+            // FIXME Ignoring cascading errors
+            let _ = utils::remove_dir("toolchain", prefix.path());
         }
 
-        toolchain.date = Some(try_next.format("%Y-%m-%d").to_string());
-    };
-
-    // Don't leave behind an empty / broken installation directory
-    if res.is_err() && fresh_install {
-        // FIXME Ignoring cascading errors
-        let _ = utils::remove_dir("toolchain", prefix.path(), opts.dl_cfg.notify_handler);
+        res
     }
-
-    res
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn try_update_from_dist_(
-    download: DownloadCfg<'_>,
-    update_hash: Option<&Path>,
+    download: &DownloadCfg<'_>,
+    update_hash: &Path,
     toolchain: &ToolchainDesc,
     profile: Option<Profile>,
     prefix: &InstallPrefix,
@@ -1065,31 +1121,33 @@ async fn try_update_from_dist_(
     components: &[&str],
     targets: &[&str],
     fetched: &mut String,
+    cfg: &Cfg<'_>,
 ) -> Result<Option<String>> {
     let toolchain_str = toolchain.to_string();
     let manifestation = Manifestation::open(prefix.clone(), toolchain.target.clone())?;
 
     // TODO: Add a notification about which manifest version is going to be used
-    (download.notify_handler)(Notification::DownloadingManifest(&toolchain_str));
-    match dl_v2_manifest(
-        download,
-        // Even if manifest has not changed, we must continue to install requested components.
-        // So if components or targets is not empty, we skip passing `update_hash` so that
-        // we essentially degenerate to `rustup component add` / `rustup target add`
-        if components.is_empty() && targets.is_empty() {
-            update_hash
-        } else {
-            None
-        },
-        toolchain,
-    )
-    .await
+    info!("syncing channel updates for {toolchain_str}");
+    match download
+        .dl_v2_manifest(
+            // Even if manifest has not changed, we must continue to install requested components.
+            // So if components or targets is not empty, we skip passing `update_hash` so that
+            // we essentially degenerate to `rustup component add` / `rustup target add`
+            if components.is_empty() && targets.is_empty() {
+                Some(update_hash)
+            } else {
+                None
+            },
+            toolchain,
+            cfg,
+        )
+        .await
     {
         Ok(Some((m, hash))) => {
-            (download.notify_handler)(Notification::DownloadedManifest(
-                &m.date,
-                m.get_rust_version().ok(),
-            ));
+            match m.get_rust_version() {
+                Ok(version) => info!("latest update on {} for version {version}", m.date),
+                Err(_) => info!("latest update on {}", m.date),
+            }
 
             let profile_components = match profile {
                 Some(profile) => m.get_profile_components(profile, &toolchain.target)?,
@@ -1114,10 +1172,9 @@ async fn try_update_from_dist_(
                     .components
                     .iter()
                     .find(|c| c.short_name_in_manifest() == component.short_name_in_manifest())
+                    && c.target.is_none()
                 {
-                    if c.target.is_none() {
-                        component = component.wildcard();
-                    }
+                    component = component.wildcard();
                 }
                 all_components.insert(component);
             }
@@ -1139,11 +1196,11 @@ async fn try_update_from_dist_(
 
             return match manifestation
                 .update(
-                    &m,
+                    m,
                     changes,
                     force_update,
-                    &download,
-                    &toolchain.manifest_name(),
+                    download,
+                    toolchain.manifest_name(),
                     true,
                 )
                 .await
@@ -1172,7 +1229,7 @@ async fn try_update_from_dist_(
                 Some(RustupError::ChecksumFailed { .. }) => return Ok(None),
                 Some(RustupError::DownloadNotExists { .. }) => {
                     // Proceed to try v1 as a fallback
-                    (download.notify_handler)(Notification::DownloadingLegacyManifest)
+                    debug!("manifest not found; trying legacy manifest");
                 }
                 _ => return Err(err),
             }
@@ -1180,7 +1237,7 @@ async fn try_update_from_dist_(
     }
 
     // If the v2 manifest is not found then try v1
-    let manifest = match dl_v1_manifest(download, toolchain).await {
+    let manifest = match download.dl_v1_manifest(&cfg.dist_root_url, toolchain).await {
         Ok(m) => m,
         Err(err) => match err.downcast_ref::<RustupError>() {
             Some(RustupError::ChecksumFailed { .. }) => return Err(err),
@@ -1201,99 +1258,19 @@ async fn try_update_from_dist_(
     };
 
     let result = manifestation
-        .update_v1(
-            &manifest,
-            update_hash,
-            download.tmp_cx,
-            &download.notify_handler,
-            download.process,
-        )
+        .update_v1(&manifest, update_hash, download)
         .await;
 
     // inspect, determine what context to add, then process afterwards.
-    if let Err(e) = &result {
-        if let Some(RustupError::DownloadNotExists { .. }) = e.downcast_ref::<RustupError>() {
-            return result.with_context(|| {
-                format!("could not download nonexistent rust version `{toolchain_str}`")
-            });
-        }
+    if let Err(e) = &result
+        && let Some(RustupError::DownloadNotExists { .. }) = e.downcast_ref::<RustupError>()
+    {
+        return result.with_context(|| {
+            format!("could not download nonexistent rust version `{toolchain_str}`")
+        });
     }
 
     result
-}
-
-pub(crate) async fn dl_v2_manifest(
-    download: DownloadCfg<'_>,
-    update_hash: Option<&Path>,
-    toolchain: &ToolchainDesc,
-) -> Result<Option<(ManifestV2, String)>> {
-    let manifest_url = toolchain.manifest_v2_url(download.dist_root, download.process);
-    match download
-        .download_and_check(&manifest_url, update_hash, ".toml")
-        .await
-    {
-        Ok(manifest_dl) => {
-            // Downloaded ok!
-            let Some((manifest_file, manifest_hash)) = manifest_dl else {
-                return Ok(None);
-            };
-            let manifest_str = utils::read_file("manifest", &manifest_file)?;
-            let manifest =
-                ManifestV2::parse(&manifest_str).with_context(|| RustupError::ParsingFile {
-                    name: "manifest",
-                    path: manifest_file.to_path_buf(),
-                })?;
-
-            Ok(Some((manifest, manifest_hash)))
-        }
-        Err(any) => {
-            if let Some(err @ RustupError::ChecksumFailed { .. }) =
-                any.downcast_ref::<RustupError>()
-            {
-                // Manifest checksum mismatched.
-                warn!("{err}");
-
-                let server = dist_root_server(download.process)?;
-                if server == DEFAULT_DIST_SERVER {
-                    info!(
-                        "this is likely due to an ongoing update of the official release server, please try again later"
-                    );
-                    info!("see <https://github.com/rust-lang/rustup/issues/3390> for more details");
-                } else {
-                    info!(
-                        "this might indicate an issue with the third-party release server '{server}'"
-                    );
-                    info!("see <https://github.com/rust-lang/rustup/issues/3885> for more details");
-                }
-            }
-            Err(any)
-        }
-    }
-}
-
-async fn dl_v1_manifest(
-    download: DownloadCfg<'_>,
-    toolchain: &ToolchainDesc,
-) -> Result<Vec<String>> {
-    let root_url = toolchain.package_dir(download.dist_root);
-
-    if let Channel::Version(ver) = &toolchain.channel {
-        // This is an explicit version. In v1 there was no manifest,
-        // you just know the file to download, so synthesize one.
-        let installer_name = format!("{}/rust-{}-{}.tar.gz", root_url, ver, toolchain.target);
-        return Ok(vec![installer_name]);
-    }
-
-    let manifest_url = toolchain.manifest_v1_url(download.dist_root, download.process);
-    let manifest_dl = download.download_and_check(&manifest_url, None, "").await?;
-    let (manifest_file, _) = manifest_dl.unwrap();
-    let manifest_str = utils::read_file("manifest", &manifest_file)?;
-    let urls = manifest_str
-        .lines()
-        .map(|s| format!("{root_url}/{s}"))
-        .collect();
-
-    Ok(urls)
 }
 
 fn date_from_manifest_date(date_str: &str) -> Option<NaiveDate> {
@@ -1375,7 +1352,15 @@ mod tests {
             assert_eq!(parsed.unwrap(), expected, "input: `{input}`");
         }
 
-        let failure_cases = vec!["anything", "00.0000.000", "3", "", "--", "0.0.0-"];
+        let failure_cases = vec![
+            "anything",
+            "00.0000.000",
+            "3",
+            "",
+            "--",
+            "0.0.0-",
+            "1.90.01",
+        ];
 
         for input in failure_cases {
             let parsed = input.parse::<ParsedToolchainDesc>();

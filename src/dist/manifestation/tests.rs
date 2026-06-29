@@ -3,7 +3,6 @@
 #![allow(clippy::type_complexity)]
 
 use std::{
-    cell::Cell,
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
@@ -16,8 +15,8 @@ use url::Url;
 
 use crate::{
     dist::{
-        DEFAULT_DIST_SERVER, Notification, Profile, TargetTriple, ToolchainDesc,
-        download::DownloadCfg,
+        DEFAULT_DIST_SERVER, Profile, TargetTriple, ToolchainDesc,
+        download::{DownloadCfg, DownloadTracker},
         manifest::{Component, Manifest},
         manifestation::{Changes, Manifestation, UpdateStatus},
         prefix::InstallPrefix,
@@ -411,22 +410,39 @@ struct TestContext {
     prefix: InstallPrefix,
     download_dir: PathBuf,
     tp: TestProcess,
-    tmp_cx: temp::Context,
+    tmp_cx: Arc<temp::Context>,
     _tempdirs: Vec<tempfile::TempDir>,
 }
 
 impl TestContext {
     fn new(edit: Option<&dyn Fn(&str, &mut MockChannel)>, comps: Compressions) -> Self {
+        Self::with_env(edit, comps, HashMap::new())
+    }
+
+    fn with_env(
+        edit: Option<&dyn Fn(&str, &mut MockChannel)>,
+        comps: Compressions,
+        env: HashMap<String, String>,
+    ) -> Self {
         let dist_tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
         let mock_dist_server = create_mock_dist_server(dist_tempdir.path(), edit);
         let url = Url::parse(&format!("file://{}", dist_tempdir.path().to_string_lossy())).unwrap();
 
-        let mut cx = Self::from_dist_server(mock_dist_server, url, comps);
+        let mut cx = Self::from_dist_server_with_env(mock_dist_server, url, comps, env);
         cx._tempdirs.push(dist_tempdir);
         cx
     }
 
     fn from_dist_server(server: MockDistServer, url: Url, comps: Compressions) -> Self {
+        Self::from_dist_server_with_env(server, url, comps, HashMap::new())
+    }
+
+    fn from_dist_server_with_env(
+        server: MockDistServer,
+        url: Url,
+        comps: Compressions,
+        env: HashMap<String, String>,
+    ) -> Self {
         server.write(
             &[MockManifestVersion::V2],
             comps.enable_xz(),
@@ -434,22 +450,10 @@ impl TestContext {
         );
 
         let prefix_tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-
         let work_tempdir = tempfile::Builder::new().prefix("rustup").tempdir().unwrap();
-        let tmp_cx = temp::Context::new(
-            work_tempdir.path().to_owned(),
-            DEFAULT_DIST_SERVER,
-            Box::new(|_| ()),
-        );
-
         let toolchain = ToolchainDesc::from_str("nightly-x86_64-apple-darwin").unwrap();
         let prefix = InstallPrefix::from(prefix_tempdir.path());
-        let tp = TestProcess::new(
-            env::current_dir().unwrap(),
-            &["rustup"],
-            HashMap::default(),
-            "",
-        );
+        let tp = TestProcess::new(env::current_dir().unwrap(), &["rustup"], env, "");
 
         Self {
             url,
@@ -457,18 +461,11 @@ impl TestContext {
             download_dir: prefix.path().join("downloads"),
             prefix,
             tp,
-            tmp_cx,
+            tmp_cx: Arc::new(temp::Context::new(
+                work_tempdir.path().to_owned(),
+                DEFAULT_DIST_SERVER,
+            )),
             _tempdirs: vec![prefix_tempdir, work_tempdir],
-        }
-    }
-
-    fn default_dl_cfg(&self) -> DownloadCfg<'_> {
-        DownloadCfg {
-            dist_root: "phony",
-            tmp_cx: &self.tmp_cx,
-            download_dir: &self.download_dir,
-            notify_handler: &|event| println!("{event}"),
-            process: &self.tp.process,
         }
     }
 
@@ -482,21 +479,18 @@ impl TestContext {
         remove: &[Component],
         force: bool,
     ) -> Result<UpdateStatus> {
-        self.update_from_dist_with_dl_cfg(add, remove, force, &self.default_dl_cfg())
-            .await
-    }
+        let dl_cfg = DownloadCfg {
+            tmp_cx: self.tmp_cx.clone(),
+            download_dir: &self.download_dir,
+            tracker: DownloadTracker::new(false, &self.tp.process),
+            permit_copy_rename: self.tp.process.permit_copy_rename(),
+            process: &self.tp.process,
+        };
 
-    async fn update_from_dist_with_dl_cfg(
-        &self,
-        add: &[Component],
-        remove: &[Component],
-        force: bool,
-        dl_cfg: &DownloadCfg<'_>,
-    ) -> Result<UpdateStatus> {
         // Download the dist manifest and place it into the installation prefix
         let manifest_url = make_manifest_url(&self.url, &self.toolchain)?;
         let manifest_file = self.tmp_cx.new_file()?;
-        download_file(&manifest_url, &manifest_file, None, &|_| {}, dl_cfg.process).await?;
+        download_file(&manifest_url, &manifest_file, None, None, dl_cfg.process).await?;
         let manifest_str = utils::read_file("manifest", &manifest_file)?;
         let manifest = Manifest::parse(&manifest_str)?;
 
@@ -516,11 +510,11 @@ impl TestContext {
 
         manifestation
             .update(
-                &manifest,
+                manifest,
                 changes,
                 force,
-                dl_cfg,
-                &self.toolchain.manifest_name(),
+                &dl_cfg,
+                self.toolchain.manifest_name(),
                 true,
             )
             .await
@@ -531,9 +525,20 @@ impl TestContext {
         let manifestation = Manifestation::open(self.prefix.clone(), trip)?;
         let manifest = manifestation.load_manifest()?.unwrap();
 
-        manifestation.uninstall(&manifest, &self.tmp_cx, &|_| (), &self.tp.process)?;
+        manifestation.uninstall(
+            &manifest,
+            self.tmp_cx.clone(),
+            self.tp.process.permit_copy_rename(),
+        )?;
 
         Ok(())
+    }
+
+    fn stderr_line_contains(&self, needle: &str) -> bool {
+        str::from_utf8(&self.tp.stderr())
+            .unwrap()
+            .lines()
+            .any(|ln| ln.contains(needle))
     }
 }
 
@@ -658,7 +663,7 @@ async fn unavailable_component() {
             assert_eq!(toolchain, "nightly");
             let descriptions = components
                 .iter()
-                .map(|c| c.description(&manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>();
             assert_eq!(descriptions, ["'bonus' for target 'x86_64-apple-darwin'"])
         }
@@ -703,7 +708,7 @@ async fn unavailable_component_from_profile() {
             assert_eq!(toolchain, "nightly");
             let descriptions = components
                 .iter()
-                .map(|c| c.description(&manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>();
             assert_eq!(descriptions, ["'rustc' for target 'x86_64-apple-darwin'"])
         }
@@ -757,7 +762,7 @@ async fn removed_component() {
             assert_eq!(toolchain, "nightly");
             let descriptions = components
                 .iter()
-                .map(|c| c.description(&manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>();
             assert_eq!(descriptions, ["'bonus' for target 'x86_64-apple-darwin'"])
         }
@@ -821,7 +826,7 @@ async fn unavailable_components_is_target() {
             assert_eq!(toolchain, "nightly");
             let descriptions = components
                 .iter()
-                .map(|c| c.description(&manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>();
             assert_eq!(
                 descriptions,
@@ -886,7 +891,7 @@ async fn unavailable_components_with_same_target() {
             assert_eq!(toolchain, "nightly");
             let descriptions = components
                 .iter()
-                .map(|c| c.description(&manifest))
+                .map(|c| manifest.description(c))
                 .collect::<Vec<_>>();
             assert_eq!(
                 descriptions,
@@ -1302,6 +1307,33 @@ async fn remove_extensions_does_not_remove_other_components() {
 }
 
 #[tokio::test]
+async fn remove_extensions_does_not_hang_with_concurrent_downloads_override() {
+    let cx = TestContext::with_env(
+        None,
+        GZOnly,
+        [("RUSTUP_CONCURRENT_DOWNLOADS".to_owned(), "2".to_owned())].into(),
+    );
+
+    let adds = vec![Component::new(
+        "rust-std".to_string(),
+        Some(TargetTriple::new("i686-apple-darwin")),
+        false,
+    )];
+
+    cx.update_from_dist(&adds, &[], false).await.unwrap();
+
+    let removes = vec![Component::new(
+        "rust-std".to_string(),
+        Some(TargetTriple::new("i686-apple-darwin")),
+        false,
+    )];
+
+    cx.update_from_dist(&[], &removes, false).await.unwrap();
+
+    assert!(utils::path_exists(cx.prefix.path().join("bin/rustc")));
+}
+
+#[tokio::test]
 async fn add_and_remove_for_upgrade() {
     let cx = TestContext::new(None, GZOnly);
     change_channel_date(&cx.url, "nightly", "2016-02-01");
@@ -1431,12 +1463,7 @@ async fn unable_to_download_component() {
 }
 
 fn prevent_installation(prefix: &InstallPrefix) {
-    utils::ensure_dir_exists(
-        "installation path",
-        &prefix.path().join("lib"),
-        &|_: Notification<'_>| {},
-    )
-    .unwrap();
+    utils::ensure_dir_exists("installation path", &prefix.path().join("lib")).unwrap();
     let install_blocker = prefix.path().join("lib").join("rustlib");
     utils::write_file("install-blocker", &install_blocker, "fail-installation").unwrap();
 }
@@ -1448,30 +1475,18 @@ fn allow_installation(prefix: &InstallPrefix) {
 
 #[tokio::test]
 async fn reuse_downloaded_file() {
-    let cx = TestContext::new(None, GZOnly);
+    let mut env = HashMap::default();
+    env.insert("RUSTUP_LOG".to_owned(), "debug".to_owned());
+    let cx = TestContext::with_env(None, GZOnly, env);
+    const EXPECTED_LOG: &str = "reusing previously downloaded file";
+
     prevent_installation(&cx.prefix);
-
-    let reuse_notification_fired = Arc::new(Cell::new(false));
-    let dl_cfg = DownloadCfg {
-        notify_handler: &|n| {
-            if let Notification::FileAlreadyDownloaded = n {
-                reuse_notification_fired.set(true);
-            }
-        },
-        ..cx.default_dl_cfg()
-    };
-
-    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg)
-        .await
-        .unwrap_err();
-    assert!(!reuse_notification_fired.get());
+    cx.update_from_dist(&[], &[], false).await.unwrap_err();
+    assert!(!cx.stderr_line_contains(EXPECTED_LOG));
 
     allow_installation(&cx.prefix);
-    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg)
-        .await
-        .unwrap();
-
-    assert!(reuse_notification_fired.get());
+    cx.update_from_dist(&[], &[], false).await.unwrap();
+    assert!(cx.stderr_line_contains(EXPECTED_LOG));
 }
 
 #[tokio::test]
@@ -1486,25 +1501,13 @@ async fn checks_files_hashes_before_reuse() {
     .unwrap()[..64]
         .to_owned();
     let prev_download = cx.download_dir.join(target_hash);
-    utils::ensure_dir_exists("download dir", &cx.download_dir, &|_: Notification<'_>| {}).unwrap();
+    utils::ensure_dir_exists("download dir", &cx.download_dir).unwrap();
     utils::write_file("bad previous download", &prev_download, "bad content").unwrap();
     println!("wrote previous download to {}", prev_download.display());
 
-    let noticed_bad_checksum = Arc::new(Cell::new(false));
-    let dl_cfg = DownloadCfg {
-        notify_handler: &|n| {
-            if let Notification::CachedFileChecksumFailed = n {
-                noticed_bad_checksum.set(true);
-            }
-        },
-        ..cx.default_dl_cfg()
-    };
-
-    cx.update_from_dist_with_dl_cfg(&[], &[], false, &dl_cfg)
-        .await
-        .unwrap();
-
-    assert!(noticed_bad_checksum.get());
+    cx.update_from_dist(&[], &[], false).await.unwrap();
+    const EXPECTED_LOG: &str = "bad checksum for cached download";
+    assert!(cx.stderr_line_contains(EXPECTED_LOG));
 }
 
 #[tokio::test]
@@ -1520,7 +1523,7 @@ async fn handle_corrupt_partial_downloads() {
     .unwrap()[..SHA256_HASH_LEN]
         .to_owned();
 
-    utils::ensure_dir_exists("download dir", &cx.download_dir, &|_: Notification<'_>| {}).unwrap();
+    utils::ensure_dir_exists("download dir", &cx.download_dir).unwrap();
     let partial_path = cx.download_dir.join(format!("{target_hash}.partial"));
     utils_raw::write_file(
         &partial_path,

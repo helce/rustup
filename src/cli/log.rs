@@ -1,8 +1,8 @@
-use std::{fmt, io::Write};
+use std::fmt;
 
+use anstyle::{AnsiColor, Color, Style};
 #[cfg(feature = "otel")]
 use opentelemetry_sdk::trace::Tracer;
-use termcolor::{Color, ColorSpec, WriteColor};
 use tracing::{Event, Subscriber, level_filters::LevelFilter};
 use tracing_subscriber::{
     EnvFilter, Layer, Registry,
@@ -19,10 +19,7 @@ use crate::{process::Process, utils::notify::NotificationLevel};
 
 pub fn tracing_subscriber(
     process: &Process,
-) -> (
-    impl tracing::Subscriber + use<>,
-    reload::Handle<EnvFilter, Registry>,
-) {
+) -> (impl Subscriber + use<>, reload::Handle<EnvFilter, Registry>) {
     #[cfg(feature = "otel")]
     let telemetry = telemetry(process);
     let (console_logger, console_filter) = console_logger(process);
@@ -49,18 +46,11 @@ fn console_logger<S>(process: &Process) -> (impl Layer<S> + use<S>, reload::Hand
 where
     S: Subscriber + for<'span> LookupSpan<'span>,
 {
-    let has_ansi = match process.var("RUSTUP_TERM_COLOR") {
-        Ok(s) if s.eq_ignore_ascii_case("always") => true,
-        Ok(s) if s.eq_ignore_ascii_case("never") => false,
-        // `RUSTUP_TERM_COLOR` is prioritized over `NO_COLOR`.
-        _ if process.var("NO_COLOR").is_ok() => false,
-        _ => process.stderr().is_a_tty(process),
-    };
     let maybe_rustup_log_directives = process.var("RUSTUP_LOG");
     let process = process.clone();
     let logger = tracing_subscriber::fmt::layer()
-        .with_writer(move || process.stderr())
-        .with_ansi(has_ansi);
+        .with_writer(process.stderr())
+        .with_ansi(true); // `process.stderr()` will translate ANSI escape codes
     if let Ok(directives) = maybe_rustup_log_directives {
         let (env_filter, handle) = reload::Layer::new(
             EnvFilter::builder()
@@ -96,18 +86,10 @@ where
         mut writer: format::Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let has_ansi = writer.has_ansi_escapes();
         let level = NotificationLevel::from(*event.metadata().level());
         {
-            let mut buf = termcolor::Buffer::ansi();
-            if has_ansi {
-                _ = buf.set_color(ColorSpec::new().set_bold(true).set_fg(level.fg_color()));
-            }
-            _ = write!(buf, "{level}: ");
-            if has_ansi {
-                _ = buf.reset();
-            }
-            writer.write_str(std::str::from_utf8(buf.as_slice()).unwrap())?;
+            let level_style = Style::new().bold().fg_color(level.fg_color());
+            write!(&mut writer, "{level_style}{level}:{level_style:#} ")?;
         }
         ctx.field_format().format_fields(writer.by_ref(), event)?;
         writeln!(writer)
@@ -117,11 +99,11 @@ where
 impl NotificationLevel {
     fn fg_color(&self) -> Option<Color> {
         match self {
-            NotificationLevel::Trace => Some(Color::Blue),
-            NotificationLevel::Debug => Some(Color::Magenta),
+            NotificationLevel::Trace => Some(AnsiColor::Blue.into()),
+            NotificationLevel::Debug => Some(AnsiColor::Magenta.into()),
             NotificationLevel::Info => None,
-            NotificationLevel::Warn => Some(Color::Yellow),
-            NotificationLevel::Error => Some(Color::Red),
+            NotificationLevel::Warn => Some(AnsiColor::Yellow.into()),
+            NotificationLevel::Error => Some(AnsiColor::Red.into()),
         }
     }
 }

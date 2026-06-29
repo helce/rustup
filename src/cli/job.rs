@@ -41,9 +41,13 @@ mod imp {
     use std::ptr;
 
     use tracing::info;
-    use windows_sys::Win32::Foundation::*;
-    use windows_sys::Win32::System::JobObjects::*;
-    use windows_sys::Win32::System::Threading::*;
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
     pub(crate) struct Setup {
         job: Handle,
@@ -85,7 +89,7 @@ mod imp {
                 job.inner,
                 JobObjectExtendedLimitInformation,
                 &mut info as *mut _ as *const std::ffi::c_void,
-                mem::size_of_val(&info) as u32,
+                size_of_val(&info) as u32,
             );
             if r == 0 {
                 return None;
@@ -115,7 +119,7 @@ mod imp {
                     self.job.inner,
                     JobObjectExtendedLimitInformation,
                     &mut info as *mut _ as *const std::ffi::c_void,
-                    mem::size_of_val(&info) as u32,
+                    size_of_val(&info) as u32,
                 );
                 if r == 0 {
                     info!("failed to configure job object to defaults: {}", last_err());

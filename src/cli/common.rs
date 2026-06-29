@@ -1,33 +1,27 @@
 //! Just a dumping ground for cli stuff
 
-use std::cell::RefCell;
 use std::fmt::Display;
 use std::fs;
-#[cfg(not(windows))]
-use std::io::ErrorKind;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::path::Path;
+use std::sync::LazyLock;
 use std::{cmp, env};
 
+use anstyle::Style;
 use anyhow::{Context, Result, anyhow};
+use clap_cargo::style::{CONTEXT, ERROR, UPDATE_ADDED, UPDATE_UNCHANGED, UPDATE_UPGRADED};
 use git_testament::{git_testament, render_testament};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
-use super::self_update;
 use crate::{
-    cli::download_tracker::DownloadTracker,
     config::Cfg,
-    dist::{
-        TargetTriple, ToolchainDesc, manifest::ComponentStatus, notifications as dist_notifications,
-    },
+    dist::{DistOptions, TargetTriple, ToolchainDesc},
     errors::RustupError,
-    install::UpdateStatus,
-    notifications::Notification,
-    process::{Process, terminalsource},
-    toolchain::{DistributableToolchain, LocalToolchainName, Toolchain, ToolchainName},
-    utils::{self, notifications as util_notifications, notify::NotificationLevel},
+    install::{InstallMethod, UpdateStatus},
+    process::Process,
+    toolchain::{LocalToolchainName, Toolchain, ToolchainName},
+    utils::{self, ExitCode},
 };
 
 pub(crate) const WARN_COMPLETE_PROFILE: &str = "downloading with complete profile isn't recommended unless you are a developer of the rust language";
@@ -126,63 +120,6 @@ pub(crate) fn read_line(process: &Process) -> Result<String> {
     .context("unable to read from stdin for confirmation")
 }
 
-pub(super) struct Notifier {
-    tracker: Mutex<DownloadTracker>,
-    ram_notice_shown: RefCell<bool>,
-}
-
-impl Notifier {
-    pub(super) fn new(quiet: bool, process: &Process) -> Self {
-        Self {
-            tracker: Mutex::new(DownloadTracker::new_with_display_progress(!quiet, process)),
-            ram_notice_shown: RefCell::new(false),
-        }
-    }
-
-    pub(super) fn handle(&self, n: Notification<'_>) {
-        if self.tracker.lock().unwrap().handle_notification(&n) {
-            return;
-        }
-
-        if let Notification::Install(dist_notifications::Notification::Utils(
-            util_notifications::Notification::SetDefaultBufferSize(_),
-        )) = &n
-        {
-            if *self.ram_notice_shown.borrow() {
-                return;
-            } else {
-                *self.ram_notice_shown.borrow_mut() = true;
-            }
-        };
-        let level = n.level();
-        for n in format!("{n}").lines() {
-            match level {
-                NotificationLevel::Debug => {
-                    debug!("{}", n);
-                }
-                NotificationLevel::Info => {
-                    info!("{}", n);
-                }
-                NotificationLevel::Warn => {
-                    warn!("{}", n);
-                }
-                NotificationLevel::Error => {
-                    error!("{}", n);
-                }
-                NotificationLevel::Trace => {
-                    trace!("{}", n);
-                }
-            }
-        }
-    }
-}
-
-#[tracing::instrument(level = "trace", skip(process))]
-pub(crate) fn set_globals(current_dir: PathBuf, quiet: bool, process: &Process) -> Result<Cfg<'_>> {
-    let notifier = Notifier::new(quiet, process);
-    Cfg::from_env(current_dir, Arc::new(move |n| notifier.handle(n)), process)
-}
-
 pub(crate) fn show_channel_update(
     cfg: &Cfg<'_>,
     name: PackageUpdate,
@@ -210,11 +147,11 @@ fn show_channel_updates(
     updates: Vec<(PackageUpdate, Result<UpdateStatus>)>,
 ) -> Result<()> {
     let data = updates.into_iter().map(|(pkg, result)| {
-        let (banner, color) = match &result {
-            Ok(UpdateStatus::Installed) => ("installed", Some(terminalsource::Color::Green)),
-            Ok(UpdateStatus::Updated(_)) => ("updated", Some(terminalsource::Color::Green)),
-            Ok(UpdateStatus::Unchanged) => ("unchanged", None),
-            Err(_) => ("update failed", Some(terminalsource::Color::Red)),
+        let (banner, style) = match &result {
+            Ok(UpdateStatus::Installed) => ("installed", UPDATE_ADDED),
+            Ok(UpdateStatus::Updated(_)) => ("updated", UPDATE_UPGRADED),
+            Ok(UpdateStatus::Unchanged) => ("unchanged", UPDATE_UNCHANGED),
+            Err(_) => ("update failed", ERROR),
         };
 
         let (previous_version, version) = match &pkg {
@@ -249,175 +186,101 @@ fn show_channel_updates(
 
         let width = pkg.to_string().len() + 1 + banner.len();
 
-        Ok((pkg, banner, width, color, version, previous_version))
+        Ok((pkg, banner, width, style, version, previous_version))
     });
 
-    let mut t = cfg.process.stdout().terminal(cfg.process);
+    let t = cfg.process.stdout();
+    let mut t = t.lock();
 
     let data: Vec<_> = data.collect::<Result<_>>()?;
     let max_width = data
         .iter()
         .fold(0, |a, &(_, _, width, _, _, _)| cmp::max(a, width));
 
-    for (pkg, banner, width, color, version, previous_version) in data {
+    for (pkg, banner, width, style, version, previous_version) in data {
         let padding = max_width - width;
         let padding: String = " ".repeat(padding);
-        let _ = write!(t.lock(), "  {padding}");
-        let _ = t.attr(terminalsource::Attr::Bold);
-        if let Some(color) = color {
-            let _ = t.fg(color);
-        }
-        let _ = write!(t.lock(), "{pkg} {banner}");
-        let _ = t.reset();
-        let _ = write!(t.lock(), " - {version}");
+        let _ = write!(t, "  {padding}{style}{pkg} {banner}{style:#} - {version}");
         if let Some(previous_version) = previous_version {
-            let _ = write!(t.lock(), " (from {previous_version})");
+            let _ = write!(t, " (from {previous_version})");
         }
-        let _ = writeln!(t.lock());
+        let _ = writeln!(t);
     }
-    let _ = writeln!(t.lock());
+    let _ = writeln!(t);
 
     Ok(())
 }
 
-pub(crate) async fn update_all_channels(
-    cfg: &Cfg<'_>,
-    do_self_update: bool,
-    force_update: bool,
-) -> Result<utils::ExitCode> {
-    let toolchains = cfg.update_all_channels(force_update).await?;
+pub(crate) async fn update_all_channels(cfg: &Cfg<'_>, force_update: bool) -> Result<ExitCode> {
+    let profile = cfg.get_profile()?;
+    let mut toolchains = Vec::new();
+    for (desc, distributable) in cfg.list_channels()? {
+        let options = DistOptions::new(&[], &[], &desc, profile, force_update, cfg)?
+            .for_update(&distributable, false);
+        let result = InstallMethod::Dist(options).install().await;
+
+        if let Err(e) = &result {
+            error!("{e}");
+        }
+
+        toolchains.push((desc, result));
+    }
+
     let has_update_error = toolchains.iter().any(|(_, r)| r.is_err());
-    let mut exit_code = utils::ExitCode(if has_update_error { 1 } else { 0 });
+    let exit_code = if has_update_error {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
 
     if toolchains.is_empty() {
         info!("no updatable toolchains installed");
     }
 
-    let show_channel_updates = || {
-        if !toolchains.is_empty() {
-            writeln!(cfg.process.stdout().lock())?;
+    if !toolchains.is_empty() {
+        writeln!(cfg.process.stdout().lock())?;
 
-            let t = toolchains
-                .into_iter()
-                .map(|(p, s)| (PackageUpdate::Toolchain(p), s))
-                .collect();
-            show_channel_updates(cfg, t)?;
-        }
-        Ok(())
-    };
-
-    if do_self_update {
-        exit_code &= self_update(show_channel_updates, cfg.process).await?;
-    } else {
-        show_channel_updates()?;
+        let t = toolchains
+            .into_iter()
+            .map(|(p, s)| (PackageUpdate::Toolchain(p), s))
+            .collect();
+        show_channel_updates(cfg, t)?;
     }
+
     Ok(exit_code)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum SelfUpdatePermission {
-    HardFail,
-    #[cfg(not(windows))]
-    Skip,
-    Permit,
-}
-
-#[cfg(windows)]
-pub(crate) fn self_update_permitted(_explicit: bool) -> Result<SelfUpdatePermission> {
-    Ok(SelfUpdatePermission::Permit)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn self_update_permitted(explicit: bool) -> Result<SelfUpdatePermission> {
-    // Detect if rustup is not meant to self-update
-    let current_exe = env::current_exe()?;
-    let current_exe_dir = current_exe.parent().expect("Rustup isn't in a directory‽");
-    if let Err(e) = tempfile::Builder::new()
-        .prefix("updtest")
-        .tempdir_in(current_exe_dir)
-    {
-        match e.kind() {
-            ErrorKind::PermissionDenied => {
-                trace!("Skipping self-update because we cannot write to the rustup dir");
-                if explicit {
-                    return Ok(SelfUpdatePermission::HardFail);
-                } else {
-                    return Ok(SelfUpdatePermission::Skip);
-                }
-            }
-            _ => return Err(e.into()),
-        }
-    }
-    Ok(SelfUpdatePermission::Permit)
-}
-
-/// Performs all of a self-update: check policy, download, apply and exit.
-pub(crate) async fn self_update<F>(before_restart: F, process: &Process) -> Result<utils::ExitCode>
-where
-    F: FnOnce() -> Result<()>,
-{
-    match self_update_permitted(false)? {
-        SelfUpdatePermission::HardFail => {
-            error!("Unable to self-update.  STOP");
-            return Ok(utils::ExitCode(1));
-        }
-        #[cfg(not(windows))]
-        SelfUpdatePermission::Skip => return Ok(utils::ExitCode(0)),
-        SelfUpdatePermission::Permit => {}
-    }
-
-    let setup_path = self_update::prepare_update(process).await?;
-
-    before_restart()?;
-
-    if let Some(ref setup_path) = setup_path {
-        return self_update::run_update(setup_path);
-    } else {
-        // Try again in case we emitted "tool `{}` is already installed" last time.
-        self_update::install_proxies(process)?;
-    }
-
-    Ok(utils::ExitCode(0))
-}
-
+/// Print a list of items (targets or components) to stdout.
+///
+/// `items` represents the list of items, with the name and a boolean
+/// to represent whether the item is currently installed.
 pub(super) fn list_items(
-    distributable: DistributableToolchain<'_>,
-    f: impl Fn(&ComponentStatus) -> Option<&str>,
+    items: impl Iterator<Item = (impl Display, bool)>,
     installed_only: bool,
     quiet: bool,
     process: &Process,
-) -> Result<utils::ExitCode> {
-    let mut t = process.stdout().terminal(process);
-    for component in distributable.components()? {
-        let Some(name) = f(&component) else { continue };
-        match (component.available, component.installed, installed_only) {
-            (false, _, _) | (_, false, true) => continue,
-            (true, true, false) if !quiet => {
-                t.attr(terminalsource::Attr::Bold)?;
-                writeln!(t.lock(), "{name} (installed)")?;
-                t.reset()?;
-            }
-            (true, _, false) | (_, true, true) => {
-                writeln!(t.lock(), "{name}")?;
-            }
+) -> Result<ExitCode> {
+    let t = process.stdout();
+    let mut t = t.lock();
+    let bold = Style::new().bold();
+    for (name, installed) in items {
+        if installed && !installed_only && !quiet {
+            writeln!(t, "{bold}{name}{bold:#} {CONTEXT}(installed){CONTEXT:#}")?;
+        } else if installed || !installed_only {
+            writeln!(t, "{name}")?;
         }
     }
-
-    Ok(utils::ExitCode(0))
+    Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) async fn list_toolchains(
-    cfg: &Cfg<'_>,
-    verbose: bool,
-    quiet: bool,
-) -> Result<utils::ExitCode> {
+pub(crate) async fn list_toolchains(cfg: &Cfg<'_>, verbose: bool, quiet: bool) -> Result<ExitCode> {
     let toolchains = cfg.list_toolchains()?;
     if toolchains.is_empty() {
         writeln!(cfg.process.stdout().lock(), "no installed toolchains")?;
     } else {
         let default_toolchain_name = cfg.get_default()?;
         let active_toolchain_name: Option<ToolchainName> =
-            if let Ok(Some((LocalToolchainName::Named(toolchain), _reason))) =
+            if let Ok(Some((LocalToolchainName::Named(toolchain), _source))) =
                 cfg.maybe_ensure_active_toolchain(None).await
             {
                 Some(toolchain)
@@ -454,6 +317,13 @@ pub(crate) async fn list_toolchains(
             return Ok(());
         }
 
+        let status_str = match (is_default, is_active) {
+            (true, true) => " (active, default)",
+            (true, false) => " (default)",
+            (false, true) => " (active)",
+            (false, false) => "",
+        };
+
         let toolchain_path = cfg.toolchains_dir.join(toolchain);
         let toolchain_meta = fs::symlink_metadata(&toolchain_path)?;
         let toolchain_path = if verbose {
@@ -465,27 +335,18 @@ pub(crate) async fn list_toolchains(
         } else {
             String::new()
         };
-        let status_str = match (is_default, is_active) {
-            (true, true) => " (active, default)",
-            (true, false) => " (default)",
-            (false, true) => " (active)",
-            (false, false) => "",
-        };
 
         writeln!(
             cfg.process.stdout().lock(),
-            "{}{}{}",
-            &toolchain,
-            status_str,
-            toolchain_path
+            "{toolchain}{CONTEXT}{status_str}{CONTEXT:#}{toolchain_path}",
         )?;
         Ok(())
     }
 
-    Ok(utils::ExitCode(0))
+    Ok(ExitCode::SUCCESS)
 }
 
-pub(crate) fn list_overrides(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
+pub(crate) fn list_overrides(cfg: &Cfg<'_>) -> Result<ExitCode> {
     let overrides = cfg.settings_file.with(|s| Ok(s.overrides.clone()))?;
 
     if overrides.is_empty() {
@@ -513,7 +374,7 @@ pub(crate) fn list_overrides(cfg: &Cfg<'_>) -> Result<utils::ExitCode> {
             );
         }
     }
-    Ok(utils::ExitCode(0))
+    Ok(ExitCode::SUCCESS)
 }
 
 git_testament!(TESTAMENT);
@@ -526,7 +387,7 @@ pub(crate) fn version() -> &'static str {
     &RENDERED
 }
 
-pub(crate) fn dump_testament(process: &Process) -> Result<utils::ExitCode> {
+pub(crate) fn dump_testament(process: &Process) -> Result<ExitCode> {
     use git_testament::GitModification::*;
     writeln!(
         process.stdout().lock(),
@@ -576,7 +437,7 @@ pub(crate) fn dump_testament(process: &Process) -> Result<utils::ExitCode> {
             }
         }
     }
-    Ok(utils::ExitCode(0))
+    Ok(ExitCode::SUCCESS)
 }
 
 fn show_backtrace(process: &Process) -> bool {
@@ -628,7 +489,7 @@ pub(crate) fn ignorable_error(
 }
 
 /// Returns an error for a toolchain if both conditions are met:
-/// - The toolchain has an incompatible target triple,
+/// - The toolchain has an incompatible target tuple,
 ///   i.e. it might not be able to run on the host system.
 /// - The `force_non_host` flag is set to `false`.
 pub(crate) fn check_non_host_toolchain(
@@ -649,6 +510,11 @@ pub(crate) fn check_non_host_toolchain(
 
 /// Warns if rustup is running under emulation, such as macOS Rosetta
 pub(crate) fn warn_if_host_is_emulated(process: &Process) {
+    // In rustup's own CI, we wouldn't want host emulation warnings to mess up the
+    // end-to-end test results.
+    if process.var("RUSTUP_CI").is_ok() {
+        return;
+    }
     if TargetTriple::is_host_emulated() {
         warn!(
             "Rustup is not running natively. It's running under emulation of {}.",

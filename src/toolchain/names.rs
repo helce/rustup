@@ -67,6 +67,8 @@ pub enum InvalidName {
     ToolchainPath(String),
     #[error("invalid toolchain name '{0}'")]
     ToolchainName(String),
+    #[error("invalid toolchain name '+{0}'; valid toolchain names do not start with '+'")]
+    PlusPrefix(String),
 }
 
 macro_rules! from_variant {
@@ -117,6 +119,9 @@ macro_rules! try_from_str {
 
 /// Common validate rules for all sorts of toolchain names
 fn validate(candidate: &str) -> Result<&str, InvalidName> {
+    if let Some(without_plus) = candidate.strip_prefix('+') {
+        return Err(InvalidName::PlusPrefix(without_plus.to_string()));
+    }
     let normalized_name = candidate.trim_end_matches('/');
     if normalized_name.is_empty() {
         Err(InvalidName::ToolchainName(candidate.into()))
@@ -428,7 +433,7 @@ impl Display for PathBasedToolchainName {
 impl TryFrom<&Path> for PathBasedToolchainName {
     type Error = InvalidName;
 
-    fn try_from(value: &Path) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: &Path) -> Result<Self, Self::Error> {
         // if official || at least a single path component
         let as_str = value.display().to_string();
         if PartialToolchainDesc::from_str(&as_str).is_ok()
@@ -452,7 +457,7 @@ impl TryFrom<&Path> for PathBasedToolchainName {
 impl TryFrom<&LocalToolchainName> for PathBasedToolchainName {
     type Error = InvalidName;
 
-    fn try_from(value: &LocalToolchainName) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: &LocalToolchainName) -> Result<Self, Self::Error> {
         match value {
             LocalToolchainName::Named(_) => Err(InvalidName::PathToolchain(format!("{value}"))),
             LocalToolchainName::Path(n) => Ok(n.clone()),
@@ -501,8 +506,9 @@ mod tests {
 
     prop_compose! {
         fn arb_custom_name()
-            (s in r"[^\\/]+") -> String {
+            (s in r"[^\\/+][^\\/]*") -> String {
                 // perhaps need to filter 'none' and partial toolchains - but they won't typically be generated anyway.
+                // Also filter '+' prefix as that's reserved for +toolchain syntax.
                 s
         }
     }

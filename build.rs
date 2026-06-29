@@ -16,9 +16,9 @@ fn main() {
     println!("cargo::rerun-if-env-changed=RUSTUP_OVERRIDE_BUILD_TRIPLE");
     println!("cargo::rerun-if-env-changed=TARGET");
     match from_build() {
-        Ok(triple) => eprintln!("Computed build based on target triple: {triple:#?}"),
+        Ok(triple) => eprintln!("Computed build based on target tuple: {triple:#?}"),
         Err(s) => {
-            eprintln!("Unable to parse target '{s}' as a known target triple");
+            eprintln!("Unable to parse target '{s}' as a known target tuple");
             eprintln!(
                 "If you are attempting to bootstrap a new target, you might need to update `platforms` to a newer version"
             );
@@ -67,4 +67,9 @@ fn main() {
     // Turning them into errors forces them to be displayed (and the build to fail).
     // If we do want to ignore specific warnings then `/IGNORE:` should be used.
     println!("cargo::rustc-link-arg-bin=rustup-init=/WX");
+
+    // Increase the stack size to 2 mb.
+    // Works around issue with the clap parser using a lot of stack space in debug mode.
+    // See https://github.com/clap-rs/clap/issues/5134
+    println!("cargo::rustc-link-arg-bin=rustup-init=/STACK:0x200000");
 }

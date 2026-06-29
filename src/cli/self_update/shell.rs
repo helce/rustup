@@ -58,7 +58,7 @@ fn cargo_home_str_with_home(home: &str, process: &Process) -> Result<Cow<'static
 }
 
 // TODO: Tcsh (BSD)
-// TODO?: Make a decision on Ion Shell, Power Shell, Nushell
+// TODO?: Make a decision on Ion Shell
 // Cross-platform non-POSIX shells have not been assessed for integration yet
 fn enumerate_shells() -> Vec<Shell> {
     vec![
@@ -67,6 +67,9 @@ fn enumerate_shells() -> Vec<Shell> {
         Box::new(Zsh),
         Box::new(Fish),
         Box::new(Nu),
+        Box::new(Tcsh),
+        Box::new(Pwsh),
+        Box::new(Xonsh),
     ]
 }
 
@@ -308,13 +311,193 @@ impl UnixShell for Nu {
 
     fn source_string(&self, process: &Process) -> Result<String> {
         Ok(format!(
-            r#"source $"{}/env.nu""#,
+            r#"source "{}/env.nu""#,
             self.cargo_home_str(process)?
         ))
     }
 
     fn cargo_home_str(&self, process: &Process) -> Result<Cow<'static, str>> {
-        cargo_home_str_with_home("($nu.home-path)", process)
+        cargo_home_str_with_home("~", process)
+    }
+}
+
+struct Tcsh;
+
+impl UnixShell for Tcsh {
+    fn does_exist(&self, process: &Process) -> bool {
+        matches!(process.var("SHELL"), Ok(sh) if sh.contains("tcsh"))
+            || utils::find_cmd(&["tcsh"], process).is_some()
+    }
+
+    fn rcfiles(&self, process: &Process) -> Vec<PathBuf> {
+        let mut paths = vec![];
+
+        if let Some(home) = process.home_dir() {
+            paths.push(home.join(".tcshrc"));
+            paths.push(home.join(".cshrc"));
+        }
+
+        paths
+    }
+
+    fn update_rcs(&self, process: &Process) -> Vec<PathBuf> {
+        for f in self.rcfiles(process) {
+            if f.is_file() {
+                return vec![f];
+            }
+        }
+
+        // If neither exists, default to ~/.tcshrc
+        if let Some(home) = process.home_dir() {
+            return vec![home.join(".tcshrc")];
+        }
+
+        vec![]
+    }
+
+    fn env_script(&self) -> ShellScript {
+        ShellScript {
+            name: "env.tcsh",
+            content: include_str!("env.tcsh"),
+        }
+    }
+
+    fn source_string(&self, process: &Process) -> Result<String> {
+        Ok(format!(
+            r#"source "{}/env.tcsh""#,
+            self.cargo_home_str(process)?
+        ))
+    }
+}
+
+struct Pwsh;
+
+impl UnixShell for Pwsh {
+    fn does_exist(&self, process: &Process) -> bool {
+        matches!(process.var("SHELL"), Ok(sh) if sh.contains("pwsh"))
+            || utils::find_cmd(&["pwsh"], process).is_some()
+    }
+
+    fn rcfiles(&self, process: &Process) -> Vec<PathBuf> {
+        let mut paths = vec![];
+
+        let Some(mut config_dir) = process.home_dir() else {
+            return paths;
+        };
+        config_dir.extend([".config", "powershell"]);
+
+        // PowerShell provides many kinds of user-specific and host-specific
+        // profile files. When the system has multiple profiles, PowerShell
+        // executes them in a defined order.
+        //
+        // For more details, please refer to:
+        // https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_profiles
+        //
+        // `~/.config/powershell/profile.ps1` is the "Current User, All Hosts"
+        // profile file. It affects all PowerShell hosts of the current user.
+        paths.push(config_dir.join("profile.ps1"));
+
+        let Ok(config_dir) = config_dir.read_dir() else {
+            return paths;
+        };
+
+        // Some editors like Visual Studio Code or PowerShell ISE use their
+        // own dedicated profile files, whose file names are
+        // `<Host Profile ID>_profile.ps1`. Such customization may use
+        // PowerShell Editor Services for IDE integration.
+        // https://github.com/PowerShell/PowerShellEditorServices
+        for host_profile in config_dir {
+            let Ok(host_profile) = host_profile else {
+                continue;
+            };
+            let host_profile_path = host_profile.path();
+            if !host_profile_path.is_file() {
+                continue;
+            }
+            if host_profile_path.ends_with("_profile.ps1") {
+                paths.push(host_profile_path);
+            }
+        }
+
+        paths
+    }
+
+    fn update_rcs(&self, process: &Process) -> Vec<PathBuf> {
+        let mut paths = vec![];
+        // Always modify the "Current User, All Hosts" profile.
+        let Some(mut profile) = process.home_dir() else {
+            return paths;
+        };
+
+        profile.extend([".config", "powershell", "profile.ps1"]);
+        paths.push(profile);
+        paths
+    }
+
+    fn env_script(&self) -> ShellScript {
+        ShellScript {
+            name: "env.ps1",
+            content: include_str!("env.ps1"),
+        }
+    }
+
+    fn source_string(&self, process: &Process) -> Result<String> {
+        Ok(format!(r#". "{}/env.ps1""#, self.cargo_home_str(process)?))
+    }
+}
+
+struct Xonsh;
+
+impl UnixShell for Xonsh {
+    fn does_exist(&self, process: &Process) -> bool {
+        process.var("XONSHRC").is_ok() || utils::find_cmd(&["xonsh"], process).is_some()
+    }
+
+    fn rcfiles(&self, process: &Process) -> Vec<PathBuf> {
+        let mut paths = vec![];
+
+        if let Ok(p) = process.var("XDG_CONFIG_HOME") {
+            let mut p = PathBuf::from(p);
+            p.extend(["xonsh", "rc.xsh"]);
+            paths.push(p);
+        }
+
+        if let Some(mut p) = process.home_dir() {
+            p.extend([".config", "xonsh", "rc.xsh"]);
+            paths.push(p);
+        }
+
+        if let Some(home) = process.home_dir() {
+            paths.push(home.join(".xonshrc"));
+        }
+
+        paths
+    }
+
+    fn update_rcs(&self, process: &Process) -> Vec<PathBuf> {
+        // The first rcfile in XDG_CONFIG_HOME takes precedence.
+        match self.rcfiles(process).into_iter().next() {
+            Some(path) => vec![path],
+            None => vec![],
+        }
+    }
+
+    fn env_script(&self) -> ShellScript {
+        ShellScript {
+            name: "env.xsh",
+            content: include_str!("env.xsh"),
+        }
+    }
+
+    fn source_string(&self, process: &Process) -> Result<String> {
+        Ok(format!(
+            r#"source "{}/env.xsh""#,
+            self.cargo_home_str(process)?
+        ))
+    }
+
+    fn cargo_home_str(&self, process: &Process) -> Result<Cow<'static, str>> {
+        cargo_home_str_with_home("$HOME", process)
     }
 }
 

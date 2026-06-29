@@ -12,18 +12,19 @@
 //!
 //! Docs: <https://forge.rust-lang.org/infra/channel-layout.html>
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-use std::fmt;
-use std::hash::{Hash, Hasher};
-use std::str::FromStr;
+use std::{
+    collections::{BTreeMap, btree_map::Entry},
+    fmt,
+    hash::{Hash, Hasher},
+    str::FromStr,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     dist::{Profile, TargetTriple, ToolchainDesc, config::Config},
-    errors::*,
+    errors::RustupError,
     toolchain::DistributableToolchain,
 };
 
@@ -41,13 +42,41 @@ pub struct Manifest {
     pub(crate) manifest_version: ManifestVersion,
     pub date: String,
     #[serde(default, rename = "pkg")]
-    pub packages: HashMap<String, Package>,
+    pub packages: BTreeMap<String, Package>,
     #[serde(default)]
-    pub renames: HashMap<String, Renamed>,
+    pub renames: BTreeMap<String, Renamed>,
     #[serde(default, skip_serializing)]
-    pub reverse_renames: HashMap<String, String>,
+    pub reverse_renames: BTreeMap<String, String>,
     #[serde(default)]
-    pub profiles: HashMap<Profile, Vec<String>>,
+    pub profiles: BTreeMap<Profile, Vec<String>>,
+}
+
+impl Manifest {
+    pub(crate) fn name(&self, component: &Component) -> String {
+        let pkg = self.short_name(component);
+        if let Some(t) = &component.target {
+            format!("{pkg}-{t}")
+        } else {
+            pkg.to_owned()
+        }
+    }
+
+    pub(crate) fn description(&self, component: &Component) -> String {
+        let pkg = self.short_name(component);
+        if let Some(t) = &component.target {
+            format!("'{pkg}' for target '{t}'")
+        } else {
+            format!("'{pkg}'")
+        }
+    }
+
+    pub(crate) fn short_name<'a>(&'a self, component: &'a Component) -> &'a str {
+        if let Some(from) = self.reverse_renames.get(&component.pkg) {
+            from
+        } else {
+            &component.pkg
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -66,12 +95,12 @@ pub struct Package {
 #[serde(from = "TargetsMap", into = "TargetsMap")]
 pub enum PackageTargets {
     Wildcard(TargetedPackage),
-    Targeted(HashMap<TargetTriple, TargetedPackage>),
+    Targeted(BTreeMap<TargetTriple, TargetedPackage>),
 }
 
 #[derive(Deserialize, Serialize)]
 #[serde(transparent)]
-struct TargetsMap(HashMap<TargetTriple, TargetedPackage>);
+struct TargetsMap(BTreeMap<TargetTriple, TargetedPackage>);
 
 impl From<TargetsMap> for PackageTargets {
     fn from(mut map: TargetsMap) -> Self {
@@ -87,7 +116,7 @@ impl From<PackageTargets> for TargetsMap {
     fn from(targets: PackageTargets) -> Self {
         match targets {
             PackageTargets::Wildcard(tpkg) => {
-                let mut map = HashMap::new();
+                let mut map = BTreeMap::new();
                 map.insert(TargetTriple::new("*"), tpkg);
                 Self(map)
             }
@@ -249,7 +278,7 @@ impl Hash for Component {
 }
 
 mod component_target {
-    use super::*;
+    use super::{Result, TargetTriple};
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(
@@ -283,8 +312,16 @@ impl Manifest {
         Ok(manifest)
     }
 
-    pub fn stringify(self) -> anyhow::Result<String> {
+    pub fn stringify(self) -> Result<String> {
         Ok(toml::to_string(&self)?)
+    }
+
+    pub(super) fn binary(&self, component: &Component) -> Result<Option<&HashedBinary>> {
+        let package = self.get_package(component.short_name_in_manifest())?;
+        let target_package = package.get_target(component.target.as_ref())?;
+        // We prefer the first format in the list, since the parsing of the
+        // manifest leaves us with the files/hash pairs in preference order.
+        Ok(target_package.bins.first())
     }
 
     pub fn get_package(&self, name: &str) -> Result<&Package> {
@@ -344,12 +381,12 @@ impl Manifest {
 
     fn validate_targeted_package(&self, tpkg: &TargetedPackage) -> Result<()> {
         for c in tpkg.components.iter() {
-            let cpkg = self
-                .get_package(&c.pkg)
-                .with_context(|| RustupError::MissingPackageForComponent(c.short_name(self)))?;
-            let _ctpkg = cpkg
-                .get_target(c.target.as_ref())
-                .with_context(|| RustupError::MissingPackageForComponent(c.short_name(self)))?;
+            let cpkg = self.get_package(&c.pkg).with_context(|| {
+                RustupError::MissingPackageForComponent(self.short_name(c).to_owned())
+            })?;
+            let _ctpkg = cpkg.get_target(c.target.as_ref()).with_context(|| {
+                RustupError::MissingPackageForComponent(self.short_name(c).to_owned())
+            })?;
         }
         Ok(())
     }
@@ -357,11 +394,11 @@ impl Manifest {
     fn validate(&self) -> Result<()> {
         // Every component mentioned must have an actual package to download
         for pkg in self.packages.values() {
-            match pkg.targets {
-                PackageTargets::Wildcard(ref tpkg) => {
+            match &pkg.targets {
+                PackageTargets::Wildcard(tpkg) => {
                     self.validate_targeted_package(tpkg)?;
                 }
-                PackageTargets::Targeted(ref tpkgs) => {
+                PackageTargets::Targeted(tpkgs) => {
                     for tpkg in tpkgs.values() {
                         self.validate_targeted_package(tpkg)?;
                     }
@@ -400,7 +437,7 @@ impl Manifest {
         config: &Config,
     ) -> Result<Vec<ComponentStatus>> {
         // Return all optional components of the "rust" package for the
-        // toolchain's target triple.
+        // toolchain's target tuple.
         let mut res = Vec::new();
 
         let rust_pkg = self
@@ -423,7 +460,7 @@ impl Manifest {
                 .unwrap_or_else(|_| {
                     panic!(
                         "manifest should contain component {}",
-                        &component.short_name(self)
+                        &self.short_name(component)
                     )
                 });
             let component_target_pkg = component_pkg
@@ -433,7 +470,7 @@ impl Manifest {
 
             res.push(ComponentStatus {
                 component: component.clone(),
-                name: component.name(self),
+                name: self.name(component),
                 installed,
                 available: component_target_pkg.available(),
             });
@@ -447,9 +484,9 @@ impl Manifest {
 
 impl Package {
     pub fn get_target(&self, target: Option<&TargetTriple>) -> Result<&TargetedPackage> {
-        match self.targets {
-            PackageTargets::Wildcard(ref tpkg) => Ok(tpkg),
-            PackageTargets::Targeted(ref tpkgs) => {
+        match &self.targets {
+            PackageTargets::Wildcard(tpkg) => Ok(tpkg),
+            PackageTargets::Targeted(tpkgs) => {
                 if let Some(t) = target {
                     tpkgs
                         .get(t)
@@ -501,7 +538,7 @@ impl Component {
         let manifest = distributable.get_manifest()?;
         for component_status in distributable.components()? {
             let component = component_status.component;
-            if name == component.name_in_manifest() || name == component.name(&manifest) {
+            if name == component.name_in_manifest() || name == manifest.name(&component) {
                 return Ok(component);
             }
         }
@@ -521,35 +558,12 @@ impl Component {
         }
     }
 
-    pub(crate) fn name(&self, manifest: &Manifest) -> String {
-        let pkg = self.short_name(manifest);
-        if let Some(ref t) = self.target {
-            format!("{pkg}-{t}")
-        } else {
-            pkg
-        }
-    }
-    pub(crate) fn short_name(&self, manifest: &Manifest) -> String {
-        if let Some(from) = manifest.reverse_renames.get(&self.pkg) {
-            from.to_owned()
-        } else {
-            self.pkg.clone()
-        }
-    }
-    pub(crate) fn description(&self, manifest: &Manifest) -> String {
-        let pkg = self.short_name(manifest);
-        if let Some(ref t) = self.target {
-            format!("'{pkg}' for target '{t}'")
-        } else {
-            format!("'{pkg}'")
-        }
-    }
     pub fn short_name_in_manifest(&self) -> &String {
         &self.pkg
     }
     pub(crate) fn name_in_manifest(&self) -> String {
         let pkg = self.short_name_in_manifest();
-        if let Some(ref t) = self.target {
+        if let Some(t) = &self.target {
             format!("{pkg}-{t}")
         } else {
             pkg.to_string()
@@ -626,6 +640,9 @@ mod tests {
 
     // Example manifest from https://public.etherpad-mozilla.org/p/Rust-infra-work-week
     static EXAMPLE: &str = include_str!("manifest/tests/channel-rust-nightly-example.toml");
+    // Same manifest as above, but with the packages in a different order.
+    static EXAMPLE_REORDERED: &str =
+        include_str!("manifest/tests/channel-rust-nightly-example.toml");
     // From brson's live build-rust-manifest.py script
     static EXAMPLE2: &str = include_str!("manifest/tests/channel-rust-nightly-example2.toml");
 
@@ -728,5 +745,14 @@ date = "2015-10-10"
         let manifest = EXAMPLE.replace("x86_64-unknown-linux-gnu", "mycpu-myvendor-myos");
 
         assert!(Manifest::parse(&manifest).is_ok());
+    }
+
+    // #4715
+    #[test]
+    fn manifest_serialized_with_sorted_keys() -> anyhow::Result<()> {
+        let manifest = Manifest::parse(EXAMPLE)?;
+        let manifest_reordered = Manifest::parse(EXAMPLE_REORDERED)?;
+        assert_eq!(manifest.stringify()?, manifest_reordered.stringify()?);
+        Ok(())
     }
 }

@@ -6,11 +6,11 @@ use std::str::FromStr;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use tracing::info;
 
 use crate::cli::self_update::SelfUpdateMode;
 use crate::dist::{AutoInstallMode, Profile};
-use crate::errors::*;
-use crate::notifications::*;
+use crate::errors::RustupError;
 use crate::utils;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,42 +98,30 @@ pub struct Settings {
 }
 
 impl Settings {
-    fn path_to_key(path: &Path, notify_handler: &dyn Fn(Notification<'_>)) -> String {
+    fn path_to_key(path: &Path) -> String {
         if path.exists() {
-            utils::canonicalize_path(path, notify_handler)
-                .display()
-                .to_string()
+            utils::canonicalize_path(path).display().to_string()
         } else {
             path.display().to_string()
         }
     }
 
-    pub(crate) fn remove_override(
-        &mut self,
-        path: &Path,
-        notify_handler: &dyn Fn(Notification<'_>),
-    ) -> bool {
-        let key = Self::path_to_key(path, notify_handler);
+    pub(crate) fn remove_override(&mut self, path: &Path) -> bool {
+        let key = Self::path_to_key(path);
         self.overrides.remove(&key).is_some()
     }
 
-    pub(crate) fn add_override(
-        &mut self,
-        path: &Path,
-        toolchain: String,
-        notify_handler: &dyn Fn(Notification<'_>),
-    ) {
-        let key = Self::path_to_key(path, notify_handler);
-        notify_handler(Notification::SetOverrideToolchain(path, &toolchain));
+    pub(crate) fn add_override(&mut self, path: &Path, toolchain: String) {
+        let key = Self::path_to_key(path);
+        info!(
+            "override toolchain for {} set to {toolchain}",
+            path.display(),
+        );
         self.overrides.insert(key, toolchain);
     }
 
-    pub(crate) fn dir_override(
-        &self,
-        dir: &Path,
-        notify_handler: &dyn Fn(Notification<'_>),
-    ) -> Option<String> {
-        let key = Self::path_to_key(dir, notify_handler);
+    pub(crate) fn dir_override(&self, dir: &Path) -> Option<String> {
+        let key = Self::path_to_key(dir);
         self.overrides.get(&key).cloned()
     }
 
@@ -147,7 +135,7 @@ impl Settings {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) enum MetadataVersion {
+pub enum MetadataVersion {
     #[serde(rename = "2")]
     V2,
     #[serde(rename = "12")]

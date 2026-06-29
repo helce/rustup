@@ -15,8 +15,6 @@ use sharded_slab::pool::{OwnedRef, OwnedRefMut};
 use tracing::debug;
 
 use super::{CompletedIo, Executor, Item, perform};
-use crate::utils::notifications::Notification;
-use crate::utils::units::Unit;
 
 #[derive(Copy, Clone, Debug, Enum)]
 pub(crate) enum Bucket {
@@ -55,16 +53,12 @@ impl AsRef<[u8]> for PoolReference {
     }
 }
 
+#[derive(Default)]
 enum Task {
     Request(CompletedIo),
     // Used to synchronise in the join method.
+    #[default]
     Sentinel,
-}
-
-impl Default for Task {
-    fn default() -> Self {
-        Self::Sentinel
-    }
 }
 
 struct Pool {
@@ -97,23 +91,18 @@ impl fmt::Debug for Pool {
     }
 }
 
-pub(crate) struct Threaded<'a> {
+pub(crate) struct Threaded {
     n_files: Arc<AtomicUsize>,
     pool: threadpool::ThreadPool,
-    notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
     rx: Receiver<Task>,
     tx: Sender<Task>,
     vec_pools: EnumMap<Bucket, Pool>,
     ram_budget: usize,
 }
 
-impl<'a> Threaded<'a> {
+impl Threaded {
     /// Construct a new Threaded executor.
-    pub(crate) fn new(
-        notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
-        thread_count: usize,
-        ram_budget: usize,
-    ) -> Self {
+    pub(crate) fn new(thread_count: usize, ram_budget: usize) -> Self {
         // Defaults to hardware thread count threads; this is suitable for
         // our needs as IO bound operations tend to show up as write latencies
         // rather than close latencies, so we don't need to look at
@@ -169,7 +158,6 @@ impl<'a> Threaded<'a> {
         Self {
             n_files: Arc::new(AtomicUsize::new(0)),
             pool,
-            notify_handler,
             rx,
             tx,
             vec_pools,
@@ -234,7 +222,7 @@ impl<'a> Threaded<'a> {
     }
 }
 
-impl Executor for Threaded<'_> {
+impl Executor for Threaded {
     fn dispatch(&self, item: Item) -> Box<dyn Iterator<Item = CompletedIo> + '_> {
         // Yield any completed work before accepting new work - keep memory
         // pressure under control
@@ -261,18 +249,11 @@ impl Executor for Threaded<'_> {
         // items, and the download tracker's progress is confounded with
         // actual handling of data today, we synthesis a data buffer and
         // pretend to have bytes to deliver.
-        let mut prev_files = self.n_files.load(Ordering::Relaxed);
-        if let Some(handler) = self.notify_handler {
-            handler(Notification::DownloadFinished);
-            handler(Notification::DownloadPushUnit(Unit::IO));
-            handler(Notification::DownloadContentLengthReceived(
-                prev_files as u64,
-            ));
-        }
+        let prev_files = self.n_files.load(Ordering::Relaxed);
         if prev_files > 50 {
             debug!("{prev_files} deferred IO operations");
         }
-        let buf: Vec<u8> = vec![0; prev_files];
+
         // Cheap wrap-around correctness check - we have 20k files, more than
         // 32K means we subtracted from 0 somewhere.
         assert!(32767 > prev_files);
@@ -280,18 +261,10 @@ impl Executor for Threaded<'_> {
         while current_files != 0 {
             use std::thread::sleep;
             sleep(std::time::Duration::from_millis(100));
-            prev_files = current_files;
             current_files = self.n_files.load(Ordering::Relaxed);
-            let step_count = prev_files - current_files;
-            if let Some(handler) = self.notify_handler {
-                handler(Notification::DownloadDataReceived(&buf[0..step_count]));
-            }
         }
         self.pool.join();
-        if let Some(handler) = self.notify_handler {
-            handler(Notification::DownloadFinished);
-            handler(Notification::DownloadPopUnit);
-        }
+
         // close the feedback channel so that blocking reads on it can
         // complete. send is atomic, and we know the threads completed from the
         // pool join, so this is race-free. It is possible that try_iter is safe
@@ -351,19 +324,19 @@ impl Executor for Threaded<'_> {
     }
 }
 
-impl Drop for Threaded<'_> {
+impl Drop for Threaded {
     fn drop(&mut self) {
         // We are not permitted to fail - consume but do not handle the items.
         self.join().for_each(drop);
     }
 }
 
-struct JoinIterator<'a, 'b> {
-    executor: &'a Threaded<'b>,
+struct JoinIterator<'a> {
+    executor: &'a Threaded,
     consume_sentinel: bool,
 }
 
-impl JoinIterator<'_, '_> {
+impl JoinIterator<'_> {
     fn inner<T: Iterator<Item = Task>>(&self, mut iter: T) -> Option<CompletedIo> {
         loop {
             let task_o = iter.next();
@@ -387,7 +360,7 @@ impl JoinIterator<'_, '_> {
     }
 }
 
-impl Iterator for JoinIterator<'_, '_> {
+impl Iterator for JoinIterator<'_> {
     type Item = CompletedIo;
 
     fn next(&mut self) -> Option<CompletedIo> {
@@ -399,12 +372,12 @@ impl Iterator for JoinIterator<'_, '_> {
     }
 }
 
-struct SubmitIterator<'a, 'b> {
-    executor: &'a Threaded<'b>,
+struct SubmitIterator<'a> {
+    executor: &'a Threaded,
     item: Cell<Option<Item>>,
 }
 
-impl Iterator for SubmitIterator<'_, '_> {
+impl Iterator for SubmitIterator<'_> {
     type Item = CompletedIo;
 
     fn next(&mut self) -> Option<CompletedIo> {

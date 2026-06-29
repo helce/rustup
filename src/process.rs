@@ -1,9 +1,10 @@
-use std::env;
 use std::ffi::OsString;
 use std::fmt::Debug;
 use std::io;
 use std::io::IsTerminal;
+use std::num::NonZero;
 use std::path::PathBuf;
+use std::str::FromStr;
 #[cfg(feature = "test")]
 use std::{
     collections::HashMap,
@@ -11,8 +12,11 @@ use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
+use std::{env, thread};
 
-use anyhow::{Context, Result};
+use anstream::ColorChoice;
+use anyhow::{Context, Result, bail};
+use indicatif::ProgressDrawTarget;
 #[cfg(feature = "test")]
 use tracing::subscriber::DefaultGuard;
 #[cfg(feature = "test")]
@@ -20,11 +24,12 @@ use tracing_subscriber::util::SubscriberInitExt;
 #[cfg(feature = "test")]
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
-#[cfg(all(feature = "test", feature = "otel"))]
+#[cfg(feature = "test")]
 use crate::cli::log;
 
-pub mod filesource;
-pub mod terminalsource;
+mod file_source;
+mod terminal_source;
+pub use terminal_source::ColorableTerminal;
 
 /// Allows concrete types for the process abstraction.
 #[derive(Clone, Debug)]
@@ -64,22 +69,82 @@ impl Process {
         home::env::rustup_home_with_env(self).context("failed to determine rustup home dir")
     }
 
+    pub fn io_thread_count(&self) -> Result<IoThreadCount> {
+        if let Ok(n) = self.var("RUSTUP_IO_THREADS") {
+            let threads = usize::from_str(&n).context(
+                "invalid value in RUSTUP_IO_THREADS -- must be a natural number greater than zero",
+            )?;
+            match threads {
+                0 => bail!("RUSTUP_IO_THREADS must be a natural number greater than zero"),
+                _ => return Ok(IoThreadCount::UserSpecified(threads)),
+            }
+        };
+
+        let count = match thread::available_parallelism() {
+            // Don't spawn more than 8 I/O threads unless the user tells us to.
+            // Feel free to increase this value if it improves performance.
+            Ok(threads) => Ord::min(threads.get(), 8),
+            // Unknown for target platform or no permission to query.
+            Err(_) => 1,
+        };
+        Ok(IoThreadCount::Default(count))
+    }
+
+    pub(crate) fn unpack_ram(&self) -> Result<Option<usize>, env::VarError> {
+        Ok(match self.var_opt("RUSTUP_UNPACK_RAM")? {
+            Some(budget) => usize::from_str(&budget).ok(),
+            None => None,
+        })
+    }
+
+    pub fn var_opt(&self, key: &str) -> Result<Option<String>, env::VarError> {
+        match self.var(key) {
+            Ok(val) => Ok(Some(val)),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
     pub fn var(&self, key: &str) -> Result<String, env::VarError> {
-        match self {
-            Process::OsProcess(_) => env::var(key),
+        let value = match self {
+            Process::OsProcess(_) => env::var(key)?,
             #[cfg(feature = "test")]
             Process::TestProcess(p) => match p.vars.get(key) {
-                Some(val) => Ok(val.to_owned()),
-                None => Err(env::VarError::NotPresent),
+                Some(val) => val.to_owned(),
+                None => return Err(env::VarError::NotPresent),
             },
+        };
+
+        match value.is_empty() {
+            false => Ok(value),
+            true => Err(env::VarError::NotPresent),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn permit_copy_rename(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn permit_copy_rename(&self) -> bool {
+        match self {
+            Process::OsProcess(_) => env::var_os("RUSTUP_PERMIT_COPY_RENAME").is_some(),
+            #[cfg(feature = "test")]
+            Process::TestProcess(p) => p.vars.contains_key("RUSTUP_PERMIT_COPY_RENAME"),
         }
     }
 
     pub(crate) fn var_os(&self, key: &str) -> Option<OsString> {
-        match self {
-            Process::OsProcess(_) => env::var_os(key),
+        let value = match self {
+            Process::OsProcess(_) => env::var_os(key)?,
             #[cfg(feature = "test")]
-            Process::TestProcess(p) => p.vars.get(key).map(OsString::from),
+            Process::TestProcess(p) => p.vars.get(key).map(OsString::from)?,
+        };
+
+        match value.is_empty() {
+            false => Some(value),
+            true => None,
         }
     }
 
@@ -99,27 +164,31 @@ impl Process {
         }
     }
 
-    pub(crate) fn stdin(&self) -> Box<dyn filesource::Stdin> {
+    pub(crate) fn stdin(&self) -> Box<dyn file_source::Stdin> {
         match self {
             Process::OsProcess(_) => Box::new(io::stdin()),
             #[cfg(feature = "test")]
-            Process::TestProcess(p) => Box::new(filesource::TestStdin(p.stdin.clone())),
+            Process::TestProcess(p) => Box::new(file_source::TestStdin(p.stdin.clone())),
         }
     }
 
-    pub(crate) fn stdout(&self) -> Box<dyn filesource::Writer> {
+    pub(crate) fn stdout(&self) -> ColorableTerminal {
         match self {
-            Process::OsProcess(_) => Box::new(io::stdout()),
+            Process::OsProcess(_) => ColorableTerminal::stdout(self),
             #[cfg(feature = "test")]
-            Process::TestProcess(p) => Box::new(filesource::TestWriter(p.stdout.clone())),
+            Process::TestProcess(p) => {
+                ColorableTerminal::test(file_source::TestWriter(p.stdout.clone()), self)
+            }
         }
     }
 
-    pub(crate) fn stderr(&self) -> Box<dyn filesource::Writer> {
+    pub(crate) fn stderr(&self) -> ColorableTerminal {
         match self {
-            Process::OsProcess(_) => Box::new(io::stderr()),
+            Process::OsProcess(_) => ColorableTerminal::stderr(self),
             #[cfg(feature = "test")]
-            Process::TestProcess(p) => Box::new(filesource::TestWriter(p.stderr.clone())),
+            Process::TestProcess(p) => {
+                ColorableTerminal::test(file_source::TestWriter(p.stderr.clone()), self)
+            }
         }
     }
 
@@ -128,6 +197,54 @@ impl Process {
             Process::OsProcess(_) => env::current_dir(),
             #[cfg(feature = "test")]
             Process::TestProcess(p) => Ok(p.cwd.clone()),
+        }
+    }
+
+    pub fn progress_draw_target(&self) -> ProgressDrawTarget {
+        match self {
+            Process::OsProcess(_) => (),
+            #[cfg(feature = "test")]
+            Process::TestProcess(_) => return ProgressDrawTarget::hidden(),
+        }
+
+        let term = self.stdout();
+        let term = match self.var("RUSTUP_TERM_PROGRESS_WHEN") {
+            Ok(s) if s.eq_ignore_ascii_case("always") => Some(term),
+            Ok(s) if s.eq_ignore_ascii_case("never") => None,
+            _ if term.is_a_tty() => Some(term),
+            _ => None,
+        };
+
+        match term {
+            Some(t) => ProgressDrawTarget::term_like_with_hz(Box::new(t), 20),
+            None => ProgressDrawTarget::hidden(),
+        }
+    }
+
+    fn color_choice(&self, is_a_tty: bool) -> ColorChoice {
+        match self.var("RUSTUP_TERM_COLOR") {
+            Ok(s) if s.eq_ignore_ascii_case("always") => ColorChoice::Always,
+            Ok(s) if s.eq_ignore_ascii_case("never") => ColorChoice::Never,
+            _ if is_a_tty => ColorChoice::Auto,
+            _ => ColorChoice::Never,
+        }
+    }
+
+    pub fn concurrent_downloads(&self) -> Option<usize> {
+        let s = self.var("RUSTUP_CONCURRENT_DOWNLOADS").ok()?;
+        Some(NonZero::from_str(&s).ok()?.get())
+    }
+}
+
+pub enum IoThreadCount {
+    Default(usize),
+    UserSpecified(usize),
+}
+
+impl From<IoThreadCount> for usize {
+    fn from(c: IoThreadCount) -> Self {
+        match c {
+            IoThreadCount::Default(n) | IoThreadCount::UserSpecified(n) => n,
         }
     }
 }
@@ -239,7 +356,7 @@ impl TestProcess {
 impl From<TestContext> for TestProcess {
     fn from(inner: TestContext) -> Self {
         let inner = Process::TestProcess(inner);
-        let (tracing_subscriber, console_filter) = crate::cli::log::tracing_subscriber(&inner);
+        let (tracing_subscriber, console_filter) = log::tracing_subscriber(&inner);
         Self {
             process: inner,
             console_filter,
@@ -263,7 +380,33 @@ pub struct TestContext {
     pub cwd: PathBuf,
     args: Vec<String>,
     vars: HashMap<String, String>,
-    stdin: filesource::TestStdinInner,
-    stdout: filesource::TestWriterInner,
-    stderr: filesource::TestWriterInner,
+    stdin: file_source::TestStdinInner,
+    stdout: file_source::TestWriterInner,
+    stderr: file_source::TestWriterInner,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::process::TestProcess;
+    use crate::test::Env;
+
+    #[test]
+    fn term_color_choice() {
+        fn assert_color_choice(env_val: &str, is_a_tty: bool, color_choice: ColorChoice) {
+            let mut vars = HashMap::new();
+            vars.env("RUSTUP_TERM_COLOR", env_val);
+            let tp = TestProcess::with_vars(vars);
+            assert_eq!(tp.process.color_choice(is_a_tty), color_choice);
+        }
+
+        assert_color_choice("aLWayS", false, ColorChoice::Always);
+        assert_color_choice("neVer", false, ColorChoice::Never);
+        // tty + `auto` enables the colors.
+        assert_color_choice("AutO", true, ColorChoice::Auto);
+        // non-tty + `auto` does not enable the colors.
+        assert_color_choice("aUTo", false, ColorChoice::Never);
+    }
 }

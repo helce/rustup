@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::{
     env::{self, consts::EXE_SUFFIX},
     ffi::{OsStr, OsString},
@@ -12,16 +14,20 @@ use std::{
 
 use anyhow::{Context, anyhow, bail};
 use fs_at::OpenOptions;
+use same_file::is_same_file;
 use tracing::info;
 use url::Url;
 use wait_timeout::ChildExt;
 
 use crate::{
     RustupError,
-    config::{ActiveReason, Cfg, InstalledPath},
-    dist::PartialToolchainDesc,
+    config::{ActiveSource, Cfg, InstalledPath},
+    dist::{
+        DistOptions, PartialToolchainDesc, TargetTriple,
+        component::{Component, Components},
+        prefix::InstallPrefix,
+    },
     env_var, install,
-    notifications::Notification,
     utils::{self, raw::open_dir_following_links},
 };
 
@@ -55,23 +61,19 @@ impl<'a> Toolchain<'a> {
                 name: ToolchainName::Official(desc),
                 ..
             }) if install_if_missing => {
-                Ok(
-                    DistributableToolchain::install(cfg, &desc, &[], &[], cfg.get_profile()?, true)
-                        .await?
-                        .1
-                        .toolchain,
-                )
+                let options = DistOptions::new(&[], &[], &desc, cfg.get_profile()?, true, cfg)?;
+                Ok(DistributableToolchain::install(options).await?.1.toolchain)
             }
             Err(e) => Err(e.into()),
         }
     }
 
     /// Calls Toolchain::new(), but augments the error message with more context
-    /// from the ActiveReason if the toolchain isn't installed.
-    pub(crate) fn with_reason(
+    /// from the ActiveSource if the toolchain isn't installed.
+    pub(crate) fn with_source(
         cfg: &'a Cfg<'a>,
         name: LocalToolchainName,
-        reason: &ActiveReason,
+        source: &ActiveSource,
     ) -> anyhow::Result<Self> {
         match Self::new(cfg, name.clone()) {
             Err(RustupError::ToolchainNotInstalled { .. }) => (),
@@ -80,28 +82,28 @@ impl<'a> Toolchain<'a> {
             }
         }
 
-        let reason_err = match reason {
-            ActiveReason::Environment => {
+        let source_err = match source {
+            ActiveSource::Environment => {
                 "the RUSTUP_TOOLCHAIN environment variable specifies an uninstalled toolchain"
                     .to_string()
             }
-            ActiveReason::CommandLine => {
+            ActiveSource::CommandLine => {
                 "the +toolchain on the command line specifies an uninstalled toolchain".to_string()
             }
-            ActiveReason::OverrideDB(path) => format!(
+            ActiveSource::OverrideDb(path) => format!(
                 "the directory override for '{}' specifies an uninstalled toolchain",
-                utils::canonicalize_path(path, cfg.notify_handler.as_ref()).display(),
+                utils::canonicalize_path(path).display(),
             ),
-            ActiveReason::ToolchainFile(path) => format!(
+            ActiveSource::ToolchainFile(path) => format!(
                 "the toolchain file at '{}' specifies an uninstalled toolchain",
-                utils::canonicalize_path(path, cfg.notify_handler.as_ref()).display(),
+                utils::canonicalize_path(path).display(),
             ),
-            ActiveReason::Default => {
+            ActiveSource::Default => {
                 "the default toolchain does not describe an installed toolchain".to_string()
             }
         };
 
-        Err(anyhow!(reason_err).context(format!("override toolchain '{name}' is not installed")))
+        Err(anyhow!(source_err).context(format!("override toolchain '{name}' is not installed")))
     }
 
     pub(crate) fn new(cfg: &'a Cfg<'a>, name: LocalToolchainName) -> Result<Self, RustupError> {
@@ -154,7 +156,7 @@ impl<'a> Toolchain<'a> {
     pub fn binary_file(&self, name: &str) -> PathBuf {
         let mut path = self.path.clone();
         path.push("bin");
-        path.push(name.to_owned() + env::consts::EXE_SUFFIX);
+        path.push(name.to_owned() + EXE_SUFFIX);
         path
     }
 
@@ -329,13 +331,24 @@ impl<'a> Toolchain<'a> {
     pub(crate) fn command(&self, binary: &str) -> anyhow::Result<Command> {
         // Should push the cargo fallback into a custom toolchain type? And then
         // perhaps a trait that create command layers on?
-        if !matches!(
-            self.name(),
-            LocalToolchainName::Named(ToolchainName::Official(_))
-        ) {
-            if let Some(cmd) = self.maybe_do_cargo_fallback(binary)? {
+        if let "cargo" | "cargo.exe" = binary {
+            if let Some(cmd) = self.maybe_do_cargo_fallback()? {
+                info!("`cargo` is unavailable for the active toolchain");
+                info!(
+                    r#"falling back to "{}""#,
+                    Path::new(cmd.get_program()).display()
+                );
                 return Ok(cmd);
             }
+        } else if let "rust-analyzer" | "rust-analyzer.exe" = binary
+            && let Some(cmd) = self.maybe_do_rust_analyzer_fallback(binary)?
+        {
+            info!("`rust-analyzer` is unavailable for the active toolchain");
+            info!(
+                r#"falling back to "{}""#,
+                Path::new(cmd.get_program()).display()
+            );
+            return Ok(cmd);
         }
 
         self.create_command(binary)
@@ -343,18 +356,17 @@ impl<'a> Toolchain<'a> {
 
     // Custom toolchains don't have cargo, so here we detect that situation and
     // try to find a different cargo.
-    pub(crate) fn maybe_do_cargo_fallback(&self, binary: &str) -> anyhow::Result<Option<Command>> {
-        if binary != "cargo" && binary != "cargo.exe" {
+    fn maybe_do_cargo_fallback(&self) -> anyhow::Result<Option<Command>> {
+        if let LocalToolchainName::Named(ToolchainName::Official(_)) = self.name() {
             return Ok(None);
         }
-
-        let cargo_path = self.binary_file("cargo");
 
         // breadcrumb in case of regression: we used to get the cargo path and
         // cargo.exe path separately, not using the binary_file helper. This may
         // matter if calling a binary with some personality that allows .exe and
         // not .exe to coexist (e.g. wine) - but that's not something we aim to
         // support : the host should always be correct.
+        let cargo_path = self.binary_file("cargo");
         if cargo_path.exists() {
             return Ok(None);
         }
@@ -371,6 +383,50 @@ impl<'a> Toolchain<'a> {
             }
         }
 
+        Ok(None)
+    }
+
+    /// Tries to find `rust-analyzer` on the PATH when the active toolchain does
+    /// not have `rust-analyzer` installed.
+    ///
+    /// This happens from time to time often because the user wants to use a
+    /// more recent build of RA than the one shipped with rustup, or because
+    /// rustup isn't shipping RA on their host platform at all.
+    ///
+    /// See the following issues for more context:
+    /// - <https://github.com/rust-lang/rustup/issues/3299>
+    /// - <https://github.com/rust-lang/rustup/issues/3846>
+    fn maybe_do_rust_analyzer_fallback(&self, binary: &str) -> anyhow::Result<Option<Command>> {
+        if self.binary_file("rust-analyzer").exists() {
+            return Ok(None);
+        }
+
+        let proc = self.cfg.process;
+        let Some(path) = proc.var_os("PATH") else {
+            return Ok(None);
+        };
+
+        let me = env::current_exe()?;
+
+        // Try to find the first `rust-analyzer` under the `$PATH` that is both
+        // an existing file and not the same file as `me`, i.e. not a rustup proxy.
+        for mut p in env::split_paths(&path) {
+            p.push(binary);
+            let is_external_ra = p.is_file()
+                // We report `true` on `is_same_file()` error to prevent an invalid `p`
+                // from becoming the candidate.
+                && !is_same_file(&me, &p).unwrap_or(true);
+            // On Unix, we additionally check if the file is executable.
+            #[cfg(unix)]
+            let is_external_ra = is_external_ra
+                && p.metadata()
+                    .is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0);
+            if is_external_ra {
+                let mut ra = Command::new(p);
+                self.set_env(&mut ra);
+                return Ok(Some(ra));
+            }
+        }
         Ok(None)
     }
 
@@ -429,12 +485,12 @@ impl<'a> Toolchain<'a> {
         // but only if we know the absolute path to cargo.
         // This works around an issue with old versions of cargo not updating
         // the environment variable itself.
-        if Path::new(&binary).file_stem() == Some("cargo".as_ref()) && path.is_absolute() {
-            if let Some(cargo) = self.cfg.process.var_os("CARGO") {
-                if fs::read_link(&cargo).is_ok_and(|p| p.file_stem() == Some("rustup".as_ref())) {
-                    cmd.env("CARGO", path);
-                }
-            }
+        if Path::new(&binary).file_stem() == Some("cargo".as_ref())
+            && path.is_absolute()
+            && let Some(cargo) = self.cfg.process.var_os("CARGO")
+            && fs::read_link(&cargo).is_ok_and(|p| p.file_stem() == Some("rustup".as_ref()))
+        {
+            cmd.env("CARGO", path);
         }
         Ok(cmd)
     }
@@ -483,7 +539,7 @@ impl<'a> Toolchain<'a> {
         };
         let fs_modified = match Self::exists(cfg, &(&name).into())? {
             true => {
-                (cfg.notify_handler)(Notification::UninstallingToolchain(&name));
+                info!("uninstalling toolchain {name}");
                 let installed_paths = match &name {
                     ToolchainName::Custom(_) => Ok(vec![InstalledPath::Dir { path: &path }]),
                     ToolchainName::Official(desc) => cfg.installed_paths(desc, &path),
@@ -493,9 +549,7 @@ impl<'a> Toolchain<'a> {
                         InstalledPath::File { name, path } => {
                             utils::ensure_file_removed(name, &path)?
                         }
-                        InstalledPath::Dir { path } => {
-                            install::uninstall(path, &|n| (cfg.notify_handler)(n.into()))?
-                        }
+                        InstalledPath::Dir { path } => install::uninstall(path)?,
                     }
                 }
                 true
@@ -503,7 +557,7 @@ impl<'a> Toolchain<'a> {
             false => {
                 // Might be a dangling symlink
                 if path.is_symlink() {
-                    (cfg.notify_handler)(Notification::UninstallingToolchain(&name));
+                    info!("uninstalling toolchain {name}");
                     fs::remove_dir_all(&path)?;
                     true
                 } else {
@@ -520,8 +574,29 @@ impl<'a> Toolchain<'a> {
         };
 
         if !path.is_symlink() && !path.exists() && fs_modified {
-            (cfg.notify_handler)(Notification::UninstalledToolchain(&name));
+            info!("toolchain {name} uninstalled");
         }
         Ok(())
+    }
+
+    /// Get the list of installed components for any toolchain
+    ///
+    /// NB: An assumption is made that custom toolchains always have a `rustlib/components` file
+    pub fn installed_components(&self) -> anyhow::Result<Vec<Component>> {
+        let prefix = InstallPrefix::from(self.path.clone());
+        Components::open(prefix)?.list()
+    }
+
+    /// Get the list of installed targets for any toolchain
+    pub fn installed_targets(&self) -> anyhow::Result<Vec<TargetTriple>> {
+        Ok(self
+            .installed_components()?
+            .into_iter()
+            .filter_map(|c| {
+                c.name()
+                    .strip_prefix("rust-std-")
+                    .map(|triple| TargetTriple::new(triple.to_string()))
+            })
+            .collect())
     }
 }

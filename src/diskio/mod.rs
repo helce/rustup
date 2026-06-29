@@ -51,23 +51,24 @@
 //    loss or errors in this model.
 // f) data gathering: record (name, bytes, start, duration)
 //    write to disk afterwards as a csv file?
+use std::io::{self, Write};
+use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
+use std::{fmt::Debug, fs::OpenOptions};
+
+use anyhow::Result;
+use tracing::{error, trace, warn};
+
+use crate::process::IoThreadCount;
+use crate::utils::units::Size;
+
 pub(crate) mod immediate;
 #[cfg(test)]
 mod test;
 pub(crate) mod threaded;
-
-use std::io::{self, Write};
-use std::ops::{Deref, DerefMut};
-use std::path::{Path, PathBuf};
-use std::sync::mpsc::Receiver;
-use std::thread::available_parallelism;
-use std::time::{Duration, Instant};
-use std::{fmt::Debug, fs::OpenOptions};
-
-use anyhow::{Context, Result};
-
-use crate::process::Process;
-use crate::utils::notifications::Notification;
 use threaded::PoolReference;
 
 /// Carries the implementation specific data for complete file transfers into the executor.
@@ -270,14 +271,14 @@ impl IncrementalFileState {
         mode: u32,
     ) -> Result<(Box<dyn FnMut(FileBuffer) -> bool>, IncrementalFile)> {
         use std::sync::mpsc::channel;
-        match *self {
+        match self {
             IncrementalFileState::Threaded => {
                 let (tx, rx) = channel::<FileBuffer>();
                 let content_callback = IncrementalFile::ThreadedReceiver(rx);
                 let chunk_submit = move |chunk: FileBuffer| tx.send(chunk).is_ok();
                 Ok((Box::new(chunk_submit), content_callback))
             }
-            IncrementalFileState::Immediate(ref state) => {
+            IncrementalFileState::Immediate(state) => {
                 let content_callback = IncrementalFile::ImmediateReceiver;
                 let mut writer = immediate::IncrementalFileWriter::new(path, mode, state.clone())?;
                 let chunk_submit = move |chunk: FileBuffer| writer.chunk_submit(chunk);
@@ -290,7 +291,7 @@ impl IncrementalFileState {
 /// Trait object for performing IO. At this point the overhead
 /// of trait invocation is not a bottleneck, but if it becomes
 /// one we could consider an enum variant based approach instead.
-pub(crate) trait Executor {
+pub(crate) trait Executor: Send {
     /// Perform a single operation.
     /// During overload situations previously queued items may
     /// need to be completed before the item is accepted:
@@ -444,19 +445,89 @@ pub(crate) fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 
 /// Get the executor for disk IO.
 pub(crate) fn get_executor<'a>(
-    notify_handler: Option<&'a dyn Fn(Notification<'_>)>,
     ram_budget: usize,
-    process: &Process,
-) -> Result<Box<dyn Executor + 'a>> {
+    thread_count: IoThreadCount,
+) -> Box<dyn Executor + 'a> {
     // If this gets lots of use, consider exposing via the config file.
-    let thread_count = match process.var("RUSTUP_IO_THREADS") {
-        Err(_) => available_parallelism().map(|p| p.get()).unwrap_or(1),
-        Ok(n) => n
-            .parse::<usize>()
-            .context("invalid value in RUSTUP_IO_THREADS. Must be a natural number")?,
-    };
-    Ok(match thread_count {
+    let threads = effective_thread_count(ram_budget, thread_count);
+    match threads {
         0 | 1 => Box::new(immediate::ImmediateUnpacker::new()),
-        n => Box::new(threaded::Threaded::new(notify_handler, n, ram_budget)),
-    })
+        n => Box::new(threaded::Threaded::new(n, ram_budget)),
+    }
 }
+
+fn effective_thread_count(ram_budget: usize, thread_count: IoThreadCount) -> usize {
+    match thread_count {
+        IoThreadCount::Default(n) if n > 1 && ram_budget < LOW_MEMORY_THRESHOLD => {
+            warn!(
+                "using single-threaded unpacking due to low memory \
+                 (ram budget: {} < {} threshold), \
+                 set RUSTUP_IO_THREADS to override",
+                Size::new(ram_budget),
+                Size::new(LOW_MEMORY_THRESHOLD)
+            );
+            1
+        }
+        IoThreadCount::Default(n) | IoThreadCount::UserSpecified(n) => n,
+    }
+}
+
+pub(crate) fn unpack_ram(io_chunk_size: usize, budget: Option<usize>) -> usize {
+    const RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS: usize = 200 * 1024 * 1024;
+    let minimum_ram = io_chunk_size * 2;
+
+    let default_max_unpack_ram = match effective_limits::memory_limit() {
+        Ok(effective)
+            if effective as usize > minimum_ram + RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS =>
+        {
+            effective as usize - RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS
+        }
+        Ok(_) => minimum_ram,
+        Err(error) => {
+            error!("can't determine memory limit: {error}");
+            minimum_ram
+        }
+    };
+
+    let unpack_ram = match budget {
+        Some(budget) => {
+            if budget < minimum_ram {
+                warn!(
+                    "Ignoring RUSTUP_UNPACK_RAM ({}) less than minimum of {}.",
+                    budget, minimum_ram
+                );
+                minimum_ram
+            } else if budget > default_max_unpack_ram {
+                warn!(
+                    "Ignoring RUSTUP_UNPACK_RAM ({}) greater than detected available RAM of {}.",
+                    budget, default_max_unpack_ram
+                );
+                default_max_unpack_ram
+            } else {
+                budget
+            }
+        }
+        None => {
+            if RAM_NOTICE_SHOWN.set(()).is_ok() {
+                trace!(size = %Size::new(default_max_unpack_ram), "unpacking components in memory");
+            }
+            default_max_unpack_ram
+        }
+    };
+
+    if minimum_ram > unpack_ram {
+        panic!("RUSTUP_UNPACK_RAM must be larger than {minimum_ram}");
+    } else {
+        unpack_ram
+    }
+}
+
+static RAM_NOTICE_SHOWN: OnceLock<()> = OnceLock::new();
+
+/// The Threaded executor uses substantially more memory than its ram_budget
+/// accounts for (pool overhead, sharded_slab metadata, multiple in-flight
+/// operations, thread stacks, allocator fragmentation). On systems where the
+/// ram_budget is under this threshold, fall back to single-threaded unpacking
+/// which peaks at ~110MB.
+/// See https://github.com/rust-lang/rustup/issues/3125
+const LOW_MEMORY_THRESHOLD: usize = 512 * 1024 * 1024;

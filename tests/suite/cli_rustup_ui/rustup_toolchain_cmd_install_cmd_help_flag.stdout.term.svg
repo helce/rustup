@@ -1,0 +1,91 @@
+<svg width="860px" height="614px" xmlns="http://www.w3.org/2000/svg">
+  <style>
+    .fg { fill: #AAAAAA }
+    .bg { fill: #000000 }
+    .fg-bright-cyan { fill: #55FFFF }
+    .fg-bright-green { fill: #55FF55 }
+    .fg-cyan { fill: #00AAAA }
+    .container {
+      padding: 0 10px;
+      line-height: 18px;
+    }
+    .bold { font-weight: bold; }
+    tspan {
+      font: 14px SFMono-Regular, Consolas, Liberation Mono, Menlo, monospace;
+      white-space: pre;
+      line-height: 18px;
+    }
+  </style>
+
+  <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
+
+  <text xml:space="preserve" class="container fg">
+    <tspan x="10px" y="28px"><tspan>Install or update the given toolchains, or by default the active toolchain</tspan>
+</tspan>
+    <tspan x="10px" y="46px">
+</tspan>
+    <tspan x="10px" y="64px"><tspan class="fg-bright-green bold">Usage:</tspan><tspan> </tspan><tspan class="fg-bright-cyan bold">rustup[EXE] toolchain install</tspan><tspan> </tspan><tspan class="fg-cyan">[OPTIONS]</tspan><tspan> </tspan><tspan class="fg-cyan">[TOOLCHAIN]...</tspan>
+</tspan>
+    <tspan x="10px" y="82px">
+</tspan>
+    <tspan x="10px" y="100px"><tspan class="fg-bright-green bold">Arguments:</tspan>
+</tspan>
+    <tspan x="10px" y="118px"><tspan>  </tspan><tspan class="fg-cyan">[TOOLCHAIN]...</tspan><tspan>  Toolchain name, such as 'stable', 'nightly', or '1.8.0'. For more information see</tspan>
+</tspan>
+    <tspan x="10px" y="136px"><tspan>                  `rustup help toolchain`</tspan>
+</tspan>
+    <tspan x="10px" y="154px">
+</tspan>
+    <tspan x="10px" y="172px"><tspan class="fg-bright-green bold">Options:</tspan>
+</tspan>
+    <tspan x="10px" y="190px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--profile</tspan><tspan class="fg-cyan"> </tspan><tspan class="fg-cyan">&lt;PROFILE&gt;</tspan><tspan>      [possible values: minimal, default, complete]</tspan>
+</tspan>
+    <tspan x="10px" y="208px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">-c</tspan><tspan>, </tspan><tspan class="fg-bright-cyan bold">--component</tspan><tspan class="fg-cyan"> </tspan><tspan class="fg-cyan">&lt;COMPONENT&gt;</tspan><tspan>  Comma-separated list of components to be added on installation</tspan>
+</tspan>
+    <tspan x="10px" y="226px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">-t</tspan><tspan>, </tspan><tspan class="fg-bright-cyan bold">--target</tspan><tspan class="fg-cyan"> </tspan><tspan class="fg-cyan">&lt;TARGET&gt;</tspan><tspan>        Comma-separated list of targets to be added on installation</tspan>
+</tspan>
+    <tspan x="10px" y="244px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--no-self-update</tspan><tspan>         Don't perform self update when running the `rustup toolchain install`</tspan>
+</tspan>
+    <tspan x="10px" y="262px"><tspan>                               command</tspan>
+</tspan>
+    <tspan x="10px" y="280px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--no-update</tspan><tspan>              Don't try to update the installed toolchain</tspan>
+</tspan>
+    <tspan x="10px" y="298px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--force</tspan><tspan>                  Force an update, even if some components are missing</tspan>
+</tspan>
+    <tspan x="10px" y="316px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--allow-downgrade</tspan><tspan>        Allow rustup to downgrade the toolchain to satisfy your component</tspan>
+</tspan>
+    <tspan x="10px" y="334px"><tspan>                               choice</tspan>
+</tspan>
+    <tspan x="10px" y="352px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--force-non-host</tspan><tspan>         Install toolchains that require an emulator. See</tspan>
+</tspan>
+    <tspan x="10px" y="370px"><tspan>                               https://github.com/rust-lang/rustup/wiki/Non-host-toolchains</tspan>
+</tspan>
+    <tspan x="10px" y="388px"><tspan>      </tspan><tspan class="fg-bright-cyan bold">--override</tspan><tspan>               Set the installed toolchain as the override for the current directory</tspan>
+</tspan>
+    <tspan x="10px" y="406px"><tspan>  </tspan><tspan class="fg-bright-cyan bold">-h</tspan><tspan>, </tspan><tspan class="fg-bright-cyan bold">--help</tspan><tspan>                   Print help</tspan>
+</tspan>
+    <tspan x="10px" y="424px">
+</tspan>
+    <tspan x="10px" y="442px"><tspan class="fg-bright-green bold">Discussion:</tspan>
+</tspan>
+    <tspan x="10px" y="460px"><tspan>  Some environment variables allow you to customize certain parameters</tspan>
+</tspan>
+    <tspan x="10px" y="478px"><tspan>  in toolchain installation, including:</tspan>
+</tspan>
+    <tspan x="10px" y="496px">
+</tspan>
+    <tspan x="10px" y="514px"><tspan>  - `RUSTUP_CONCURRENT_DOWNLOADS`: the number of concurrent downloads.</tspan>
+</tspan>
+    <tspan x="10px" y="532px"><tspan>  - `RUSTUP_DOWNLOAD_TIMEOUT`: the download timeout in seconds.</tspan>
+</tspan>
+    <tspan x="10px" y="550px">
+</tspan>
+    <tspan x="10px" y="568px"><tspan>  See &lt;https://rust-lang.github.io/rustup/devel/environment-variables.html&gt;</tspan>
+</tspan>
+    <tspan x="10px" y="586px"><tspan>  for more info.</tspan>
+</tspan>
+    <tspan x="10px" y="604px">
+</tspan>
+  </text>
+
+</svg>

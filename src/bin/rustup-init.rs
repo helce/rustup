@@ -23,33 +23,35 @@ use rs_tracing::{
 };
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
-use rustup::cli::common;
-use rustup::cli::log;
-use rustup::cli::proxy_mode;
-use rustup::cli::rustup_mode;
+use rustup::cli::errors::CliError;
 #[cfg(windows)]
 use rustup::cli::self_update;
-use rustup::cli::setup_mode;
+use rustup::cli::{common, log, proxy_mode, rustup_mode, setup_mode};
 use rustup::env_var::RUST_RECURSION_COUNT_MAX;
 use rustup::errors::RustupError;
 use rustup::is_proxyable_tools;
 use rustup::process::Process;
 use rustup::utils;
 
-#[tokio::main]
-async fn main() -> Result<ExitCode> {
+fn main() -> Result<ExitCode> {
     #[cfg(windows)]
     pre_rustup_main_init();
 
     let process = Process::os();
-    let result = {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(process.io_thread_count()?.into())
+        .build()
+        .unwrap();
+
+    let result = runtime.block_on(async {
         #[cfg(feature = "otel")]
         let _telemetry_guard = log::set_global_telemetry();
         tracing_log::LogTracer::init()?;
         let (subscriber, console_filter) = log::tracing_subscriber(&process);
         tracing::subscriber::set_global_default(subscriber)?;
         run_rustup(&process, console_filter).await
-    };
+    });
 
     match result {
         Err(e) => {
@@ -119,7 +121,7 @@ async fn run_rustup_inner(
         }
         None => {
             // Weird case. No arg0, or it's unparsable.
-            Err(rustup::cli::errors::CLIError::NoExeName.into())
+            Err(CliError::NoExeName.into())
         }
     }
 }

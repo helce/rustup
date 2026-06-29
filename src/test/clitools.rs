@@ -1,6 +1,7 @@
 //! A mock distribution server used by tests/cli-v1.rs and
 //! tests/cli-v2.rs
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::HashMap,
     env::{self, consts::EXE_SUFFIX},
@@ -18,6 +19,7 @@ use std::{
 };
 
 use enum_map::{Enum, EnumMap, enum_map};
+use snapbox::{IntoData, RedactedValue, Redactions, assert_data_eq};
 use tempfile::TempDir;
 use url::Url;
 
@@ -25,10 +27,12 @@ use crate::cli::rustup_mode;
 use crate::process;
 use crate::test as rustup_test;
 use crate::test::const_dist_dir;
+use crate::test::tempdir_in_with_prefix;
 use crate::test::this_host_triple;
 use crate::utils;
 
 use super::{
+    CROSS_ARCH1, CROSS_ARCH2, MULTI_ARCH1,
     dist::{MockDistServer, MockManifestVersion, Release, RlsStatus, change_channel_date},
     mock::MockFile,
 };
@@ -39,7 +43,7 @@ pub struct Config {
     /// Where we put the rustup / rustc / cargo bins
     pub exedir: PathBuf,
     /// The tempfile for the mutable distribution server
-    pub test_dist_dir: tempfile::TempDir,
+    pub test_dist_dir: TempDir,
     /// The mutable distribution server; None if none is set.
     pub distdir: Option<PathBuf>,
     /// The const distribution server; None if none is set
@@ -58,6 +62,183 @@ pub struct Config {
     pub workdir: RefCell<PathBuf>,
     /// This is the test root for keeping stuff together
     pub test_root_dir: PathBuf,
+}
+
+/// Helper type to simplify assertions of a command's output.
+///
+/// Typically, an [`Assert`] instance is created by calling the
+/// [`Config::expect()`] method (or its variations) which will run the given
+/// command in the test environment and wrap its output in the instance.
+/// Then, that output can be compared against the expected one.
+///
+/// # Snapshot-Based Testing
+///
+/// Currently, rustup utilizes [`snapbox`] (a snapshot-based testing library)
+/// for most comparisons, where the corresponding [`Assert`] method would
+/// accept an `expected` argument conforming [`IntoData`], which is also
+/// called a "snapshot".
+///
+/// Most of our tests use [inline][`snapbox::data::Inline`] snapshots created
+/// with [`snapbox::str`], but it is also possible to use snapshots from
+/// another file with [`snapbox::file`].
+///
+/// # Creating or Updating a Snapshot
+///
+/// There is no need to write out a snapshot by hand. Instead, create an empty
+/// snapshot (e.g. `snapbox::str![[""]]`), and run the test in question with the
+/// environment variable `SNAPSHOTS=overwrite` set. Normally, the snapshot will
+/// then be populated automatically with the right value (modulo redaction,
+/// which will be discussed in a later section).
+///
+/// The same environment variable is also used to update a snapshot with no extra
+/// steps required.
+///
+/// # Redacting Snapshots
+///
+/// To defend against leaking of environment-specific information that might
+/// break the tests on a different machine, a set of redaction rules (also known
+/// as "filters") is used to sanitize the output before sending to comparison.
+///
+/// Rustup extends the list of `snapbox`'s default filters (see
+/// [`assert_data_eq`]'s documentation for more info) with a list of
+/// rustup-specific values, including:
+/// - `[CURRENT_VERSION]`: The current rustup version.
+/// - `[HOST_TRIPLE]`: The return value of [`this_host_triple()`].
+/// - `[CROSS_ARCH_I]`: The value of [`CROSS_ARCH1`].
+/// - `[CROSS_ARCH_II]`: The value of [`CROSS_ARCH2`].
+/// - `[MULTI_ARCH_I]`: The value of [`MULTI_ARCH1`].
+///
+/// When updating snapshots, the filters are automatically applied.
+/// To redact some remaining part of the snapshot, you can use the
+/// [`Assert::extend_redactions`] method to introduce new filters.
+#[derive(Clone)]
+pub struct Assert {
+    pub output: SanitizedOutput,
+    redactions: Redactions,
+    sort_stdout: bool,
+    sort_stderr: bool,
+}
+
+impl Assert {
+    /// Creates a new [`Assert`] object with the given [`SanitizedOutput`].
+    pub fn new(output: SanitizedOutput) -> Self {
+        let mut redactions = Redactions::new();
+        redactions
+            .extend([
+                (
+                    "[CURRENT_VERSION]",
+                    Cow::Borrowed(env!("CARGO_PKG_VERSION")),
+                ),
+                ("[HOST_TRIPLE]", Cow::Owned(this_host_triple())),
+                ("[CROSS_ARCH_I]", Cow::Borrowed(CROSS_ARCH1)),
+                ("[CROSS_ARCH_II]", Cow::Borrowed(CROSS_ARCH2)),
+                ("[MULTI_ARCH_I]", Cow::Borrowed(MULTI_ARCH1)),
+            ])
+            .expect("invalid redactions detected");
+        Self {
+            output,
+            redactions,
+            sort_stdout: false,
+            sort_stderr: false,
+        }
+    }
+
+    /// Extends the redaction rules used in the current assertion with new values.
+    pub fn extend_redactions(
+        &mut self,
+        vars: impl IntoIterator<Item = (&'static str, impl Into<RedactedValue>)>,
+    ) -> &mut Self {
+        self.redactions
+            .extend(vars)
+            .expect("invalid redactions detected");
+        self
+    }
+
+    /// Removes the existing redaction rules used in the current assertion.
+    pub fn remove_redactions(&mut self, vars: impl IntoIterator<Item = &'static str>) -> &mut Self {
+        for var in vars {
+            self.redactions
+                .remove(var)
+                .expect("invalid redactions detected");
+        }
+        self
+    }
+
+    /// Sort stdout lines to gloss over platform-specific sort orders
+    pub fn sort_stdout(&mut self, yes: bool) -> &mut Self {
+        self.sort_stdout = yes;
+        self
+    }
+
+    /// Sort stderr lines to gloss over platform-specific sort orders
+    pub fn sort_stderr(&mut self, yes: bool) -> &mut Self {
+        self.sort_stderr = yes;
+        self
+    }
+
+    /// Performs the redaction based on the existing rules.
+    pub fn redact(&self, input: &str) -> String {
+        self.redactions.redact(input)
+    }
+
+    /// Asserts that the command exited with an ok status.
+    pub fn is_ok(&self) -> &Self {
+        self.has_code(0)
+    }
+
+    /// Asserts that the command exited with an error.
+    pub fn is_err(&self) -> &Self {
+        assert_ne!(self.output.status, Some(0));
+        self
+    }
+
+    /// Asserts that the command exited with the specific code.
+    pub fn has_code(&self, code: i32) -> &Self {
+        assert_eq!(self.output.status, Some(code));
+        self
+    }
+
+    /// Asserts that the command exited with the given `expected` stdout pattern.
+    pub fn with_stdout(&self, expected: impl IntoData) -> &Self {
+        let mut stdout = self.redact(&self.output.stdout);
+        if self.sort_stdout {
+            let mut lines = stdout.lines().collect::<Vec<_>>();
+            lines.sort();
+            stdout = lines.join("\n");
+        }
+        assert_data_eq!(&stdout, expected);
+        self
+    }
+
+    /// Asserts that the command exited without the given `unexpected` stdout pattern.
+    pub fn without_stdout(&self, unexpected: &str) -> &Self {
+        if self.output.stdout.contains(unexpected) {
+            print_indented("expected.stdout.does_not_contain", unexpected);
+            panic!();
+        }
+        self
+    }
+
+    /// Asserts that the command exited with the given `expected` stderr pattern.
+    pub fn with_stderr(&self, expected: impl IntoData) -> &Self {
+        let mut stderr = self.redact(&self.output.stderr);
+        if self.sort_stderr {
+            let mut lines = stderr.lines().collect::<Vec<_>>();
+            lines.sort();
+            stderr = lines.join("\n");
+        }
+        assert_data_eq!(&stderr, expected);
+        self
+    }
+
+    /// Asserts that the command exited without the given `unexpected` stderr pattern.
+    pub fn without_stderr(&self, unexpected: &str) -> &Self {
+        if self.output.stderr.contains(unexpected) {
+            print_indented("expected.stderr.does_not_contain", unexpected);
+            panic!();
+        }
+        self
+    }
 }
 
 impl Config {
@@ -82,7 +263,7 @@ impl Config {
         // Ensure PATH is prefixed with the rustup-exe directory
         let prev_path = env::var_os("PATH");
         let mut new_path = self.exedir.clone().into_os_string();
-        if let Some(ref p) = prev_path {
+        if let Some(p) = &prev_path {
             new_path.push(if cfg!(windows) { ";" } else { ":" });
             new_path.push(p);
         }
@@ -118,7 +299,7 @@ impl Config {
         // Setup pgp test key
         cmd.env(
             "RUSTUP_PGP_KEY",
-            std::env::current_dir()
+            env::current_dir()
                 .unwrap()
                 .join("tests/mock/signing-key.pub.asc"),
         );
@@ -130,143 +311,51 @@ impl Config {
             "/bogus-config-file.toml",
         );
 
+        // Pass `RUSTUP_CI` over to the test process in case it is required downstream
+        if let Some(ci) = env::var_os("RUSTUP_CI") {
+            cmd.env("RUSTUP_CI", ci);
+        }
+
         if let Some(root) = self.rustup_update_root.as_ref() {
             cmd.env("RUSTUP_UPDATE_ROOT", root);
         }
     }
 
-    /// Expect an ok status
-    pub async fn expect_ok(&mut self, args: &[&str]) {
-        self.expect_ok_env(args, &[]).await
+    /// Returns an [`Assert`] object to check the output of running the command
+    /// specified by `args` under the default environment.
+    #[must_use]
+    pub async fn expect<S: AsRef<OsStr> + Clone + Debug>(&self, args: impl AsRef<[S]>) -> Assert {
+        self.expect_with_env(args, []).await
     }
 
-    /// Expect an ok status with extra environment variables
-    pub async fn expect_ok_env(&self, args: &[&str], env: &[(&str, &str)]) {
-        let out = self.run(args[0], &args[1..], env).await;
-        if !out.ok {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            panic!();
-        }
-    }
-
-    /// Expect an err status and a string in stderr
-    pub async fn expect_err(&self, args: &[&str], expected: &str) {
-        self.expect_err_env(args, &[], expected).await
-    }
-
-    /// Expect an err status and a string in stderr, with extra environment variables
-    pub async fn expect_err_env(&self, args: &[&str], env: &[(&str, &str)], expected: &str) {
-        let out = self.run(args[0], &args[1..], env).await;
-        if out.ok || !out.stderr.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: false");
-            print_indented("expected.stderr.contains", expected);
-            panic!();
-        }
-    }
-
-    /// Expect an ok status and a string in stdout
-    pub async fn expect_stdout_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if !out.ok || !out.stdout.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            print_indented("expected.stdout.contains", expected);
-            panic!();
-        }
-    }
-
-    pub async fn expect_not_stdout_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if !out.ok || out.stdout.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            print_indented("expected.stdout.does_not_contain", expected);
-            panic!();
-        }
-    }
-
-    pub async fn expect_not_stderr_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if !out.ok || out.stderr.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: false");
-            print_indented("expected.stderr.does_not_contain", expected);
-            panic!();
-        }
-    }
-
-    pub async fn expect_not_stderr_err(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if out.ok || out.stderr.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: false");
-            print_indented("expected.stderr.does_not_contain", expected);
-            panic!();
-        }
-    }
-
-    /// Expect an ok status and a string in stderr
-    pub async fn expect_stderr_ok(&self, args: &[&str], expected: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if !out.ok || !out.stderr.contains(expected) {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            print_indented("expected.stderr.contains", expected);
-            panic!();
-        }
-    }
-
-    /// Expect an exact strings on stdout/stderr with an ok status code
-    pub async fn expect_ok_ex(&mut self, args: &[&str], stdout: &str, stderr: &str) {
-        self.expect_ok_ex_env(args, &[], stdout, stderr).await;
-    }
-
-    /// Expect an exact strings on stdout/stderr with an ok status code,
-    /// with extra environment variables
-    pub async fn expect_ok_ex_env(
-        &mut self,
-        args: &[&str],
-        env: &[(&str, &str)],
-        stdout: &str,
-        stderr: &str,
-    ) {
-        let out = self.run(args[0], &args[1..], env).await;
-        if !out.ok || out.stdout != stdout || out.stderr != stderr {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            print_indented("expected.stdout", stdout);
-            print_indented("expected.stderr", stderr);
-            dbg!(out.stdout == stdout);
-            dbg!(out.stderr == stderr);
-            panic!();
-        }
-    }
-
-    /// Expect an exact strings on stdout/stderr with an error status code
-    pub async fn expect_err_ex(&self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if out.ok || out.stdout != stdout || out.stderr != stderr {
-            print_command(args, &out);
-            println!("expected.ok: false");
-            print_indented("expected.stdout", stdout);
-            print_indented("expected.stderr", stderr);
-            if out.ok {
-                panic!("expected command to fail");
-            } else if out.stdout != stdout {
-                panic!("expected stdout to match");
-            } else if out.stderr != stderr {
-                panic!("expected stderr to match");
-            } else {
-                unreachable!()
-            }
-        }
+    /// Returns an [`Assert`] object to check the output of running the command
+    /// specified by `args` and under the environment specified by `env`.
+    #[must_use]
+    pub async fn expect_with_env<S: AsRef<OsStr> + Clone + Debug>(
+        &self,
+        args: impl AsRef<[S]>,
+        env: impl AsRef<[(&str, &str)]>,
+    ) -> Assert {
+        let (program, args) = args
+            .as_ref()
+            .split_first()
+            .expect("args should not be empty");
+        let output = self
+            .run(
+                program
+                    .as_ref()
+                    .to_str()
+                    .expect("invalid UTF-8 in program name"),
+                args,
+                env.as_ref(),
+            )
+            .await;
+        Assert::new(output)
     }
 
     pub async fn expect_ok_contains(&self, args: &[&str], stdout: &str, stderr: &str) {
         let out = self.run(args[0], &args[1..], &[]).await;
-        if !out.ok || !out.stdout.contains(stdout) || !out.stderr.contains(stderr) {
+        if out.status != Some(0) || !out.stdout.contains(stdout) || !out.stderr.contains(stderr) {
             print_command(args, &out);
             println!("expected.ok: true");
             print_indented("expected.stdout.contains", stdout);
@@ -278,7 +367,11 @@ impl Config {
     pub async fn expect_ok_eq(&self, args1: &[&str], args2: &[&str]) {
         let out1 = self.run(args1[0], &args1[1..], &[]).await;
         let out2 = self.run(args2[0], &args2[1..], &[]).await;
-        if !out1.ok || !out2.ok || out1.stdout != out2.stdout || out1.stderr != out2.stderr {
+        if out1.status != Some(0)
+            || out2.status != Some(0)
+            || out1.stdout != out2.stdout
+            || out1.stderr != out2.stderr
+        {
             print_command(args1, &out1);
             println!("expected.ok: true");
             print_command(args2, &out2);
@@ -289,7 +382,7 @@ impl Config {
 
     pub async fn expect_component_executable(&self, cmd: &str) {
         let out1 = self.run(cmd, ["--version"], &[]).await;
-        if !out1.ok {
+        if out1.status != Some(0) {
             print_command(&[cmd, "--version"], &out1);
             println!("expected.ok: true");
             panic!()
@@ -298,14 +391,14 @@ impl Config {
 
     pub async fn expect_component_not_executable(&self, cmd: &str) {
         let out1 = self.run(cmd, ["--version"], &[]).await;
-        if out1.ok {
+        if out1.status == Some(0) {
             print_command(&[cmd, "--version"], &out1);
             println!("expected.ok: false");
             panic!()
         }
     }
 
-    pub async fn run<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> SanitizedOutput
+    async fn run<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> SanitizedOutput
     where
         I: IntoIterator<Item = A> + Clone + Debug,
         A: AsRef<OsStr>,
@@ -321,9 +414,9 @@ impl Config {
         let status = out.status;
         let output = SanitizedOutput::try_from(out).unwrap();
 
-        println!("ran: {} {:?}", name, args);
+        println!("ran: {name} {args:?}");
         println!("inprocess: {inprocess}");
-        println!("status: {:?}", status);
+        println!("status: {status:?}");
         println!("duration: {:.3}s", duration.as_secs_f32());
         println!("stdout:\n====\n{}\n====\n", output.stdout);
         println!("stderr:\n====\n{}\n====\n", output.stderr);
@@ -371,7 +464,7 @@ impl Config {
             Ok(process_res) => process_res,
             Err(e) => {
                 crate::cli::common::report_error(&e, &tp.process);
-                utils::ExitCode(1)
+                utils::ExitCode::FAILURE
             }
         };
         Output {
@@ -402,7 +495,7 @@ impl Config {
                 Err(e) => {
                     retries -= 1;
                     if retries > 0
-                        && e.kind() == std::io::ErrorKind::Other
+                        && e.kind() == io::ErrorKind::Other
                         && e.raw_os_error() == Some(26)
                     {
                         // This is an ETXTBSY situation
@@ -602,7 +695,7 @@ static CONST_TEST_STATE: LazyLock<ConstState> =
 /// Const test state - test dirs that can be reused across tests.
 struct ConstState {
     scenarios: EnumMap<Scenario, RwLock<Option<PathBuf>>>,
-    const_dist_dir: tempfile::TempDir,
+    const_dist_dir: TempDir,
 }
 
 /// The lock to be used when creating test environments.
@@ -615,7 +708,7 @@ struct ConstState {
 static CMD_LOCK: LazyLock<RwLock<usize>> = LazyLock::new(|| RwLock::new(0));
 
 impl ConstState {
-    fn new(const_dist_dir: tempfile::TempDir) -> Self {
+    fn new(const_dist_dir: TempDir) -> Self {
         Self {
             const_dist_dir,
             scenarios: enum_map! {
@@ -647,16 +740,15 @@ impl ConstState {
         {
             // fast path: the dist already exists
             let lock = self.scenarios[s].read().unwrap();
-            if let Some(ref path) = *lock {
+            if let Some(path) = &*lock {
                 return Ok(path.clone());
             }
         }
         {
             let mut lock = self.scenarios[s].write().unwrap();
             // another writer may have initialized it
-            match *lock {
-                Some(ref path) => Ok(path.clone()),
-
+            match &*lock {
+                Some(path) => Ok(path.clone()),
                 None => {
                     let dist_path = self.const_dist_dir.path().join(format!("{s:?}"));
                     s.write_to(&dist_path);
@@ -669,7 +761,7 @@ impl ConstState {
 }
 
 /// State a test can interact and mutate
-async fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDir, Config) {
+async fn setup_test_state(test_dist_dir: TempDir) -> (TempDir, Config) {
     // SAFETY: This is probably not the best way of doing such a thing, but it should be
     // okay since we are setting the environment variables for the integration tests only.
     // There are two types of integration test in rustup: in-process and subprocess.
@@ -685,6 +777,7 @@ async fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDi
     unsafe {
         // Unset env variables that will break our testing
         env::remove_var("CARGO");
+        env::remove_var("RUSTUP_AUTO_INSTALL");
         env::remove_var("RUSTUP_UPDATE_ROOT");
         env::remove_var("RUSTUP_TOOLCHAIN");
         env::remove_var("SHELL");
@@ -707,19 +800,11 @@ async fn setup_test_state(test_dist_dir: tempfile::TempDir) -> (tempfile::TempDi
     }
     let test_dir = rustup_test::test_dir().unwrap();
 
-    fn tempdir_in_with_prefix<P: AsRef<Path>>(path: P, prefix: &str) -> PathBuf {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .tempdir_in(path.as_ref())
-            .unwrap()
-            .into_path()
-    }
-
-    let exedir = tempdir_in_with_prefix(&test_dir, "rustup-exe");
-    let customdir = tempdir_in_with_prefix(&test_dir, "rustup-custom");
-    let cargodir = tempdir_in_with_prefix(&test_dir, "rustup-cargo");
-    let homedir = tempdir_in_with_prefix(&test_dir, "rustup-home");
-    let workdir = tempdir_in_with_prefix(&test_dir, "rustup-workdir");
+    let exedir = tempdir_in_with_prefix(&test_dir, "rustup-exe").unwrap();
+    let customdir = tempdir_in_with_prefix(&test_dir, "rustup-custom").unwrap();
+    let cargodir = tempdir_in_with_prefix(&test_dir, "rustup-cargo").unwrap();
+    let homedir = tempdir_in_with_prefix(&test_dir, "rustup-home").unwrap();
+    let workdir = tempdir_in_with_prefix(&test_dir, "rustup-workdir").unwrap();
 
     // The uninstall process on windows involves using the directory above
     // CARGO_HOME, so make sure it's a subdir of our tempdir
@@ -1016,7 +1101,7 @@ pub fn print_command(args: &[&str], out: &SanitizedOutput) {
         }
     }
     println!();
-    println!("out.ok: {}", out.ok);
+    println!("out.status: {:?}", out.status);
     print_indented("out.stdout", &out.stdout);
     print_indented("out.stderr", &out.stderr);
 }
@@ -1042,9 +1127,9 @@ pub struct Output {
     pub stderr: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SanitizedOutput {
-    pub ok: bool,
+    pub status: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -1054,7 +1139,7 @@ impl TryFrom<Output> for SanitizedOutput {
 
     fn try_from(out: Output) -> Result<Self, Self::Error> {
         Ok(Self {
-            ok: matches!(out.status, Some(0)),
+            status: out.status,
             stdout: String::from_utf8(out.stdout)?,
             stderr: String::from_utf8(out.stderr)?,
         })
@@ -1071,7 +1156,7 @@ where
     // - proxies themselves behave appropriately the proxied output needs to be
     //   collected for assertions to be made on it as our tests traverse layers.
     // - self update executions cannot run in-process because on windows the
-    //    process replacement dance would replace the test process.
+    //   process replacement dance would replace the test process.
     // - any command with --version in it is testing to see something was
     //   installed properly, so we have to shell out to it to be sure
     if name != "rustup" {
