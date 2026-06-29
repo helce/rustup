@@ -160,8 +160,7 @@ dependencies = [
 [[package]]
 name = "aws-lc-sys"
 version = "0.28.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bfa9b6986f250236c27e5a204062434a773a13243d2ffc2955f37bdba4c5c6a1"
+source = "git+https://github.com/helce/aws-lc-rs?tag=aws-lc-sys%2Fv0.28.2#63a9e15f3107849c38e0c04efceb5d77afe4e061"
 dependencies = [
  "bindgen",
  "cc",
@@ -269,8 +268,7 @@ checksum = "d71b6127be86fdcfddb610f7182ac57211d4b18a3e9c82eb2d17662f2227ad6a"
 [[package]]
 name = "cc"
 version = "1.2.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04da6a0d40b948dfc4fa8f5bbf402b0fc1a64a28dbf7d12ffd683550f2c1b63a"
+source = "git+https://github.com/helce/cc-rs?tag=cc-v1.2.20#b84b8406c209095d82e2ae32ce73a6a8e9185a78"
 dependencies = [
  "jobserver",
  "libc",
@@ -1316,8 +1314,7 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 [[package]]
 name = "libc"
 version = "0.2.172"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa"
+source = "git+https://github.com/helce/libc?tag=0.2.172#81930e4211f23cd76082b41871c1f4ccabafdb97"
 
 [[package]]
 name = "libdbus-sys"
@@ -1379,8 +1376,7 @@ source = "git+https://github.com/helce/linux-raw-sys?tag=v0.4.15#a0fa97804fdeee2
 [[package]]
 name = "linux-raw-sys"
 version = "0.9.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd945864f07fe9f5371a27ad7b52a172b4b499999f1d97574c9fa68373937e12"
+source = "git+https://github.com/helce/linux-raw-sys?tag=v0.9.4#93c4845f8ba6a005b24042ccc0bd9ff3be65cf75"
 
 [[package]]
 name = "litemap"
@@ -1601,9 +1597,8 @@ checksum = "d05e27ee213611ffe7d6348b942e8f942b37114c00cc03cec254295a4a17852e"
 
 [[package]]
 name = "openssl-src"
-version = "300.5.0+3.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8ce546f549326b0e6052b649198487d91320875da901e7bd11a06d1ee3f9c2f"
+version = "300.5.1+3.5.1"
+source = "git+https://github.com/helce/openssl-src-rs?tag=300.5.1%2B3.5.1#e58e572fe3a1515fad807d201c1a3c696f5d0ab5"
 dependencies = [
  "cc",
 ]
@@ -2093,8 +2088,7 @@ dependencies = [
 [[package]]
 name = "ring"
 version = "0.17.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+source = "git+https://github.com/helce/ring?tag=0.17.14#75d8456acaea27d50b77ce9f47e0a17f500c273c"
 dependencies = [
  "cc",
  "cfg-if 1.0.0",
@@ -2141,14 +2135,13 @@ dependencies = [
 [[package]]
 name = "rustix"
 version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d97817398dd4bb2e6da002002db259209759911da105da92bec29ccb12cf58bf"
+source = "git+https://github.com/helce/rustix?tag=v1.0.5#8e81b3205034005bad342e84ccfa5aa14a897e72"
 dependencies = [
  "bitflags",
  "errno",
  "libc",
  "linux-raw-sys 0.9.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
