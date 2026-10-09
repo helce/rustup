@@ -30,6 +30,21 @@ RUSTUP_UPDATE_ROOT="${RUSTUP_UPDATE_ROOT:-https://dev.mcst.ru/rust/rustup}"
 # Set quiet as a global for ease of use
 RUSTUP_QUIET=no
 
+# Return the URL scheme (http or https)
+get_url_scheme() {
+    case "$1" in
+        http://*)
+            echo "http"
+            ;;
+        https://*)
+            echo "https"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
     cat <<EOF
@@ -279,7 +294,9 @@ get_e2k_cpu() {
     # without dependencies beyond coreutils.
     local _curent_eflags
     _curent_eflags=$(head -c 52 /proc/self/exe | tail -c 4)
-    if [ "$_curent_eflags" = "$(printf '\004')" ] ; then
+    if [ "$_curent_eflags" = "$(printf '\020\003')" ] ; then
+        echo "e2k4c"
+    elif [ "$_curent_eflags" = "$(printf '\004')" ] ; then
         echo "e2kv4"
     elif [ "$_curent_eflags" = "$(printf '\005')" ] ; then
         echo "e2kv5"
@@ -683,6 +700,7 @@ downloader() {
     local _err
     local _status
     local _retry
+    local _scheme
     if check_cmd curl; then
         # Check if we have a broken snap curl
         # https://github.com/boukendesho/curl-snap/issues/1
@@ -709,25 +727,34 @@ downloader() {
     if [ "$1" = --check ]; then
         need_cmd "$_dld"
     elif [ "$_dld" = curl ]; then
+        # HTTP support: determine URL scheme
+        _scheme=$(get_url_scheme "$1")
         check_curl_for_retry_support
         _retry="$RETVAL"
-        get_ciphersuites_for_curl
-        _ciphersuites="$RETVAL"
-        if [ -n "$_ciphersuites" ]; then
+        if [ "$_scheme" = "http" ]; then
+            # Plain HTTP: no TLS enforcement
             # shellcheck disable=SC2086
-            _err=$(curl $_retry --proto '=https' --tlsv1.2 --ciphers "$_ciphersuites" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+            _err=$(curl $_retry --proto '=http' --silent --show-error --fail --location "$1" --output "$2" 2>&1)
             _status=$?
         else
-            warn "Not enforcing strong cipher suites for TLS, this is potentially less secure"
-            if ! check_help_for "$3" curl --proto --tlsv1.2; then
-                warn "Not enforcing TLS v1.2, this is potentially less secure"
+            get_ciphersuites_for_curl
+            _ciphersuites="$RETVAL"
+            if [ -n "$_ciphersuites" ]; then
                 # shellcheck disable=SC2086
-                _err=$(curl $_retry --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+                _err=$(curl $_retry --proto '=https' --tlsv1.2 --ciphers "$_ciphersuites" --silent --show-error --fail --location "$1" --output "$2" 2>&1)
                 _status=$?
             else
-                # shellcheck disable=SC2086
-                _err=$(curl $_retry --proto '=https' --tlsv1.2 --silent --show-error --fail --location "$1" --output "$2" 2>&1)
-                _status=$?
+                warn "Not enforcing strong cipher suites for TLS, this is potentially less secure"
+                if ! check_help_for "$3" curl --proto --tlsv1.2; then
+                    warn "Not enforcing TLS v1.2, this is potentially less secure"
+                    # shellcheck disable=SC2086
+                    _err=$(curl $_retry --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+                    _status=$?
+                else
+                    # shellcheck disable=SC2086
+                    _err=$(curl $_retry --proto '=https' --tlsv1.2 --silent --show-error --fail --location "$1" --output "$2" 2>&1)
+                    _status=$?
+                fi
             fi
         fi
         if [ -n "$_err" ]; then
@@ -739,8 +766,14 @@ downloader() {
         fi
         return $_status
     elif [ "$_dld" = wget ]; then
+        # HTTP support: determine URL scheme
+        _scheme=$(get_url_scheme "$1")
         if [ "$(wget -V 2>&1|head -2|tail -1|cut -f1 -d" ")" = "BusyBox" ]; then
             warn "using the BusyBox version of wget.  Not enforcing strong cipher suites for TLS or TLS v1.2, this is potentially less secure"
+            _err=$(wget "$1" -O "$2" 2>&1)
+            _status=$?
+        elif [ "$_scheme" = "http" ]; then
+            # Plain HTTP: no TLS enforcement
             _err=$(wget "$1" -O "$2" 2>&1)
             _status=$?
         else
