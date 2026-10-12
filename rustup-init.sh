@@ -281,6 +281,8 @@ get_e2k_cpu() {
     _curent_eflags=$(head -c 52 /proc/self/exe | tail -c 4)
     if [ "$_curent_eflags" = "$(printf '\003')" ] ; then
         echo "e2kv3"
+    elif [ "$_curent_eflags" = "$(printf '\020\003')" ] ; then
+        echo "e2k4c"
     elif [ "$_curent_eflags" = "$(printf '\004')" ] ; then
         echo "e2kv4"
     elif [ "$_curent_eflags" = "$(printf '\005')" ] ; then
@@ -291,8 +293,6 @@ get_e2k_cpu() {
         echo "e2kv6"
     elif [ "$_curent_eflags" = "$(printf '\007')" ] ; then
         echo "e2kv7"
-    elif [ "$_curent_eflags" = "$(printf '\020\003')" ] ; then
-        echo "e2k4c"
     elif [ "$_curent_eflags" = "$(printf '\020\023')" ] ; then
         echo "e2k8c"
     elif [ "$_curent_eflags" = "$(printf '\020\024')" ] ; then
