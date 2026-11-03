@@ -54,21 +54,22 @@
 use std::io::{self, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use std::{fmt::Debug, fs::OpenOptions};
 
 use anyhow::Result;
 use tracing::{error, trace, warn};
 
+use crate::diskio::immediate::{FileState, IncrementalFileWriter};
 use crate::process::IoThreadCount;
 use crate::utils::units::Size;
 
-pub(crate) mod immediate;
+mod immediate;
 #[cfg(test)]
 mod test;
-pub(crate) mod threaded;
+mod threaded;
 use threaded::PoolReference;
 
 /// Carries the implementation specific data for complete file transfers into the executor.
@@ -80,25 +81,25 @@ pub(crate) enum FileBuffer {
 }
 
 impl FileBuffer {
-    /// All the buffers space to be re-used when the last reference to it is dropped.
-    pub(crate) fn clear(&mut self) {
-        if let FileBuffer::Threaded(contents) = self {
+    /// Allows the buffer's space to be reused when the last reference to it is dropped.
+    fn clear(&mut self) {
+        if let Self::Threaded(contents) = self {
             contents.clear()
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
+    fn len(&self) -> usize {
         match self {
-            FileBuffer::Immediate(vec) => vec.len(),
-            FileBuffer::Threaded(PoolReference::Owned(owned, _)) => owned.len(),
-            FileBuffer::Threaded(PoolReference::Mut(mutable, _)) => mutable.len(),
+            Self::Immediate(vec) => vec.len(),
+            Self::Threaded(PoolReference::Owned(owned, _)) => owned.len(),
+            Self::Threaded(PoolReference::Mut(mutable, _)) => mutable.len(),
         }
     }
 
-    pub(crate) fn finished(self) -> Self {
+    pub(super) fn finished(self) -> Self {
         match self {
-            FileBuffer::Threaded(PoolReference::Mut(mutable, pool)) => {
-                FileBuffer::Threaded(PoolReference::Owned(mutable.downgrade(), pool))
+            Self::Threaded(PoolReference::Mut(mutable, pool)) => {
+                Self::Threaded(PoolReference::Owned(mutable.downgrade(), pool))
             }
             _ => self,
         }
@@ -110,9 +111,9 @@ impl Deref for FileBuffer {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            FileBuffer::Immediate(vec) => vec,
-            FileBuffer::Threaded(PoolReference::Owned(owned, _)) => owned,
-            FileBuffer::Threaded(PoolReference::Mut(mutable, _)) => mutable,
+            Self::Immediate(vec) => vec,
+            Self::Threaded(PoolReference::Owned(owned, _)) => owned,
+            Self::Threaded(PoolReference::Mut(mutable, _)) => mutable,
         }
     }
 }
@@ -120,16 +121,16 @@ impl Deref for FileBuffer {
 impl DerefMut for FileBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
-            FileBuffer::Immediate(vec) => vec,
-            FileBuffer::Threaded(PoolReference::Owned(_, _)) => {
+            Self::Immediate(vec) => vec,
+            Self::Threaded(PoolReference::Owned(_, _)) => {
                 unimplemented!()
             }
-            FileBuffer::Threaded(PoolReference::Mut(mutable, _)) => mutable,
+            Self::Threaded(PoolReference::Mut(mutable, _)) => mutable,
         }
     }
 }
 
-pub(crate) const IO_CHUNK_SIZE: usize = 16_777_216;
+pub(super) const IO_CHUNK_SIZE: usize = 16_777_216;
 
 /// Carries the implementation specific channel data into the executor.
 #[derive(Debug)]
@@ -186,23 +187,23 @@ pub(crate) enum Kind {
 
 /// The details of the IO operation
 #[derive(Debug)]
-pub(crate) struct Item {
+pub(super) struct Item {
     /// The path to operate on
-    pub(crate) full_path: PathBuf,
+    pub(super) full_path: PathBuf,
     /// The operation to perform
-    pub(crate) kind: Kind,
+    pub(super) kind: Kind,
     /// When the operation started
     start: Option<Instant>,
     /// Amount of time the operation took to finish
     finish: Option<Duration>,
     /// The result of the operation (could now be factored into CompletedIO...)
-    pub(crate) result: io::Result<()>,
+    pub(super) result: io::Result<()>,
     /// The mode to apply
     mode: u32,
 }
 
 #[derive(Debug)]
-pub(crate) enum CompletedIo {
+pub(super) enum CompletedIo {
     /// A submitted Item has completed
     Item(Item),
     /// An IncrementalFile has completed a single chunk
@@ -211,7 +212,7 @@ pub(crate) enum CompletedIo {
 }
 
 impl Item {
-    pub(crate) fn make_dir(full_path: PathBuf, mode: u32) -> Self {
+    pub(super) fn make_dir(full_path: PathBuf, mode: u32) -> Self {
         Self {
             full_path,
             kind: Kind::Directory,
@@ -222,7 +223,7 @@ impl Item {
         }
     }
 
-    pub(crate) fn write_file(full_path: PathBuf, mode: u32, content: FileBuffer) -> Self {
+    pub(super) fn write_file(full_path: PathBuf, mode: u32, content: FileBuffer) -> Self {
         Self {
             full_path,
             kind: Kind::File(content),
@@ -233,11 +234,11 @@ impl Item {
         }
     }
 
-    pub(crate) fn write_file_segmented<'a>(
+    pub(super) fn write_file_segmented(
         full_path: PathBuf,
         mode: u32,
         state: IncrementalFileState,
-    ) -> Result<(Self, Box<dyn FnMut(FileBuffer) -> bool + 'a>)> {
+    ) -> Result<(Self, Box<dyn ChunkWriter>)> {
         let (chunk_submit, content_callback) = state.incremental_file_channel(&full_path, mode)?;
         let result = Self {
             full_path,
@@ -247,7 +248,7 @@ impl Item {
             result: Ok(()),
             mode,
         };
-        Ok((result, Box::new(chunk_submit)))
+        Ok((result, chunk_submit))
     }
 }
 
@@ -258,9 +259,9 @@ impl Item {
 /// just allows the immediate codepath to get access to the Arc referenced state
 /// without holding a lifetime reference to the executor, as the threaded code
 /// path is all message passing.
-pub(crate) enum IncrementalFileState {
+pub(super) enum IncrementalFileState {
     Threaded,
-    Immediate(immediate::IncrementalFileState),
+    Immediate(Arc<Mutex<Option<FileState>>>),
 }
 
 impl IncrementalFileState {
@@ -269,29 +270,40 @@ impl IncrementalFileState {
         &self,
         path: &Path,
         mode: u32,
-    ) -> Result<(Box<dyn FnMut(FileBuffer) -> bool>, IncrementalFile)> {
-        use std::sync::mpsc::channel;
+    ) -> Result<(Box<dyn ChunkWriter>, IncrementalFile)> {
         match self {
-            IncrementalFileState::Threaded => {
-                let (tx, rx) = channel::<FileBuffer>();
-                let content_callback = IncrementalFile::ThreadedReceiver(rx);
-                let chunk_submit = move |chunk: FileBuffer| tx.send(chunk).is_ok();
-                Ok((Box::new(chunk_submit), content_callback))
+            Self::Threaded => {
+                let (tx, rx) = mpsc::channel::<FileBuffer>();
+                Ok((Box::new(tx), IncrementalFile::ThreadedReceiver(rx)))
             }
-            IncrementalFileState::Immediate(state) => {
-                let content_callback = IncrementalFile::ImmediateReceiver;
-                let mut writer = immediate::IncrementalFileWriter::new(path, mode, state.clone())?;
-                let chunk_submit = move |chunk: FileBuffer| writer.chunk_submit(chunk);
-                Ok((Box::new(chunk_submit), content_callback))
-            }
+            Self::Immediate(state) => Ok((
+                Box::new(IncrementalFileWriter::new(path, mode, state.clone())?),
+                IncrementalFile::ImmediateReceiver,
+            )),
         }
     }
+}
+
+impl ChunkWriter for IncrementalFileWriter {
+    fn submit(&mut self, chunk: FileBuffer) -> bool {
+        self.chunk_submit(chunk)
+    }
+}
+
+impl ChunkWriter for mpsc::Sender<FileBuffer> {
+    fn submit(&mut self, chunk: FileBuffer) -> bool {
+        self.send(chunk).is_ok()
+    }
+}
+
+pub(crate) trait ChunkWriter {
+    fn submit(&mut self, chunk: FileBuffer) -> bool;
 }
 
 /// Trait object for performing IO. At this point the overhead
 /// of trait invocation is not a bottleneck, but if it becomes
 /// one we could consider an enum variant based approach instead.
-pub(crate) trait Executor: Send {
+pub(super) trait Executor: Send {
     /// Perform a single operation.
     /// During overload situations previously queued items may
     /// need to be completed before the item is accepted:
@@ -333,7 +345,7 @@ pub(crate) trait Executor: Send {
 
 /// Trivial single threaded IO to be used from executors.
 /// (Crazy sophisticated ones can obviously ignore this)
-pub(crate) fn perform<F: Fn(usize)>(item: &mut Item, chunk_complete_callback: F) {
+fn perform<F: Fn(usize)>(item: &mut Item, chunk_complete_callback: F) {
     // directories: make them, TODO: register with the dir existence cache.
     // Files, write them.
     item.result = match &mut item.kind {
@@ -358,11 +370,7 @@ pub(crate) fn perform<F: Fn(usize)>(item: &mut Item, chunk_complete_callback: F)
 }
 
 #[allow(unused_variables)]
-pub(crate) fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(
-    path: P,
-    contents: C,
-    mode: u32,
-) -> io::Result<()> {
+fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, mode: u32) -> io::Result<()> {
     let mut opts = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -389,7 +397,7 @@ pub(crate) fn write_file<P: AsRef<Path>, C: AsRef<[u8]>>(
 }
 
 #[allow(unused_variables)]
-pub(crate) fn write_file_incremental<P: AsRef<Path>, F: Fn(usize)>(
+fn write_file_incremental<P: AsRef<Path>, F: Fn(usize)>(
     path: P,
     content_callback: &mut IncrementalFile,
     mode: u32,
@@ -436,7 +444,7 @@ pub(crate) fn write_file_incremental<P: AsRef<Path>, F: Fn(usize)>(
     Ok(())
 }
 
-pub(crate) fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
+fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
     let path = path.as_ref();
     let path_display = format!("{}", path.display());
     trace_scoped!("create_dir", "name": path_display);
@@ -444,14 +452,14 @@ pub(crate) fn create_dir<P: AsRef<Path>>(path: P) -> io::Result<()> {
 }
 
 /// Get the executor for disk IO.
-pub(crate) fn get_executor<'a>(
+pub(super) fn get_executor<'a>(
     ram_budget: usize,
     thread_count: IoThreadCount,
 ) -> Box<dyn Executor + 'a> {
     // If this gets lots of use, consider exposing via the config file.
     let threads = effective_thread_count(ram_budget, thread_count);
     match threads {
-        0 | 1 => Box::new(immediate::ImmediateUnpacker::new()),
+        0 | 1 => Box::new(immediate::ImmediateUnpacker::default()),
         n => Box::new(threaded::Threaded::new(n, ram_budget)),
     }
 }
@@ -472,7 +480,7 @@ fn effective_thread_count(ram_budget: usize, thread_count: IoThreadCount) -> usi
     }
 }
 
-pub(crate) fn unpack_ram(io_chunk_size: usize, budget: Option<usize>) -> usize {
+pub(super) fn unpack_ram(io_chunk_size: usize, budget: Option<usize>) -> usize {
     const RAM_ALLOWANCE_FOR_RUSTUP_AND_BUFFERS: usize = 200 * 1024 * 1024;
     let minimum_ram = io_chunk_size * 2;
 

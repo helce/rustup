@@ -102,7 +102,7 @@ which is a `brew`-managed `rust` toolchain installation.
 ## Manual installation
 
 You can manually download `rustup-init` for a given target from
-`https://static.rust-lang.org/rustup/dist/{target-triple}/rustup-init[.exe]`[^msys2] [^msvc].
+`https://static.rust-lang.org/rustup/dist/{target-tuple}/rustup-init[.exe]`[^msys2] [^msvc].
 
 <details>
 <summary>Direct links</summary>
@@ -111,12 +111,16 @@ You can manually download `rustup-init` for a given target from
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-apple-darwin/rustup-init.sha256)
 - [aarch64-linux-android](https://static.rust-lang.org/rustup/dist/aarch64-linux-android/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-linux-android/rustup-init.sha256)
+- [aarch64-pc-windows-gnullvm](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-gnullvm/rustup-init.exe)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-gnullvm/rustup-init.exe.sha256)
 - [aarch64-pc-windows-msvc](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-pc-windows-msvc/rustup-init.exe.sha256)
 - [aarch64-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-gnu/rustup-init.sha256)
 - [aarch64-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-unknown-linux-musl/rustup-init.sha256)
+- [aarch64-unknown-freebsd](https://static.rust-lang.org/rustup/dist/aarch64-unknown-freebsd/rustup-init)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/aarch64-unknown-freebsd/rustup-init.sha256)
 - [arm-linux-androideabi](https://static.rust-lang.org/rustup/dist/arm-linux-androideabi/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/arm-linux-androideabi/rustup-init.sha256)
 - [arm-unknown-linux-gnueabi](https://static.rust-lang.org/rustup/dist/arm-unknown-linux-gnueabi/rustup-init)
@@ -159,6 +163,10 @@ You can manually download `rustup-init` for a given target from
   - [sha256 file](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-gnu/rustup-init.sha256)
 - [powerpc64le-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-musl/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/powerpc64le-unknown-linux-musl/rustup-init.sha256)
+- [riscv64gc-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/riscv64gc-unknown-linux-gnu/rustup-init)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/riscv64gc-unknown-linux-gnu/rustup-init.sha256)
+- [riscv64gc-unknown-linux-musl](https://static.rust-lang.org/rustup/dist/riscv64gc-unknown-linux-musl/rustup-init)
+  - [sha256 file](https://static.rust-lang.org/rustup/dist/riscv64gc-unknown-linux-musl/rustup-init.sha256)
 - [s390x-unknown-linux-gnu](https://static.rust-lang.org/rustup/dist/s390x-unknown-linux-gnu/rustup-init)
   - [sha256 file](https://static.rust-lang.org/rustup/dist/s390x-unknown-linux-gnu/rustup-init.sha256)
 - [sparcv9-sun-solaris](https://static.rust-lang.org/rustup/dist/sparcv9-sun-solaris/rustup-init)
@@ -187,7 +195,7 @@ You can manually download `rustup-init` for a given target from
 </details>
 
 To get a previous version, use
-`https://static.rust-lang.org/rustup/archive/{rustup-version}/{target-triple}/rustup-init[.exe]`.
+`https://static.rust-lang.org/rustup/archive/{rustup-version}/{target-tuple}/rustup-init[.exe]`.
 
 SHA-256 checksums are also available by appending `.sha256` to the link.
 

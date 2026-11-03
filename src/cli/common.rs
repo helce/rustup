@@ -10,13 +10,14 @@ use std::{cmp, env};
 use anstyle::Style;
 use anyhow::{Context, Result, anyhow};
 use clap_cargo::style::{CONTEXT, ERROR, UPDATE_ADDED, UPDATE_UNCHANGED, UPDATE_UPGRADED};
+use futures_util::future::join_all;
 use git_testament::{git_testament, render_testament};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, Registry, reload::Handle};
 
 use crate::{
     config::Cfg,
-    dist::{DistOptions, TargetTriple, ToolchainDesc},
+    dist::{DistOptions, TargetTuple, ToolchainDesc},
     errors::RustupError,
     install::{InstallMethod, UpdateStatus},
     process::Process,
@@ -24,7 +25,9 @@ use crate::{
     utils::{self, ExitCode},
 };
 
-pub(crate) const WARN_COMPLETE_PROFILE: &str = "downloading with complete profile isn't recommended unless you are a developer of the rust language";
+pub(crate) const WARN_COMPLETE_PROFILE: &str = "\
+downloading with the `complete` profile is deprecated
+help: consider switching to the `default` profile with `rustup set profile default`";
 
 pub(crate) fn confirm(question: &str, default: bool, process: &Process) -> Result<bool> {
     write!(process.stdout().lock(), "{question} ")?;
@@ -136,8 +139,8 @@ pub(crate) enum PackageUpdate {
 impl Display for PackageUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PackageUpdate::Rustup => write!(f, "rustup"),
-            PackageUpdate::Toolchain(t) => write!(f, "{t}"),
+            Self::Rustup => write!(f, "rustup"),
+            Self::Toolchain(t) => write!(f, "{t}"),
         }
     }
 }
@@ -172,7 +175,7 @@ fn show_channel_updates(
                 // this is a bit strange: we don't supply the version we
                 // presumably had (for Installed and Unchanged), so we query it
                 // again. Perhaps we can do better.
-                let version = match Toolchain::new(cfg, name.into()) {
+                let version = match Toolchain::new(cfg, name.clone().into()) {
                     Ok(t) => t.rustc_version(),
                     Err(_) => String::from("(toolchain not installed)"),
                 };
@@ -213,11 +216,26 @@ fn show_channel_updates(
 
 pub(crate) async fn update_all_channels(cfg: &Cfg<'_>, force_update: bool) -> Result<ExitCode> {
     let profile = cfg.get_profile()?;
+    let channels = cfg.list_channels()?;
+
+    // Run a pre-check to determine which channels have updates available.
+    let channels_with_manifests = join_all(channels.into_iter().map(|(desc, d)| async move {
+        // Prefetch errors are intentionally discarded; a failed prefetch falls
+        // back to the normal update path, where errors are properly propagated.
+        let manifest = d.fetch_dist_manifest().await.unwrap_or(None);
+        (desc, d, manifest)
+    }))
+    .await;
+
     let mut toolchains = Vec::new();
-    for (desc, distributable) in cfg.list_channels()? {
-        let options = DistOptions::new(&[], &[], &desc, profile, force_update, cfg)?
-            .for_update(&distributable, false);
-        let result = InstallMethod::Dist(options).install().await;
+    for (desc, distributable, manifest) in channels_with_manifests {
+        let result = if force_update || manifest.is_some() {
+            let options = DistOptions::new(&[], &[], &desc, profile, force_update, cfg)?
+                .for_update(&distributable, false);
+            InstallMethod::Dist(options).install(manifest).await
+        } else {
+            Ok(UpdateStatus::Unchanged)
+        };
 
         if let Err(e) = &result {
             error!("{e}");
@@ -494,16 +512,16 @@ pub(crate) fn ignorable_error(
 /// - The `force_non_host` flag is set to `false`.
 pub(crate) fn check_non_host_toolchain(
     toolchain: String,
-    host_arch: &TargetTriple,
-    target_triple: &TargetTriple,
+    host_arch: &TargetTuple,
+    target_tuple: &TargetTuple,
     force_non_host: bool,
 ) -> Result<()> {
-    if force_non_host || host_arch.can_run(target_triple)? {
+    if force_non_host || host_arch.can_run(target_tuple)? {
         return Ok(());
     }
     Err(RustupError::ToolchainIncompatible {
         toolchain,
-        target_triple: target_triple.clone(),
+        target_tuple: target_tuple.clone(),
     }
     .into())
 }
@@ -515,10 +533,10 @@ pub(crate) fn warn_if_host_is_emulated(process: &Process) {
     if process.var("RUSTUP_CI").is_ok() {
         return;
     }
-    if TargetTriple::is_host_emulated() {
+    if TargetTuple::is_host_emulated() {
         warn!(
             "Rustup is not running natively. It's running under emulation of {}.",
-            TargetTriple::from_host_or_build(process)
+            TargetTuple::from_host_or_build(process)
         );
         warn!(
             "For best compatibility and performance you should reinstall rustup for your native CPU."

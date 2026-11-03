@@ -12,16 +12,16 @@ use retry::{
     delay::{Fibonacci, jitter},
     retry,
 };
+#[cfg(windows)]
+use rustup::test::RegistryValueId;
 use rustup::test::{
     CROSS_ARCH1, CliTestContext, Scenario, SelfUpdateTestContext, calc_hash, output_release_file,
-    this_host_triple,
+    this_host_tuple,
 };
-#[cfg(windows)]
-use rustup::test::{RegistryGuard, RegistryValueId, USER_PATH};
 use rustup::utils::{self, raw};
 use rustup::{DUP_TOOLS, TOOLS};
 #[cfg(windows)]
-use windows_registry::Value;
+use windows_registry::{CURRENT_USER, Value};
 
 const TEST_VERSION: &str = "1.1.1";
 
@@ -57,23 +57,21 @@ async fn setup_installed() -> CliTestContext {
 #[tokio::test]
 async fn install_bins_to_cargo_home() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
-    #[cfg(windows)]
-    let _path_guard = RegistryGuard::new(&USER_PATH).unwrap();
 
     cx.config
         .expect(["rustup-init", "-y"])
         .await
         .with_stdout(snapbox::str![[r#"
 ...
-  stable-[HOST_TRIPLE] installed - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] installed - 1.1.0 (hash-stable-1.1.0)
 ...
 "#]])
         .with_stderr(snapbox::str![[r#"
 ...
-info: syncing channel updates for stable-[HOST_TRIPLE]
+info: syncing channel updates for stable-[HOST_TUPLE]
 info: latest update on 2015-01-02 for version 1.1.0 (hash-stable-1.1.0)
 info: downloading 4 components
-info: default toolchain set to stable-[HOST_TRIPLE]
+info: default toolchain set to stable-[HOST_TUPLE]
 
 "#]])
         .is_ok();
@@ -101,23 +99,21 @@ info: default toolchain set to stable-[HOST_TRIPLE]
 #[tokio::test]
 async fn proxies_are_relative_symlinks() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
-    #[cfg(windows)]
-    let _path_guard = RegistryGuard::new(&USER_PATH).unwrap();
 
     cx.config
         .expect(["rustup-init", "-y"])
         .await
         .with_stdout(snapbox::str![[r#"
 ...
-  stable-[HOST_TRIPLE] installed - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] installed - 1.1.0 (hash-stable-1.1.0)
 ...
 "#]])
         .with_stderr(snapbox::str![[r#"
 ...
-info: syncing channel updates for stable-[HOST_TRIPLE]
+info: syncing channel updates for stable-[HOST_TUPLE]
 info: latest update on 2015-01-02 for version 1.1.0 (hash-stable-1.1.0)
 info: downloading 4 components
-info: default toolchain set to stable-[HOST_TRIPLE]
+info: default toolchain set to stable-[HOST_TUPLE]
 ...
 "#]])
         .is_ok();
@@ -141,8 +137,6 @@ info: default toolchain set to stable-[HOST_TRIPLE]
 #[tokio::test]
 async fn install_twice() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
-    #[cfg(windows)]
-    let _path_guard = RegistryGuard::new(&USER_PATH).unwrap();
 
     cx.config.expect(["rustup-init", "-y"]).await.is_ok();
     cx.config.expect(["rustup-init", "-y"]).await.is_ok();
@@ -202,6 +196,28 @@ async fn uninstall_deletes_bins() {
     assert!(!rust_lldb.exists());
     assert!(!rust_gdb.exists());
     assert!(!rust_gdbgui.exists());
+}
+
+#[tokio::test]
+async fn uninstall_deletes_installed_toolchains() {
+    let cx = setup_empty_installed().await;
+    let path = cx.config.customdir.join("custom-1");
+    let path = path.to_string_lossy();
+    cx.config
+        .expect(["rustup", "toolchain", "link", "custom", &path])
+        .await
+        .is_ok();
+    cx.config
+        .expect(["rustup", "self", "uninstall", "-y"])
+        .await
+        .with_stderr(snapbox::str![[r#"
+...
+info: uninstalling toolchain custom
+info: toolchain custom uninstalled
+...
+"#]])
+        .is_ok();
+    assert!(!cx.config.rustupdir.join("toolchains").exists());
 }
 
 #[tokio::test]
@@ -417,18 +433,25 @@ async fn update_overwrites_programs_display_version() {
     let version = env!("CARGO_PKG_VERSION");
 
     let cx = SelfUpdateTestContext::new(TEST_VERSION).await;
-    let _guard = RegistryGuard::new(&USER_RUSTUP_VERSION).unwrap();
+    let test_id = &cx.config.test_registry_id;
     cx.config
         .expect(["rustup-init", "-y", "--no-modify-path"])
         .await
         .is_ok();
 
     USER_RUSTUP_VERSION
-        .set(Some(&Value::from(PLACEHOLDER_VERSION)))
+        .set(
+            Some(&Value::from(PLACEHOLDER_VERSION)),
+            test_id,
+            CURRENT_USER,
+        )
         .unwrap();
     cx.config.expect(["rustup", "self", "update"]).await.is_ok();
     assert_eq!(
-        USER_RUSTUP_VERSION.get().unwrap().unwrap(),
+        USER_RUSTUP_VERSION
+            .get(test_id, CURRENT_USER)
+            .unwrap()
+            .unwrap(),
         Value::from(version)
     );
 }
@@ -488,7 +511,7 @@ async fn update_download_404() {
         .await
         .is_ok();
 
-    let trip = this_host_triple();
+    let trip = this_host_tuple();
     let dist_dir = cx.path().join(format!("archive/{TEST_VERSION}/{trip}"));
     let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
 
@@ -685,12 +708,11 @@ async fn rustup_self_update_exact() {
         .extend_redactions([("[TEST_VERSION]", TEST_VERSION)])
         .with_stdout(snapbox::str![[r#"
 
-  stable-[HOST_TRIPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
 
 
 "#]])
         .with_stderr(snapbox::str![[r#"
-info: syncing channel updates for stable-[HOST_TRIPLE]
 info: checking for self-update (current version: [CURRENT_VERSION])
 info: downloading self-update (new version: [TEST_VERSION])
 info: cleaning up downloads & tmp directories
@@ -808,17 +830,17 @@ async fn rustup_still_works_after_update() {
 #[tokio::test]
 async fn as_rustup_setup() {
     let cx = CliTestContext::new(Scenario::Empty).await;
-    let init = cx.config.exedir.join(format!("rustup-init{EXE_SUFFIX}"));
-    let setup = cx.config.exedir.join(format!("rustup-setup{EXE_SUFFIX}"));
-    fs::copy(init, setup).unwrap();
     cx.config
-        .expect([
-            "rustup-setup",
-            "-y",
-            "--no-modify-path",
-            "--default-toolchain",
-            "none",
-        ])
+        .expect_with_env(
+            [
+                "rustup-init",
+                "-y",
+                "--no-modify-path",
+                "--default-toolchain",
+                "none",
+            ],
+            [("RUSTUP_FORCE_ARG0", &*format!("rustup-setup{EXE_SUFFIX}"))],
+        )
         .await
         .is_ok();
 }
@@ -855,7 +877,7 @@ async fn reinstall_specifying_toolchain() {
         .await
         .with_stdout(snapbox::str![[r#"
 ...
-  stable-[HOST_TRIPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
 ...
 "#]])
         .is_ok();
@@ -878,7 +900,7 @@ async fn reinstall_specifying_component() {
         .await
         .with_stdout(snapbox::str![[r#"
 ...
-  stable-[HOST_TRIPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
 ...
 "#]])
         .is_ok();
@@ -897,7 +919,7 @@ async fn reinstall_specifying_different_toolchain() {
         .await
         .with_stderr(snapbox::str![[r#"
 ...
-info: default toolchain set to nightly-[HOST_TRIPLE]
+info: default toolchain set to nightly-[HOST_TUPLE]
 ...
 "#]])
         .is_ok();
@@ -953,8 +975,8 @@ async fn install_sets_up_stable_unless_there_is_already_a_default() {
         .expect(["rustup", "run", "stable", "rustc", "--version"])
         .await
         .with_stderr(snapbox::str![[r#"
-error: toolchain 'stable-[HOST_TRIPLE]' is not installed
-help: run `rustup toolchain install stable-[HOST_TRIPLE]` to install it
+error: toolchain 'stable-[HOST_TUPLE]' is not installed
+help: run `rustup toolchain install stable-[HOST_TUPLE]` to install it
 
 "#]])
         .is_err();
@@ -1005,7 +1027,7 @@ async fn rls_proxy_set_up_after_install() {
         .expect(["rls", "--version"])
         .await
         .with_stderr(snapbox::str![[r#"
-error: 'rls[EXE]' is not installed for the toolchain 'stable-[HOST_TRIPLE]'.
+error: 'rls[EXE]' is not installed for the toolchain 'stable-[HOST_TUPLE]'.
 help: run `rustup component add rls` to install it
 
 "#]])
@@ -1126,7 +1148,7 @@ async fn install_with_components_and_targets() {
         .await
         .with_stdout(snapbox::str![[r#"
 ...
-rls-[HOST_TRIPLE] (installed)
+rls-[HOST_TUPLE] (installed)
 ...
 "#]])
         .is_ok();

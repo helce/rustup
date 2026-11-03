@@ -1,12 +1,11 @@
 //! Tests of the interactive console installer
 
 use std::env::consts::EXE_SUFFIX;
+use std::fs;
 use std::io::Write;
 use std::process::Stdio;
 
-use rustup::test::{Assert, CliTestContext, Config, SanitizedOutput, Scenario, this_host_triple};
-#[cfg(windows)]
-use rustup::test::{RegistryGuard, USER_PATH};
+use rustup::test::{Assert, CliTestContext, Config, SanitizedOutput, Scenario, this_host_tuple};
 use rustup::utils::raw;
 
 fn run_input(config: &Config, args: &[&str], input: &str) -> Assert {
@@ -44,8 +43,6 @@ fn run_input_with_env(config: &Config, args: &[&str], input: &str, env: &[(&str,
 #[tokio::test]
 async fn update() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
-    #[cfg(windows)]
-    let _path_guard = RegistryGuard::new(&USER_PATH).unwrap();
 
     run_input(&cx.config, &["rustup-init"], "\n\n");
     run_input(&cx.config, &["rustup-init"], "\n\n").is_ok();
@@ -74,7 +71,7 @@ these changes will be reverted.
 Current installation options:
 
 
-   default host triple: [HOST_TRIPLE]
+    default host tuple: [HOST_TUPLE]
      default toolchain: stable (default)
                profile: default
   modify PATH variable: no
@@ -84,7 +81,7 @@ Current installation options:
 3) Cancel installation
 >
 
-  stable-[HOST_TRIPLE] installed - 1.1.0 (hash-stable-1.1.0)
+  stable-[HOST_TUPLE] installed - 1.1.0 (hash-stable-1.1.0)
 
 
 Rust is installed now. Great!
@@ -100,8 +97,6 @@ Rust is installed now. Great!
 #[tokio::test]
 async fn smoke_case_install_with_path_install() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
-    #[cfg(windows)]
-    let _path_guard = RegistryGuard::new(&USER_PATH).unwrap();
 
     run_input(&cx.config, &["rustup-init"], "\n\n")
         .is_ok()
@@ -136,12 +131,12 @@ Rust is installed now. Great!
 }
 
 #[tokio::test]
-async fn installer_shows_default_host_triple() {
+async fn installer_shows_default_host_tuple() {
     let cx = CliTestContext::new(Scenario::SimpleV2).await;
     run_input(&cx.config, &["rustup-init", "--no-modify-path"], "2\n").with_stdout(snapbox::str![
         [r#"
 ...
-Default host triple? [[HOST_TRIPLE]]
+Default host tuple? [[HOST_TUPLE]]
 ...
 "#]
     ]);
@@ -320,7 +315,7 @@ async fn with_non_default_toolchain_still_prompts() {
 ...
 installed toolchains
 --------------------
-nightly-[HOST_TRIPLE] (active, default)
+nightly-[HOST_TUPLE] (active, default)
 ...
 "#]])
         .is_ok();
@@ -347,7 +342,7 @@ async fn with_non_release_channel_non_default_toolchain() {
 ...
 installed toolchains
 --------------------
-nightly-2015-01-02-[HOST_TRIPLE] (active, default)
+nightly-2015-01-02-[HOST_TUPLE] (active, default)
 ...
 "#]])
         .is_ok();
@@ -370,7 +365,7 @@ async fn set_nightly_toolchain() {
 ...
 installed toolchains
 --------------------
-nightly-[HOST_TRIPLE] (active, default)
+nightly-[HOST_TUPLE] (active, default)
 ...
 "#]])
         .is_ok();
@@ -408,7 +403,7 @@ async fn set_nightly_toolchain_and_unset() {
 ...
 installed toolchains
 --------------------
-beta-[HOST_TRIPLE] (active, default)
+beta-[HOST_TUPLE] (active, default)
 ...
 "#]])
         .is_ok();
@@ -448,7 +443,7 @@ rust-src (installed)
             .await
             .with_stdout(snapbox::str![[r#"
 ...
-rust-analysis-[HOST_TRIPLE] (installed)
+rust-analysis-[HOST_TUPLE] (installed)
 ...
 "#]])
             .is_ok();
@@ -497,7 +492,8 @@ async fn test_warn_if_complete_profile_is_used() {
         .await
         .with_stderr(snapbox::str![[r#"
 ...
-warn: downloading with complete profile isn't recommended unless you are a developer of the rust language
+warn: downloading with the `complete` profile is deprecated
+help: consider switching to the `default` profile with `rustup set profile default`
 ...
 "#]])
         .is_ok();
@@ -513,7 +509,7 @@ async fn installing_when_already_installed_updates_toolchain() {
     run_input(&cx.config, &["rustup-init", "--no-modify-path"], "\n\n").with_stdout(snapbox::str![
         [r#"
 ...
-[..]stable-[HOST_TRIPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
+[..]stable-[HOST_TUPLE] unchanged - 1.1.0 (hash-stable-1.1.0)
 ...
 "#]
     ]);
@@ -545,8 +541,6 @@ async fn install_stops_if_rustc_exists() {
 ...
 warn: It looks like you have an existing installation of Rust at:
 ...
-warn: If you are sure that you want both rustup and your already installed Rust
-...
 "#]]);
 }
 
@@ -575,8 +569,6 @@ async fn install_stops_if_cargo_exists() {
         .with_stderr(snapbox::str![[r#"
 ...
 warn: It looks like you have an existing installation of Rust at:
-...
-warn: If you are sure that you want both rustup and your already installed Rust
 ...
 "#]]);
 }
@@ -620,7 +612,7 @@ async fn install_non_installable_toolchain() {
         .await
         .with_stderr(snapbox::str![[r#"
 ...
-error: toolchain 'nightly-[HOST_TRIPLE]' is not installable
+error: toolchain 'nightly-[HOST_TUPLE]' is not installable
 ...
 "#]])
         .is_err();
@@ -640,7 +632,7 @@ async fn install_warns_about_existing_settings_file() {
             r#"default_toolchain = "{}"
 profile = "default"
 version = "12""#,
-            this_host_triple()
+            this_host_tuple()
         ),
     )
     .unwrap();
@@ -659,7 +651,7 @@ version = "12""#,
         .is_ok()
         .with_stderr(snapbox::str![[r#"
 ...
-warn: It looks like you have an existing rustup settings file at:
+warn: it looks like you have an existing rustup settings file at:
 ...
 "#]]);
 }
@@ -684,8 +676,45 @@ async fn install_warns_if_default_linker_missing() {
         .is_ok()
         .with_stderr(snapbox::str![[r#"
 ...
-warn: no default linker (`cc`) was found in your PATH
+warn: no default linker ([CC_TOOL]) was found in your PATH
 warn: many Rust crates require a system C toolchain to build
 ...
 "#]]);
+}
+
+#[tokio::test]
+async fn install_rejection_leaves_rustupdir_untouched() {
+    let cx = CliTestContext::new(Scenario::SimpleV2).await;
+
+    let rustupdir = &cx.config.rustupdir.rustupdir;
+    let settings_file = &rustupdir.join("settings.toml");
+    fs::remove_dir_all(rustupdir).unwrap();
+
+    run_input(&cx.config, &["rustup-init", "--no-modify-path"], "3\n")
+        .with_stdout(snapbox::str![[r#"
+...
+This path needs to be in your PATH environment variable,
+but will not be added automatically.
+
+You can uninstall at any time with rustup self uninstall and
+these changes will be reverted.
+
+Current installation options:
+
+
+    default host tuple: [HOST_TUPLE]
+     default toolchain: stable (default)
+               profile: default
+  modify PATH variable: no
+
+1) Proceed with standard installation (default - just press enter)
+2) Customize installation
+3) Cancel installation
+>
+
+"#]])
+        .is_ok();
+
+    assert!(!settings_file.exists());
+    assert!(!rustupdir.exists());
 }

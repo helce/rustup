@@ -23,6 +23,7 @@ LOCAL_DOCKER_TAG="rust-$TARGET"
 case "$TARGET" in
   aarch64-unknown-linux-gnu)       image=dist-aarch64-linux ;;
   aarch64-unknown-linux-musl)      image=dist-arm-linux-musl ;;
+  aarch64-unknown-freebsd)         image=dist-aarch64-freebsd ;;
   arm-unknown-linux-gnueabi)       image=dist-arm-linux-gnueabi ;;
   arm-unknown-linux-gnueabihf)     image=dist-armhf-linux ;;
   armv7-unknown-linux-gnueabihf)   image=dist-armv7-linux ;;
@@ -44,7 +45,8 @@ case "$TARGET" in
   x86_64-unknown-illumos)          image=dist-x86_64-illumos ;;
   x86_64-unknown-linux-gnu)        image=dist-x86_64-linux ;;
   x86_64-unknown-netbsd)           image=dist-x86_64-netbsd ;;
-  riscv64gc-unknown-linux-gnu)     image=dist-riscv64-linux ;;
+  riscv64gc-unknown-linux-gnu)     image=dist-riscv64-linux-gnu ;;
+  riscv64gc-unknown-linux-musl)    image=dist-riscv64-linux-musl ;;
   loongarch64-unknown-linux-gnu)   image=dist-loongarch64-linux ;;
   loongarch64-unknown-linux-musl)  image=dist-loongarch64-musl ;;
   *) exit ;;

@@ -4,6 +4,8 @@
 /.settings
 /.idea/
 /.vscode/
+/rust-analyzer.toml
+/.cargo/config.windows-cross.toml
 *~
 /**/target
 /home

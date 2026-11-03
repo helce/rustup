@@ -33,7 +33,7 @@ RUSTUP_QUIET=no
 # NOTICE: If you change anything here, please make the same changes in setup_mode.rs
 usage() {
     cat <<EOF
-rustup-init 1.29.0 (d243d7d4e 2026-03-04)
+rustup-init 1.29.1 (3f5811cec 2026-08-12)
 
 The installer for rustup
 
@@ -44,10 +44,10 @@ Options:
           Set log level to 'DEBUG' if 'RUSTUP_LOG' is unset
   -q, --quiet
           Disable progress output, set log level to 'WARN' if 'RUSTUP_LOG' is unset
-  -y
+  -y, --yes
           Disable confirmation prompt
       --default-host <DEFAULT_HOST>
-          Choose a default host triple
+          Choose a default host tuple
       --default-toolchain <DEFAULT_TOOLCHAIN>
           Choose a default toolchain to install. Use 'none' to not install any toolchains at all
       --profile <PROFILE>
@@ -134,6 +134,11 @@ main() {
             --quiet)
                 RUSTUP_QUIET=yes
                 ;;
+            --yes)
+                # user wants to skip the prompt --
+                # we don't need /dev/tty
+                need_tty=no
+                ;;
             *)
                 OPTIND=1
                 if [ "${arg%%--*}" = "" ]; then
@@ -173,6 +178,17 @@ main() {
         err "Please copy the file to a location where you can execute binaries and run ./rustup-init${_ext}."
         exit 1
     fi
+
+    # If a default host has been specified on the command line, we should
+    # revert our own override before calling the installer.
+    for arg in "$@"; do
+        case "$arg" in
+            --default-host|--default-host=*)
+                _default_host_override=
+                break
+                ;;
+        esac
+    done
 
     if [ "$need_tty" = "yes" ] && [ ! -t 0 ]; then
         # The installer is going to want to ask for confirmation by
@@ -509,6 +525,10 @@ get_architecture() {
 
         aarch64 | arm64)
             _cputype=aarch64
+            # Windows aarch64 uses gnullvm instead of gnu
+            if [ "$_ostype" = "pc-windows-gnu" ]; then
+                _ostype=pc-windows-gnullvm
+            fi
             ;;
 
         x86_64 | x86-64 | x64 | amd64)

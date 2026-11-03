@@ -50,7 +50,8 @@ where
     let process = process.clone();
     let logger = tracing_subscriber::fmt::layer()
         .with_writer(process.stderr())
-        .with_ansi(true); // `process.stderr()` will translate ANSI escape codes
+        .with_ansi(true)
+        .with_ansi_sanitization(false); // `process.stderr()` will translate ANSI escape codes
     if let Ok(directives) = maybe_rustup_log_directives {
         let (env_filter, handle) = reload::Layer::new(
             EnvFilter::builder()
@@ -99,11 +100,11 @@ where
 impl NotificationLevel {
     fn fg_color(&self) -> Option<Color> {
         match self {
-            NotificationLevel::Trace => Some(AnsiColor::Blue.into()),
-            NotificationLevel::Debug => Some(AnsiColor::Magenta.into()),
-            NotificationLevel::Info => None,
-            NotificationLevel::Warn => Some(AnsiColor::Yellow.into()),
-            NotificationLevel::Error => Some(AnsiColor::Red.into()),
+            Self::Trace => Some(AnsiColor::Blue.into()),
+            Self::Debug => Some(AnsiColor::Magenta.into()),
+            Self::Info => None,
+            Self::Warn => Some(AnsiColor::Yellow.into()),
+            Self::Error => Some(AnsiColor::Red.into()),
         }
     }
 }

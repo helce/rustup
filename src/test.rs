@@ -20,20 +20,25 @@ use std::process::Command;
 use anyhow::Result;
 use sha2::{Digest, Sha256};
 
-use crate::dist::TargetTriple;
+use crate::dist::TargetTuple;
 use crate::process::TestProcess;
 
+#[cfg(all(windows, any(test, feature = "test")))]
+pub(crate) fn test_id() -> String {
+    crate::utils::raw::random_string(8)
+}
+
 #[cfg(windows)]
-pub use crate::cli::self_update::{RegistryGuard, RegistryValueId, USER_PATH, get_path};
+pub use crate::cli::self_update::{RUSTUP_REGISTRY_TEST_ID, RegistryValueId, USER_PATH, get_path};
 
 mod clitools;
 pub use clitools::{
     Assert, CliTestContext, Config, SanitizedOutput, Scenario, SelfUpdateTestContext,
     output_release_file, print_command, print_indented,
 };
-pub(crate) mod dist;
+pub(super) mod dist;
 pub use dist::DistContext;
-pub(crate) mod mock;
+pub(super) mod mock;
 pub use mock::{MockComponentBuilder, MockFile, MockInstallerBuilder};
 
 // Things that can have environment variables applied to them.
@@ -77,7 +82,7 @@ fn exe_test_dir() -> io::Result<PathBuf> {
 }
 
 /// Returns a tempdir for running tests in
-pub fn test_dir() -> io::Result<tempfile::TempDir> {
+pub(super) fn test_dir() -> io::Result<tempfile::TempDir> {
     let exe_dir = exe_test_dir()?;
     let test_dir = exe_dir.join("tests");
     fs::create_dir_all(&test_dir).unwrap();
@@ -87,7 +92,7 @@ pub fn test_dir() -> io::Result<tempfile::TempDir> {
 }
 
 /// Returns a directory for storing immutable distributions in
-pub fn const_dist_dir() -> io::Result<tempfile::TempDir> {
+fn const_dist_dir() -> io::Result<tempfile::TempDir> {
     // TODO: do something smart, like managing garbage collection or something.
     let exe_dir = exe_test_dir()?;
     let dists_dir = exe_dir.join("dists");
@@ -103,7 +108,7 @@ pub fn const_dist_dir() -> io::Result<tempfile::TempDir> {
 }
 
 /// Returns a tempdir for storing test-scoped distributions in
-pub fn test_dist_dir() -> io::Result<tempfile::TempDir> {
+fn test_dist_dir() -> io::Result<tempfile::TempDir> {
     let exe_dir = exe_test_dir()?;
     let test_dir = exe_dir.join("tests");
     fs::create_dir_all(&test_dir).unwrap();
@@ -123,26 +128,26 @@ fn tempdir_in_with_prefix<P: AsRef<Path>>(path: P, prefix: &str) -> io::Result<P
         .keep())
 }
 
-/// What is this host's triple - seems very redundant with from_host_or_build()
+/// What is this host's tuple - seems very redundant with from_host_or_build()
 /// ... perhaps this is so that the test data we have is only exercised on known
-/// triples?
+/// tuples?
 ///
 /// NOTE: This *cannot* be called within a process context as it creates
 /// its own context on Windows hosts. This is partly by chance but also partly
-/// deliberate: If you need the host triple, or to call for_host(), you can do
+/// deliberate: If you need the host tuple, or to call for_host(), you can do
 /// so outside of calls to run() or unit test code that runs in a process
 /// context.
 ///
 /// IF it becomes very hard to workaround that, then we can either make a second
-/// this_host_triple that doesn't make its own process or use
-/// TargetTriple::from_host() from within the process context as needed.
-pub fn this_host_triple() -> String {
+/// this_host_tuple that doesn't make its own process or use
+/// [`TargetTuple::from_host()`] from within the process context as needed.
+pub fn this_host_tuple() -> String {
     if cfg!(target_os = "windows") {
         // For windows, this host may be different to the target: we may be
         // building with i686 toolchain, but on an x86_64 host, so run the
         // actual detection logic and trust it.
         let tp = TestProcess::default();
-        return TargetTriple::from_host(&tp.process).unwrap().to_string();
+        return TargetTuple::from_host(&tp.process).unwrap().to_string();
     }
     let arch = if cfg!(target_arch = "x86") {
         "i686"
@@ -193,11 +198,11 @@ pub fn this_host_triple() -> String {
     }
 }
 
-// Format a string with this host triple.
+// Format a string with this host tuple.
 #[macro_export]
 macro_rules! for_host {
     ($s:tt $($arg:tt)*) => {
-        &format!($s, $crate::test::this_host_triple() $($arg)*)
+        &format!($s, $crate::test::this_host_tuple() $($arg)*)
     };
 }
 
@@ -210,7 +215,7 @@ pub struct RustupHome {
 }
 
 impl RustupHome {
-    pub fn apply<E: Env>(&self, e: &mut E) {
+    pub(super) fn apply<E: Env>(&self, e: &mut E) {
         e.env("RUSTUP_HOME", self.rustupdir.to_string_lossy().to_string())
     }
 
@@ -222,9 +227,9 @@ impl RustupHome {
         self.rustupdir.join(path)
     }
 
-    pub fn new_in<P: AsRef<Path>>(path: P) -> io::Result<Self> {
+    pub(super) fn new_in<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         let rustupdir = tempdir_in_with_prefix(path, "rustup")?;
-        Ok(RustupHome { rustupdir })
+        Ok(Self { rustupdir })
     }
 
     pub fn remove(&self) -> io::Result<()> {
@@ -241,7 +246,7 @@ impl fmt::Display for RustupHome {
 /// Create an isolated rustup home with no content, then call f with it, and
 /// delete it afterwards.
 #[cfg(test)]
-pub(crate) fn with_rustup_home<F>(f: F) -> Result<()>
+pub(super) fn with_rustup_home<F>(f: F) -> Result<()>
 where
     F: FnOnce(&RustupHome) -> Result<()>,
 {
@@ -284,8 +289,8 @@ pub mod topical_doc_data {
     fn repath(origin: &str) -> String {
         // Add doc prefix and rewrite string paths for the current platform
         let with_prefix = "share/doc/rust/html/".to_owned() + origin;
-        let splitted = with_prefix.split('/');
-        let repathed = splitted.fold(PathBuf::new(), |acc, e| acc.join(e));
+        let split = with_prefix.split('/');
+        let repathed = split.fold(PathBuf::new(), |acc, e| acc.join(e));
         repathed.into_os_string().into_string().unwrap()
     }
 
@@ -293,7 +298,7 @@ pub mod topical_doc_data {
         TEST_CASES.iter().map(|(args, path)| (*args, repath(path)))
     }
 
-    pub fn unique_paths() -> impl Iterator<Item = String> {
+    pub(super) fn unique_paths() -> impl Iterator<Item = String> {
         // Hashset used to test uniqueness of values through insert method.
         let mut unique_paths = HashSet::new();
         TEST_CASES
@@ -308,7 +313,7 @@ pub fn calc_hash(src: &Path) -> String {
     File::open(src).unwrap().read_to_end(&mut buf).unwrap();
     let mut hasher = Sha256::new();
     hasher.update(buf);
-    format!("{:x}", hasher.finalize())
+    faster_hex::hex_string(&hasher.finalize())
 }
 
 pub fn create_hash(src: &Path, dst: &Path) -> String {
@@ -326,4 +331,4 @@ pub static CROSS_ARCH2: &str = "arm-linux-androideabi";
 #[cfg(target_pointer_width = "64")]
 pub static MULTI_ARCH1: &str = "i686-unknown-linux-gnu";
 #[cfg(not(target_pointer_width = "64"))]
-pub static MULTI_ARCH1: &str = "x86_64-unknown-linux-gnu";
+static MULTI_ARCH1: &str = "x86_64-unknown-linux-gnu";

@@ -15,7 +15,7 @@ use crate::utils;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettingsFile {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     cache: RefCell<Option<Settings>>,
 }
 
@@ -29,7 +29,7 @@ impl SettingsFile {
 
     fn write_settings(&self) -> Result<()> {
         let settings = self.cache.borrow();
-        utils::write_file(
+        utils::write_locked_file(
             "settings",
             &self.path,
             &settings.as_ref().unwrap().stringify()?,
@@ -38,25 +38,18 @@ impl SettingsFile {
     }
 
     fn read_settings(&self) -> Result<()> {
-        let mut needs_save = false;
-        {
-            let b = self.cache.borrow();
-            if b.is_none() {
-                drop(b);
-                *self.cache.borrow_mut() = Some(if utils::is_file(&self.path) {
-                    let content = utils::read_file("settings", &self.path)?;
-                    Settings::parse(&content).with_context(|| RustupError::ParsingFile {
-                        name: "settings",
-                        path: self.path.clone(),
-                    })?
-                } else {
-                    needs_save = true;
-                    Default::default()
-                });
-            }
-        }
-        if needs_save {
-            self.write_settings()?;
+        let b = self.cache.borrow();
+        if b.is_none() {
+            drop(b);
+            *self.cache.borrow_mut() = Some(if utils::is_file(&self.path) {
+                let content = utils::read_locked_file("settings", &self.path)?;
+                Settings::parse(&content).with_context(|| RustupError::ParsingFile {
+                    name: "settings",
+                    path: self.path.clone(),
+                })?
+            } else {
+                Settings::default()
+            });
         }
         Ok(())
     }
@@ -82,7 +75,8 @@ impl SettingsFile {
 pub struct Settings {
     pub version: MetadataVersion,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub default_host_triple: Option<String>,
+    #[serde(alias = "default_host_triple")]
+    pub default_host_tuple: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_toolchain: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,4 +218,28 @@ profile = "default"
 
 [overrides]
 "#;
+
+    #[test]
+    fn deserialize_default_host_triple() {
+        let raw = r#"version = "12"
+default_host_triple = "stable-aarch64-apple-darwin"
+"#;
+        let settings = Settings::parse(raw).unwrap();
+        assert_eq!(
+            settings.default_host_tuple,
+            Some("stable-aarch64-apple-darwin".to_owned())
+        );
+    }
+
+    #[test]
+    fn deserialize_default_host_tuple() {
+        let raw = r#"version = "12"
+default_host_tuple = "stable-aarch64-apple-darwin"
+"#;
+        let settings = Settings::parse(raw).unwrap();
+        assert_eq!(
+            settings.default_host_tuple,
+            Some("stable-aarch64-apple-darwin".to_owned())
+        );
+    }
 }

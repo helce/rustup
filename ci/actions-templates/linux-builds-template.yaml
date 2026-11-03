@@ -6,9 +6,9 @@ jobs: # skip-main skip-pr skip-stable
   build-linux-main: # job-name skip-pr skip-stable
   build-linux-stable: # job-name skip-main skip-pr
     runs-on: ${{ matrix.os || 'ubuntu-latest' }}
-    if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-main skip-stable
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'main') }} # skip-pr skip-stable
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-main
+    if: ${{ contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }} # skip-main skip-stable
+    if: ${{ github.event_name == 'push' && (github.ref_name == 'main' || startsWith(github.ref_name, 'release/')) }} # skip-pr skip-stable
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)  }} # skip-pr skip-main
     permissions:
       id-token: write
       contents: read
@@ -24,6 +24,7 @@ jobs: # skip-main skip-pr skip-stable
           - aarch64-linux-android
           - aarch64-unknown-linux-gnu
           - aarch64-unknown-linux-musl     # skip-pr skip-main
+          - aarch64-unknown-freebsd        # skip-pr skip-main skip-stable
           - powerpc64-unknown-linux-gnu    # skip-pr
           - x86_64-unknown-linux-musl      # skip-pr
           - i686-unknown-linux-gnu         # skip-pr skip-main
@@ -34,7 +35,7 @@ jobs: # skip-main skip-pr skip-stable
           - x86_64-unknown-netbsd          # skip-pr skip-main
           - x86_64-unknown-illumos         # skip-pr skip-main
           - powerpc-unknown-linux-gnu      # skip-pr skip-main
-          - powerpc64-unknown-linux-musl   # skip-pr skip-main skip-stable
+          - powerpc64-unknown-linux-musl   # skip-pr skip-main
           - powerpc64le-unknown-linux-gnu  # skip-pr skip-main
           - powerpc64le-unknown-linux-musl # skip-pr skip-main
           - s390x-unknown-linux-gnu        # skip-pr skip-main
@@ -43,6 +44,7 @@ jobs: # skip-main skip-pr skip-stable
           - armv7-linux-androideabi        # skip-pr skip-main
           - x86_64-linux-android           # skip-pr skip-main
           - riscv64gc-unknown-linux-gnu    # skip-pr skip-main
+          - riscv64gc-unknown-linux-musl   # skip-pr skip-main
           - loongarch64-unknown-linux-gnu  # skip-pr skip-main
           - loongarch64-unknown-linux-musl # skip-pr skip-main
         include:
@@ -65,7 +67,7 @@ jobs: # skip-main skip-pr skip-stable
             #snap_arch: s390x # skip-pr skip-main
     steps:
       - name: Clone repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           # v2 defaults to a shallow checkout, but we need at least to the previous tag
           fetch-depth: 0
@@ -88,7 +90,7 @@ jobs: # skip-main skip-pr skip-stable
         run: |
           echo "SKIP_TESTS=yes" >> $GITHUB_ENV
       - name: Cache cargo registry and git trees
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -100,7 +102,7 @@ jobs: # skip-main skip-pr skip-stable
           echo "{rust_hash}={$(rustc -Vv | grep commit-hash | awk '{print $2}')}" >> $GITHUB_OUTPUT
         shell: bash
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ github.base_ref }}-${{ github.head_ref }}-${{ matrix.target }}-${{ matrix.mode }}-cargo-target-dir-${{ steps.cargo-target-cache.outputs.rust_hash }}-${{ hashFiles('**/Cargo.lock') }}
@@ -186,13 +188,13 @@ jobs: # skip-main skip-pr skip-stable
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
       - name: Configure AWS credentials
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
           aws-region: us-east-1
       - name: Deploy build to rustup-builds bucket for release team
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         run: |
           aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
         env:

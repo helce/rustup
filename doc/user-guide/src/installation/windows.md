@@ -20,18 +20,12 @@ a target tuple of either `i686-pc-windows-msvc`, `x86_64-pc-windows-msvc`, or `a
 depending on the CPU architecture of the host Windows OS. The toolchains that
 `rustup` chooses to install, unless told otherwise through the [toolchain
 specification], will be compiled to run on that target tuple host and will
-target that triple by default.
+target that tuple by default.
 
 You can change this behavior with `rustup set default-host` or during
 installation.
 
-For example, to explicitly select the 32-bit MSVC host:
-
-```console
-$ rustup set default-host i686-pc-windows-msvc
-```
-
-Or to choose the 64 bit GNU toolchain:
+For example, to choose the 64 bit GNU toolchain:
 
 ```console
 $ rustup set default-host x86_64-pc-windows-gnu

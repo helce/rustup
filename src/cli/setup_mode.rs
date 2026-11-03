@@ -10,7 +10,6 @@ use crate::{
         common::{self, update_console_filter},
         self_update::{self, InstallOpts},
     },
-    config::Cfg,
     dist::Profile,
     process::Process,
     toolchain::MaybeOfficialToolchainName,
@@ -36,10 +35,10 @@ struct RustupInit {
     quiet: bool,
 
     /// Disable confirmation prompt
-    #[arg(short = 'y')]
+    #[arg(short = 'y', long = "yes")]
     no_prompt: bool,
 
-    /// Choose a default host triple
+    /// Choose a default host tuple
     #[arg(long)]
     default_host: Option<String>,
 
@@ -121,7 +120,7 @@ pub async fn main(
     update_console_filter(process, &console_filter, quiet, verbose);
 
     let opts = InstallOpts {
-        default_host_triple: default_host,
+        default_host_tuple: default_host,
         default_toolchain,
         profile,
         no_modify_path,
@@ -129,7 +128,5 @@ pub async fn main(
         components: &component.iter().map(|s| &**s).collect::<Vec<_>>(),
         targets: &target.iter().map(|s| &**s).collect::<Vec<_>>(),
     };
-
-    let mut cfg = Cfg::from_env(current_dir, quiet, process)?;
-    self_update::install(no_prompt, opts, &mut cfg).await
+    opts.install(current_dir, no_prompt, quiet, process).await
 }

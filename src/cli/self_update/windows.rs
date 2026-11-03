@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::env::{consts::EXE_SUFFIX, split_paths};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -5,8 +6,6 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Command;
-#[cfg(any(test, feature = "test"))]
-use std::sync::{LockResult, Mutex, MutexGuard};
 
 use anyhow::{Context, Result, anyhow};
 use tracing::{info, warn};
@@ -20,9 +19,7 @@ use super::super::errors::CliError;
 use super::common;
 use super::{InstallOpts, install_bins, report_error};
 use crate::cli::markdown::md;
-use crate::config::Cfg;
-use crate::dist::TargetTriple;
-use crate::dist::download::DownloadCfg;
+use crate::dist::TargetTuple;
 use crate::download::download_file;
 use crate::process::{ColorableTerminal, Process};
 use crate::utils;
@@ -92,35 +89,36 @@ pub(crate) fn choose_vs_install(process: &Process) -> Result<Option<VsInstallPla
 pub(super) async fn maybe_install_msvc(
     term: &mut ColorableTerminal,
     no_prompt: bool,
+    quiet: bool,
     opts: &InstallOpts<'_>,
-    cfg: &Cfg<'_>,
+    process: &Process,
 ) -> Result<()> {
-    let Some(plan) = do_msvc_check(opts, cfg.process) else {
+    let Some(plan) = do_msvc_check(opts, process) else {
         return Ok(());
     };
 
     if no_prompt {
         warn!("installing msvc toolchain without its prerequisites");
-    } else if !cfg.quiet && plan == VsInstallPlan::Automatic {
+    } else if !quiet && plan == VsInstallPlan::Automatic {
         md(term, MSVC_AUTO_INSTALL_MESSAGE);
-        match choose_vs_install(cfg.process)? {
+        match choose_vs_install(process)? {
             Some(VsInstallPlan::Automatic) => {
-                match try_install_msvc(opts, cfg).await {
+                match try_install_msvc(opts, process).await {
                     Err(e) => {
                         // Make sure the console doesn't exit before the user can
                         // see the error and give the option to continue anyway.
-                        report_error(&e, cfg.process);
-                        if !common::question_bool("\nContinue?", false, cfg.process)? {
+                        report_error(&e, process);
+                        if !common::question_bool("\nContinue?", false, process)? {
                             info!("aborting installation");
                         }
                     }
-                    Ok(ContinueInstall::No) => ensure_prompt(cfg.process)?,
+                    Ok(ContinueInstall::No) => ensure_prompt(process)?,
                     _ => {}
                 }
             }
             Some(VsInstallPlan::Manual) => {
                 md(term, MSVC_MANUAL_INSTALL_MESSAGE);
-                if !common::question_bool("\nContinue?", false, cfg.process)? {
+                if !common::question_bool("\nContinue?", false, process)? {
                     info!("aborting installation");
                 }
             }
@@ -129,7 +127,7 @@ pub(super) async fn maybe_install_msvc(
     } else {
         md(term, MSVC_MESSAGE);
         md(term, MSVC_MANUAL_INSTALL_MESSAGE);
-        if !common::question_bool("\nContinue?", false, cfg.process)? {
+        if !common::question_bool("\nContinue?", false, process)? {
             info!("aborting installation");
         }
     }
@@ -187,20 +185,20 @@ pub(crate) fn do_msvc_check(opts: &InstallOpts<'_>, process: &Process) -> Option
     }
 
     use cc::windows_registry;
-    let host_triple = if let Some(trip) = opts.default_host_triple.as_ref() {
-        trip.to_owned()
+    let host_tuple = if let Some(tuple) = opts.default_host_tuple.as_ref() {
+        tuple.to_owned()
     } else {
-        TargetTriple::from_host_or_build(process).to_string()
+        TargetTuple::from_host_or_build(process).to_string()
     };
-    let installing_msvc = host_triple.contains("msvc");
-    let have_msvc = windows_registry::find_tool(&host_triple, "cl.exe").is_some();
+    let installing_msvc = host_tuple.contains("msvc");
+    let have_msvc = windows_registry::find_tool(&host_tuple, "cl.exe").is_some();
     if installing_msvc && !have_msvc {
         // Visual Studio build tools are required.
         // If the user does not have Visual Studio installed and their host
         // machine is i686 or x86_64 then it's OK to try an auto install.
         // Otherwise a manual install will be required.
         let has_any_vs = windows_registry::find_vs_version().is_ok();
-        let is_x86 = host_triple.contains("i686") || host_triple.contains("x86_64");
+        let is_x86 = host_tuple.contains("i686") || host_tuple.contains("x86_64");
         if is_x86 && !has_any_vs {
             Some(VsInstallPlan::Automatic)
         } else {
@@ -260,7 +258,7 @@ pub(crate) enum ContinueInstall {
 /// but the rustup install should not be continued at this time.
 pub(crate) async fn try_install_msvc(
     opts: &InstallOpts<'_>,
-    cfg: &Cfg<'_>,
+    process: &Process,
 ) -> Result<ContinueInstall> {
     // download the installer
     let visual_studio_url = utils::parse_url("https://aka.ms/vs/17/release/vs_community.exe")?;
@@ -271,16 +269,8 @@ pub(crate) async fn try_install_msvc(
         .context("error creating temp directory")?;
 
     let visual_studio = tempdir.path().join("vs_setup.exe");
-    let dl_cfg = DownloadCfg::new(cfg);
     info!("downloading Visual Studio installer");
-    download_file(
-        &visual_studio_url,
-        &visual_studio,
-        None,
-        None,
-        dl_cfg.process,
-    )
-    .await?;
+    download_file(&visual_studio_url, &visual_studio, None, None, process).await?;
 
     // Run the installer. Arguments are documented at:
     // https://docs.microsoft.com/en-us/visualstudio/install/use-command-line-parameters-to-install-visual-studio
@@ -295,7 +285,7 @@ pub(crate) async fn try_install_msvc(
 
     // It's possible an earlier or later version of the Windows SDK has been
     // installed separately from Visual Studio so installing it can be skipped.
-    if !has_windows_sdk_libs(cfg.process) {
+    if !has_windows_sdk_libs(process) {
         cmd.args([
             "--add",
             "Microsoft.VisualStudio.Component.Windows11SDK.26100",
@@ -328,8 +318,8 @@ pub(crate) async fn try_install_msvc(
                 // It's possible that the installer returned a non-zero exit code
                 // even though the required components were successfully installed.
                 // In that case we warn about the error but continue on.
-                let have_msvc = do_msvc_check(opts, cfg.process).is_none();
-                let has_libs = has_windows_sdk_libs(cfg.process);
+                let have_msvc = do_msvc_check(opts, process).is_none();
+                let has_libs = has_windows_sdk_libs(process);
                 if have_msvc && has_libs {
                     warn!("Visual Studio is installed but a problem occurred during installation");
                     warn!("{}", err);
@@ -454,23 +444,22 @@ pub(crate) fn wait_for_parent() -> Result<()> {
 
 pub(crate) fn do_add_to_path(process: &Process) -> Result<()> {
     let new_path = _with_path_cargo_home_bin(_add_to_path, process)?;
-    _apply_new_path(new_path)?;
-    do_add_to_programs(process)
+    _apply_new_path(new_path, process)?;
+    add_uninstall_registry_entry(process)
 }
 
-fn _apply_new_path(new_path: Option<HSTRING>) -> Result<()> {
+fn _apply_new_path(new_path: Option<HSTRING>, process: &Process) -> Result<()> {
     use std::ptr;
     use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutA, WM_SETTINGCHANGE,
     };
 
-    let new_path = match new_path {
-        Some(new_path) => new_path,
-        None => return Ok(()), // No need to set the path
+    let Some(new_path) = new_path else {
+        return Ok(()); // No need to set the path
     };
 
-    let environment = CURRENT_USER.create("Environment")?;
+    let environment = process.registry_environment_key()?;
 
     if new_path.is_empty() {
         environment.remove_value("PATH")?;
@@ -498,9 +487,9 @@ fn _apply_new_path(new_path: Option<HSTRING>) -> Result<()> {
 // Get the windows PATH variable out of the registry as a String. If
 // this returns None then the PATH variable is not a string and we
 // should not mess with it.
-fn get_windows_path_var() -> Result<Option<HSTRING>> {
-    let environment = CURRENT_USER
-        .create("Environment")
+fn get_windows_path_var(process: &Process) -> Result<Option<HSTRING>> {
+    let environment = process
+        .registry_environment_key()
         .context("Failed opening Environment key")?;
 
     let reg_value = environment.get_hstring("PATH");
@@ -564,7 +553,7 @@ fn _with_path_cargo_home_bin<F>(f: F, process: &Process) -> Result<Option<HSTRIN
 where
     F: FnOnce(HSTRING, HSTRING) -> Option<HSTRING>,
 {
-    let windows_path = get_windows_path_var()?;
+    let windows_path = get_windows_path_var(process)?;
     let mut path_str = process.cargo_home()?;
     path_str.push("bin");
     Ok(windows_path.and_then(|old_path| f(old_path, HSTRING::from(path_str.as_path()))))
@@ -572,28 +561,58 @@ where
 
 pub(crate) fn do_remove_from_path(process: &Process) -> Result<()> {
     let new_path = _with_path_cargo_home_bin(_remove_from_path, process)?;
-    _apply_new_path(new_path)?;
-    do_remove_from_programs()
+    _apply_new_path(new_path, process)?;
+    remove_uninstall_registry_entry(process)
 }
 
 const RUSTUP_UNINSTALL_ENTRY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Rustup";
 
-fn rustup_uninstall_reg_key() -> Result<Key> {
-    CURRENT_USER
-        .create(RUSTUP_UNINSTALL_ENTRY)
+impl Process {
+    fn registry_sub_key_path<'a>(&self, sub_key: &'a str) -> Cow<'a, str> {
+        #[cfg(any(test, feature = "test"))]
+        if let Ok(test_id) = self.var(RUSTUP_REGISTRY_TEST_ID) {
+            return Cow::Owned(format!(r"RustupTest-{test_id}\{sub_key}"));
+        }
+
+        Cow::Borrowed(sub_key)
+    }
+
+    fn registry_key(&self, sub_key: &str, parent: &Key) -> windows_registry::Result<Key> {
+        let mut options = parent.options();
+        options.read().write().create();
+
+        #[cfg(any(test, feature = "test"))]
+        if self.var(RUSTUP_REGISTRY_TEST_ID).is_ok() {
+            options.volatile();
+        }
+
+        options.open(self.registry_sub_key_path(sub_key))
+    }
+
+    fn registry_environment_key(&self) -> windows_registry::Result<Key> {
+        self.registry_key("Environment", CURRENT_USER)
+    }
+}
+
+fn rustup_uninstall_registry_key(process: &Process) -> Result<Key> {
+    process
+        .registry_key(RUSTUP_UNINSTALL_ENTRY, CURRENT_USER)
         .context("Failed creating uninstall key")
 }
 
-pub(crate) fn do_update_programs_display_version(version: &str) -> Result<()> {
-    rustup_uninstall_reg_key()?
+pub(crate) fn update_uninstall_registry_display_version(
+    version: &str,
+    process: &Process,
+) -> Result<()> {
+    rustup_uninstall_registry_key(process)?
         .set_string("DisplayVersion", version)
         .context("Failed to set `DisplayVersion`")
 }
 
-pub(crate) fn do_add_to_programs(process: &Process) -> Result<()> {
+pub(crate) fn add_uninstall_registry_entry(process: &Process) -> Result<()> {
     use std::path::PathBuf;
 
-    let key = rustup_uninstall_reg_key()?;
+    let key = rustup_uninstall_registry_key(process)?;
 
     // Don't overwrite registry if Rustup is already installed
     let prev = key.get_hstring("UninstallString");
@@ -615,20 +634,20 @@ pub(crate) fn do_add_to_programs(process: &Process) -> Result<()> {
         .context("Failed to set `UninstallString`")?;
     key.set_string("DisplayName", "Rustup: the Rust toolchain installer")
         .context("Failed to set `DisplayName`")?;
-    do_update_programs_display_version(env!("CARGO_PKG_VERSION"))?;
+    update_uninstall_registry_display_version(env!("CARGO_PKG_VERSION"), process)?;
 
     Ok(())
 }
 
-pub(crate) fn do_remove_from_programs() -> Result<()> {
-    match CURRENT_USER.remove_tree(RUSTUP_UNINSTALL_ENTRY) {
+pub(crate) fn remove_uninstall_registry_entry(process: &Process) -> Result<()> {
+    match CURRENT_USER.remove_tree(process.registry_sub_key_path(RUSTUP_UNINSTALL_ENTRY)) {
         Ok(()) => Ok(()),
         Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND) => Ok(()),
         Err(e) => Err(anyhow!(e)),
     }
 }
 
-pub(crate) fn run_update(setup_path: &Path) -> Result<utils::ExitCode> {
+pub(crate) fn run_update(setup_path: &Path, process: &Process) -> Result<utils::ExitCode> {
     Command::new(setup_path)
         .arg("--self-replace")
         .spawn()
@@ -638,7 +657,7 @@ pub(crate) fn run_update(setup_path: &Path) -> Result<utils::ExitCode> {
         warn!("failed to get the new rustup version in order to update `DisplayVersion`");
         return Ok(utils::ExitCode(1));
     };
-    do_update_programs_display_version(&version)?;
+    update_uninstall_registry_display_version(&version, process)?;
 
     Ok(utils::ExitCode(0))
 }
@@ -755,38 +774,14 @@ pub(crate) fn delete_rustup_and_cargo_home(process: &Process) -> Result<()> {
     Ok(())
 }
 
+/// Environment variable carrying the per-test registry ID.
 #[cfg(any(test, feature = "test"))]
-pub fn get_path() -> Result<Option<Value>> {
-    USER_PATH.get()
-}
+pub const RUSTUP_REGISTRY_TEST_ID: &str = "RUSTUP_REGISTRY_TEST_ID";
 
 #[cfg(any(test, feature = "test"))]
-pub struct RegistryGuard<'a> {
-    _locked: LockResult<MutexGuard<'a, ()>>,
-    id: &'static RegistryValueId,
-    prev: Option<Value>,
+pub fn get_path(test_id: &str) -> Result<Option<Value>> {
+    USER_PATH.get(test_id, CURRENT_USER)
 }
-
-#[cfg(any(test, feature = "test"))]
-impl RegistryGuard<'_> {
-    pub fn new(id: &'static RegistryValueId) -> Result<Self> {
-        Ok(Self {
-            _locked: REGISTRY_LOCK.lock(),
-            id,
-            prev: id.get()?,
-        })
-    }
-}
-
-#[cfg(any(test, feature = "test"))]
-impl Drop for RegistryGuard<'_> {
-    fn drop(&mut self) {
-        self.id.set(self.prev.as_ref()).unwrap();
-    }
-}
-
-#[cfg(any(test, feature = "test"))]
-static REGISTRY_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(any(test, feature = "test"))]
 pub const USER_PATH: RegistryValueId = RegistryValueId {
@@ -802,8 +797,10 @@ pub struct RegistryValueId {
 
 #[cfg(any(test, feature = "test"))]
 impl RegistryValueId {
-    pub fn get(&self) -> Result<Option<Value>> {
-        let sub_key = CURRENT_USER.create(self.sub_key)?;
+    pub fn get(&self, test_id: &str, parent: &Key) -> Result<Option<Value>> {
+        let mut options = parent.options();
+        options.read().write().create().volatile();
+        let sub_key = options.open(format!(r"RustupTest-{test_id}\{}", self.sub_key))?;
         match sub_key.get_value(self.value_name) {
             Ok(val) => Ok(Some(val)),
             Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND) => Ok(None),
@@ -811,23 +808,109 @@ impl RegistryValueId {
         }
     }
 
-    pub fn set(&self, new: Option<&Value>) -> Result<()> {
-        let sub_key = CURRENT_USER.create(self.sub_key)?;
+    pub fn set(&self, new: Option<&Value>, test_id: &str, parent: &Key) -> Result<()> {
+        let mut options = parent.options();
+        options.read().write().create().volatile();
+        let sub_key = options.open(format!(r"RustupTest-{test_id}\{}", self.sub_key))?;
         match new {
             Some(new) => Ok(sub_key.set_value(self.value_name, new)?),
-            None => Ok(sub_key.remove_value(self.value_name)?),
+            None => match sub_key.remove_value(self.value_name) {
+                Ok(()) => Ok(()),
+                Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND) => Ok(()),
+                Err(e) => Err(e.into()),
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::os::windows::ffi::OsStringExt;
 
     use windows_registry::Type;
 
     use super::*;
     use crate::process::TestProcess;
+    use crate::test::test_id;
+
+    fn test_process(test_id: &str) -> TestProcess {
+        let vars: HashMap<String, String> = [
+            ("HOME".to_string(), "/unused".to_string()),
+            (RUSTUP_REGISTRY_TEST_ID.to_string(), test_id.to_owned()),
+        ]
+        .into_iter()
+        .collect();
+        TestProcess::with_vars(vars)
+    }
+
+    fn clear_path(environment: &Key) {
+        match environment.remove_value("PATH") {
+            Ok(()) => {}
+            Err(e) if e.code() == HRESULT::from_win32(ERROR_FILE_NOT_FOUND) => {}
+            Err(e) => panic!("failed to clear PATH: {e}"),
+        }
+    }
+
+    #[test]
+    fn windows_registry_isolated_per_test_id() {
+        let first_id = test_id();
+        let second_id = test_id();
+        let first = test_process(&first_id);
+        let second = test_process(&second_id);
+        let first_value = Value::from("first");
+        let second_value = Value::from("second");
+
+        USER_PATH
+            .set(Some(&first_value), &first_id, CURRENT_USER)
+            .unwrap();
+        USER_PATH
+            .set(Some(&second_value), &second_id, CURRENT_USER)
+            .unwrap();
+
+        assert_eq!(
+            first
+                .process
+                .registry_environment_key()
+                .unwrap()
+                .get_hstring("PATH")
+                .unwrap(),
+            HSTRING::from("first")
+        );
+        assert_eq!(
+            second
+                .process
+                .registry_environment_key()
+                .unwrap()
+                .get_hstring("PATH")
+                .unwrap(),
+            HSTRING::from("second")
+        );
+
+        let programs_version = RegistryValueId {
+            sub_key: RUSTUP_UNINSTALL_ENTRY,
+            value_name: "DisplayVersion",
+        };
+        programs_version
+            .set(Some(&first_value), &first_id, CURRENT_USER)
+            .unwrap();
+        assert_eq!(
+            programs_version.get(&first_id, CURRENT_USER).unwrap(),
+            Some(first_value)
+        );
+        assert_eq!(
+            programs_version.get(&second_id, CURRENT_USER).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_registry_cleanup_is_idempotent() {
+        let test_id = test_id();
+        let tp = test_process(&test_id);
+
+        remove_uninstall_registry_entry(&tp.process).unwrap();
+    }
 
     #[test]
     fn windows_install_does_not_add_path_twice() {
@@ -865,16 +948,20 @@ mod tests {
     #[test]
     fn windows_path_regkey_type() {
         // per issue #261, setting PATH should use REG_EXPAND_SZ.
-        let _guard = RegistryGuard::new(&USER_PATH);
-        let environment = CURRENT_USER.create("Environment").unwrap();
-        environment.remove_value("PATH").unwrap();
+        let test_id = test_id();
+        let tp = test_process(&test_id);
+        let environment = tp.process.registry_environment_key().unwrap();
+        clear_path(&environment);
 
         {
             // Can't compare the Results as Eq isn't derived; thanks error-chain.
             #![allow(clippy::unit_cmp)]
-            assert_eq!((), _apply_new_path(Some(HSTRING::from("foo"))).unwrap());
+            assert_eq!(
+                (),
+                _apply_new_path(Some(HSTRING::from("foo")), &tp.process).unwrap()
+            );
         }
-        let environment = CURRENT_USER.create("Environment").unwrap();
+        let environment = tp.process.registry_environment_key().unwrap();
         let path = environment.get_value("PATH").unwrap();
         let path_hstring = environment.get_hstring("PATH").unwrap();
         assert_eq!(path.ty(), Type::ExpandString);
@@ -885,8 +972,9 @@ mod tests {
     fn windows_path_delete_key_when_empty() {
         // during uninstall the PATH key may end up empty; if so we should
         // delete it.
-        let _guard = RegistryGuard::new(&USER_PATH);
-        let environment = CURRENT_USER.create("Environment").unwrap();
+        let test_id = test_id();
+        let tp = test_process(&test_id);
+        let environment = tp.process.registry_environment_key().unwrap();
         environment
             .set_expand_hstring("PATH", &HSTRING::from("foo"))
             .unwrap();
@@ -894,7 +982,10 @@ mod tests {
         {
             // Can't compare the Results as Eq isn't derived; thanks error-chain.
             #![allow(clippy::unit_cmp)]
-            assert_eq!((), _apply_new_path(Some(HSTRING::new())).unwrap());
+            assert_eq!(
+                (),
+                _apply_new_path(Some(HSTRING::new()), &tp.process).unwrap()
+            );
         }
         let reg_value = environment.get_value("PATH");
         match reg_value {
@@ -906,16 +997,11 @@ mod tests {
 
     #[test]
     fn windows_doesnt_mess_with_a_non_string_path() {
+        let test_id = test_id();
         // This writes an error, so we want a sink for it.
-        let tp = TestProcess::with_vars(
-            [("HOME".to_string(), "/unused".to_string())]
-                .iter()
-                .cloned()
-                .collect(),
-        );
+        let tp = test_process(&test_id);
 
-        let _guard = RegistryGuard::new(&USER_PATH);
-        let environment = CURRENT_USER.create("Environment").unwrap();
+        let environment = tp.process.registry_environment_key().unwrap();
         environment
             .set_bytes("PATH", Type::Bytes, &[0x12, 0x34])
             .unwrap();
@@ -935,11 +1021,15 @@ mod tests {
     #[test]
     fn windows_treat_missing_path_as_empty() {
         // during install the PATH key may be missing; treat it as empty
-        let _guard = RegistryGuard::new(&USER_PATH);
-        let environment = CURRENT_USER.create("Environment").unwrap();
-        environment.remove_value("PATH").unwrap();
+        let test_id = test_id();
+        let tp = test_process(&test_id);
+        let environment = tp.process.registry_environment_key().unwrap();
+        clear_path(&environment);
 
-        assert_eq!(Some(HSTRING::new()), get_windows_path_var().unwrap());
+        assert_eq!(
+            Some(HSTRING::new()),
+            get_windows_path_var(&tp.process).unwrap()
+        );
     }
 
     #[test]

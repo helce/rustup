@@ -6,7 +6,7 @@
 //!
 //! `MaybeOfficialToolchainName` represents a toolchain passed to rustup-init:
 //! 'none' to select no toolchain to install, and otherwise a partial toolchain
-//! description - channel and optional triple and optional date.
+//! description - channel and optional target tuple and optional date.
 //!
 //! `ResolvableToolchainName` represents a toolchain name from a user. Either a
 //! partial toolchain description or a single path component that is not 'none'.
@@ -15,7 +15,7 @@
 //! for both custom and official names.
 //!
 //! `ToolchainName` is the result of resolving `ResolvableToolchainName` with a
-//! host triple, or parsing an installed toolchain name directly.
+//! host tuple, or parsing an installed toolchain name directly.
 //!
 //! `ResolvableLocalToolchainName` represents the values permittable in
 //! `RUSTUP_TOOLCHAIN`: resolved or not resolved official names, custom names,
@@ -50,7 +50,7 @@ use std::{
 
 use thiserror::Error;
 
-use crate::dist::{PartialToolchainDesc, TargetTriple, ToolchainDesc};
+use crate::dist::{PartialToolchainDesc, TargetTuple, ToolchainDesc};
 
 /// Errors related to toolchains
 #[derive(Error, Debug)]
@@ -71,65 +71,6 @@ pub enum InvalidName {
     PlusPrefix(String),
 }
 
-macro_rules! from_variant {
-    ($from:ident, $to:ident, $variant:expr) => {
-        impl From<$from> for $to {
-            fn from(value: $from) -> Self {
-                $variant(value)
-            }
-        }
-        impl From<&$from> for $to {
-            fn from(value: &$from) -> Self {
-                $variant(value.to_owned())
-            }
-        }
-    };
-}
-
-macro_rules! try_from_str {
-    ($to:ident) => {
-        try_from_str!(&str, $to);
-        try_from_str!(&String, $to);
-        impl TryFrom<String> for $to {
-            type Error = InvalidName;
-
-            fn try_from(value: String) -> std::result::Result<Self, Self::Error> {
-                $to::validate(&value)
-            }
-        }
-
-        impl FromStr for $to {
-            type Err = InvalidName;
-
-            fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
-                $to::validate(value)
-            }
-        }
-    };
-    ($from:ty, $to:ident) => {
-        impl TryFrom<$from> for $to {
-            type Error = InvalidName;
-
-            fn try_from(value: $from) -> std::result::Result<Self, Self::Error> {
-                $to::validate(value)
-            }
-        }
-    };
-}
-
-/// Common validate rules for all sorts of toolchain names
-fn validate(candidate: &str) -> Result<&str, InvalidName> {
-    if let Some(without_plus) = candidate.strip_prefix('+') {
-        return Err(InvalidName::PlusPrefix(without_plus.to_string()));
-    }
-    let normalized_name = candidate.trim_end_matches('/');
-    if normalized_name.is_empty() {
-        Err(InvalidName::ToolchainName(candidate.into()))
-    } else {
-        Ok(normalized_name)
-    }
-}
-
 /// A toolchain name from user input.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum ResolvableToolchainName {
@@ -139,44 +80,43 @@ pub(crate) enum ResolvableToolchainName {
 
 impl ResolvableToolchainName {
     /// Resolve to a concrete toolchain name
-    pub fn resolve(&self, host: &TargetTriple) -> Result<ToolchainName, anyhow::Error> {
-        match self.clone() {
-            ResolvableToolchainName::Custom(c) => Ok(ToolchainName::Custom(c)),
-            ResolvableToolchainName::Official(desc) => {
-                let resolved = desc.resolve(host)?;
-                Ok(ToolchainName::Official(resolved))
-            }
-        }
-    }
-
-    // If candidate could be resolved, return a ready to resolve version of it.
-    // Otherwise error.
-    fn validate(candidate: &str) -> Result<ResolvableToolchainName, InvalidName> {
-        let candidate = validate(candidate)?;
-        candidate
-            .parse::<PartialToolchainDesc>()
-            .map(ResolvableToolchainName::Official)
-            .or_else(|_| {
-                CustomToolchainName::try_from(candidate)
-                    .map(ResolvableToolchainName::Custom)
-                    .map_err(|_| InvalidName::ToolchainName(candidate.into()))
-            })
+    pub fn resolve(self, host: &TargetTuple) -> Result<ToolchainName, anyhow::Error> {
+        Ok(match self {
+            Self::Custom(c) => ToolchainName::Custom(c),
+            Self::Official(desc) => ToolchainName::Official(desc.resolve(host)?),
+        })
     }
 }
 
-try_from_str!(ResolvableToolchainName);
+impl FromStr for ResolvableToolchainName {
+    type Err = InvalidName;
+
+    // If value could be resolved, return a ready to resolve version of it.
+    // Otherwise error.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let candidate = normalize_name(value)?;
+        if let Ok(desc) = PartialToolchainDesc::from_str(candidate) {
+            return Ok(Self::Official(desc));
+        }
+
+        match CustomToolchainName::from_str(candidate) {
+            Ok(custom) => Ok(Self::Custom(custom)),
+            Err(_) => Err(InvalidName::ToolchainName(candidate.into())),
+        }
+    }
+}
 
 impl From<&PartialToolchainDesc> for ResolvableToolchainName {
     fn from(value: &PartialToolchainDesc) -> Self {
-        ResolvableToolchainName::Official(value.to_owned())
+        Self::Official(value.to_owned())
     }
 }
 
 impl Display for ResolvableToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolvableToolchainName::Custom(c) => write!(f, "{c}"),
-            ResolvableToolchainName::Official(o) => write!(f, "{o}"),
+            Self::Custom(c) => write!(f, "{c}"),
+            Self::Official(o) => write!(f, "{o}"),
         }
     }
 }
@@ -190,28 +130,24 @@ pub(crate) enum MaybeResolvableToolchainName {
     None,
 }
 
-impl MaybeResolvableToolchainName {
-    // If candidate could be resolved, return a ready to resolve version of it.
+impl FromStr for MaybeResolvableToolchainName {
+    type Err = InvalidName;
+
+    // If value could be resolved, return a ready to resolve version of it.
     // Otherwise error.
-    fn validate(candidate: &str) -> Result<MaybeResolvableToolchainName, InvalidName> {
-        let candidate = validate(candidate)?;
-        if candidate == "none" {
-            Ok(MaybeResolvableToolchainName::None)
-        } else {
-            Ok(MaybeResolvableToolchainName::Some(
-                ResolvableToolchainName::validate(candidate)?,
-            ))
-        }
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match normalize_name(value)? {
+            "none" => Self::None,
+            candidate => Self::Some(ResolvableToolchainName::from_str(candidate)?),
+        })
     }
 }
-
-try_from_str!(MaybeResolvableToolchainName);
 
 impl Display for MaybeResolvableToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MaybeResolvableToolchainName::Some(t) => write!(f, "{t}"),
-            MaybeResolvableToolchainName::None => write!(f, "none"),
+            Self::Some(t) => write!(f, "{t}"),
+            Self::None => write!(f, "none"),
         }
     }
 }
@@ -224,28 +160,25 @@ pub(crate) enum MaybeOfficialToolchainName {
     Some(PartialToolchainDesc),
 }
 
-impl MaybeOfficialToolchainName {
-    fn validate(candidate: &str) -> Result<MaybeOfficialToolchainName, InvalidName> {
-        let candidate = validate(candidate)?;
-        if candidate == "none" {
-            Ok(MaybeOfficialToolchainName::None)
-        } else {
-            Ok(MaybeOfficialToolchainName::Some(
-                validate(candidate)?
-                    .parse::<PartialToolchainDesc>()
+impl FromStr for MaybeOfficialToolchainName {
+    type Err = InvalidName;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(match normalize_name(value)? {
+            "none" => Self::None,
+            candidate => Self::Some(
+                PartialToolchainDesc::from_str(candidate)
                     .map_err(|_| InvalidName::OfficialName(candidate.into()))?,
-            ))
-        }
+            ),
+        })
     }
 }
-
-try_from_str!(MaybeOfficialToolchainName);
 
 impl Display for MaybeOfficialToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MaybeOfficialToolchainName::None => write!(f, "none"),
-            MaybeOfficialToolchainName::Some(t) => write!(f, "{t}"),
+            Self::None => write!(f, "none"),
+            Self::Some(t) => write!(f, "{t}"),
         }
     }
 }
@@ -259,28 +192,40 @@ pub enum ToolchainName {
     Custom(CustomToolchainName),
 }
 
-impl ToolchainName {
-    /// If the string is already resolved, allow direct conversion
-    fn validate(candidate: &str) -> Result<Self, InvalidName> {
-        let candidate = validate(candidate)?;
-        candidate
-            .parse::<ToolchainDesc>()
-            .map(ToolchainName::Official)
-            .or_else(|_| CustomToolchainName::try_from(candidate).map(ToolchainName::Custom))
-            .map_err(|_| InvalidName::ToolchainName(candidate.into()))
+impl From<ToolchainDesc> for ToolchainName {
+    fn from(value: ToolchainDesc) -> Self {
+        Self::Official(value)
     }
 }
 
-from_variant!(ToolchainDesc, ToolchainName, ToolchainName::Official);
-from_variant!(CustomToolchainName, ToolchainName, ToolchainName::Custom);
+impl From<CustomToolchainName> for ToolchainName {
+    fn from(value: CustomToolchainName) -> Self {
+        Self::Custom(value)
+    }
+}
 
-try_from_str!(ToolchainName);
+impl FromStr for ToolchainName {
+    type Err = InvalidName;
+
+    /// If the string is already resolved, allow direct conversion
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let candidate = normalize_name(value)?;
+        if let Ok(desc) = ToolchainDesc::from_str(candidate) {
+            return Ok(Self::Official(desc));
+        }
+
+        match CustomToolchainName::from_str(candidate) {
+            Ok(custom) => Ok(Self::Custom(custom)),
+            Err(_) => Err(InvalidName::ToolchainName(candidate.into())),
+        }
+    }
+}
 
 impl Display for ToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ToolchainName::Custom(t) => write!(f, "{t}"),
-            ToolchainName::Official(t) => write!(f, "{t}"),
+            Self::Custom(t) => write!(f, "{t}"),
+            Self::Official(t) => write!(f, "{t}"),
         }
     }
 }
@@ -296,34 +241,35 @@ pub(crate) enum ResolvableLocalToolchainName {
 
 impl ResolvableLocalToolchainName {
     /// Resolve to a concrete toolchain name
-    pub fn resolve(&self, host: &TargetTriple) -> Result<LocalToolchainName, anyhow::Error> {
+    pub fn resolve(&self, host: &TargetTuple) -> Result<LocalToolchainName, anyhow::Error> {
         match self.clone() {
-            ResolvableLocalToolchainName::Named(t) => {
-                Ok(LocalToolchainName::Named(t.resolve(host)?))
-            }
-            ResolvableLocalToolchainName::Path(t) => Ok(LocalToolchainName::Path(t)),
+            Self::Named(t) => Ok(LocalToolchainName::Named(t.resolve(host)?)),
+            Self::Path(t) => Ok(LocalToolchainName::Path(t)),
         }
-    }
-
-    /// Validates if the string is a resolvable toolchain, or a path based toolchain.
-    fn validate(candidate: &str) -> Result<Self, InvalidName> {
-        let candidate = validate(candidate)?;
-        ResolvableToolchainName::try_from(candidate)
-            .map(ResolvableLocalToolchainName::Named)
-            .or_else(|_| {
-                PathBasedToolchainName::try_from(&PathBuf::from(candidate) as &Path)
-                    .map(ResolvableLocalToolchainName::Path)
-            })
     }
 }
 
-try_from_str!(ResolvableLocalToolchainName);
+impl FromStr for ResolvableLocalToolchainName {
+    type Err = InvalidName;
+
+    /// Parses a resolvable toolchain, or a path based toolchain.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let candidate = normalize_name(value)?;
+        if let Ok(name) = ResolvableToolchainName::from_str(candidate) {
+            return Ok(Self::Named(name));
+        }
+
+        Ok(Self::Path(PathBasedToolchainName::try_from(
+            &PathBuf::from(candidate) as &Path,
+        )?))
+    }
+}
 
 impl Display for ResolvableLocalToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ResolvableLocalToolchainName::Named(t) => write!(f, "{t}"),
-            ResolvableLocalToolchainName::Path(t) => write!(f, "{t}"),
+            Self::Named(t) => write!(f, "{t}"),
+            Self::Path(t) => write!(f, "{t}"),
         }
     }
 }
@@ -339,15 +285,21 @@ pub(crate) enum LocalToolchainName {
     Path(PathBasedToolchainName),
 }
 
-impl From<&ToolchainDesc> for LocalToolchainName {
-    fn from(value: &ToolchainDesc) -> Self {
-        ToolchainName::Official(value.to_owned()).into()
+impl From<ToolchainName> for LocalToolchainName {
+    fn from(value: ToolchainName) -> Self {
+        Self::Named(value)
     }
 }
 
-impl From<&CustomToolchainName> for LocalToolchainName {
-    fn from(value: &CustomToolchainName) -> Self {
-        ToolchainName::Custom(value.to_owned()).into()
+impl From<PathBasedToolchainName> for LocalToolchainName {
+    fn from(value: PathBasedToolchainName) -> Self {
+        Self::Path(value)
+    }
+}
+
+impl From<ToolchainDesc> for LocalToolchainName {
+    fn from(value: ToolchainDesc) -> Self {
+        ToolchainName::Official(value).into()
     }
 }
 
@@ -357,17 +309,10 @@ impl From<CustomToolchainName> for LocalToolchainName {
     }
 }
 
-from_variant!(ToolchainName, LocalToolchainName, LocalToolchainName::Named);
-from_variant!(
-    PathBasedToolchainName,
-    LocalToolchainName,
-    LocalToolchainName::Path
-);
-
 impl PartialEq<ToolchainName> for LocalToolchainName {
     fn eq(&self, other: &ToolchainName) -> bool {
         match self {
-            LocalToolchainName::Named(n) => n == other,
+            Self::Named(n) => n == other,
             _ => false,
         }
     }
@@ -376,8 +321,8 @@ impl PartialEq<ToolchainName> for LocalToolchainName {
 impl Display for LocalToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LocalToolchainName::Named(t) => write!(f, "{t}"),
-            LocalToolchainName::Path(t) => write!(f, "{t}"),
+            Self::Named(t) => write!(f, "{t}"),
+            Self::Path(t) => write!(f, "{t}"),
         }
     }
 }
@@ -387,21 +332,6 @@ impl Display for LocalToolchainName {
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct CustomToolchainName(String);
 
-impl CustomToolchainName {
-    fn validate(candidate: &str) -> Result<CustomToolchainName, InvalidName> {
-        let candidate = validate(candidate)?;
-        if candidate.parse::<PartialToolchainDesc>().is_ok()
-            || candidate == "none"
-            || candidate.contains('/')
-            || candidate.contains('\\')
-        {
-            Err(InvalidName::CustomName(candidate.into()))
-        } else {
-            Ok(CustomToolchainName(candidate.into()))
-        }
-    }
-}
-
 impl Deref for CustomToolchainName {
     type Target = str;
 
@@ -410,7 +340,22 @@ impl Deref for CustomToolchainName {
     }
 }
 
-try_from_str!(CustomToolchainName);
+impl FromStr for CustomToolchainName {
+    type Err = InvalidName;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let candidate = normalize_name(value)?;
+        if candidate.parse::<PartialToolchainDesc>().is_ok()
+            || candidate == "none"
+            || candidate.contains('/')
+            || candidate.contains('\\')
+        {
+            Err(InvalidName::CustomName(candidate.into()))
+        } else {
+            Ok(Self(candidate.into()))
+        }
+    }
+}
 
 impl Display for CustomToolchainName {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -448,7 +393,7 @@ impl TryFrom<&Path> for PathBasedToolchainName {
             } else if !value.join("bin").is_dir() {
                 Err(InvalidName::ToolchainPath(as_str))
             } else {
-                Ok(PathBasedToolchainName(value.into(), as_str))
+                Ok(Self(value.into(), as_str))
             }
         }
     }
@@ -473,6 +418,23 @@ impl Deref for PathBasedToolchainName {
     }
 }
 
+/// Normalization shared by all sorts of toolchain names.
+///
+/// Strips the trailing slashes a shell may have completed onto a toolchain
+/// directory, and rejects the `+toolchain` argument form along with names that
+/// are empty once normalized.
+fn normalize_name(candidate: &str) -> Result<&str, InvalidName> {
+    if let Some(without_plus) = candidate.strip_prefix('+') {
+        return Err(InvalidName::PlusPrefix(without_plus.to_string()));
+    }
+    let normalized_name = candidate.trim_end_matches('/');
+    if normalized_name.is_empty() {
+        Err(InvalidName::ToolchainName(candidate.into()))
+    } else {
+        Ok(normalized_name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
@@ -482,24 +444,24 @@ mod tests {
     use crate::{
         dist::{
             PartialToolchainDesc,
-            triple::known::{LIST_ARCHS, LIST_ENVS, LIST_OSES},
+            target_tuple::known::{LIST_ARCHS, LIST_ENVS, LIST_OSES},
         },
         toolchain::names::{CustomToolchainName, ResolvableToolchainName, ToolchainName},
     };
 
-    fn partial_toolchain_desc_re() -> String {
-        let triple_re = format!(
+    fn partial_toolchain_desc_regex() -> String {
+        let tuple_regex = format!(
             r"(-({}))?(?:-({}))?(?:-({}))?",
             LIST_ARCHS.join("|"),
             LIST_OSES.join("|"),
             LIST_ENVS.join("|")
         );
-        r"(nightly|beta|stable|[0-9]{1}(\.(0|[1-9][0-9]{0,2}))(\.(0|[1-9][0-9]{0,1}))?(-beta(\.(0|[1-9][1-9]{0,1}))?)?)(-([0-9]{4}-[0-9]{2}-[0-9]{2}))?".to_owned() + &triple_re
+        r"(nightly|beta|stable|[0-9]{1}(\.(0|[1-9][0-9]{0,2}))(\.(0|[1-9][0-9]{0,1}))?(-beta(\.(0|[1-9][1-9]{0,1}))?)?)(-([0-9]{4}-[0-9]{2}-[0-9]{2}))?".to_owned() + &tuple_regex
     }
 
     prop_compose! {
         fn arb_partial_toolchain_desc()
-            (s in string_regex(&partial_toolchain_desc_re()).unwrap()) -> String {
+            (s in string_regex(&partial_toolchain_desc_regex()).unwrap()) -> String {
             s
         }
     }
@@ -541,12 +503,12 @@ mod tests {
 
         #[test]
         fn test_parse_custom(name in arb_custom_name()) {
-            CustomToolchainName::try_from(name).unwrap();
+            CustomToolchainName::from_str(&name).unwrap();
         }
 
         #[test]
         fn test_parse_resolvable_name(name in arb_resolvable_name()) {
-            ResolvableToolchainName::try_from(name).unwrap();
+            ResolvableToolchainName::from_str(&name).unwrap();
         }
 
         // TODO: This needs some thought
@@ -583,7 +545,7 @@ mod tests {
             "this.is.not-a+semver",
         ]
         .into_iter()
-        .map(|s| ToolchainName::try_from(s).unwrap())
+        .map(|s| ToolchainName::from_str(s).unwrap())
         .collect::<Vec<_>>();
 
         let mut v = vec![
@@ -608,7 +570,7 @@ mod tests {
             "the cake is a lie",
         ]
         .into_iter()
-        .map(|s| ToolchainName::try_from(s).unwrap())
+        .map(|s| ToolchainName::from_str(s).unwrap())
         .collect::<Vec<_>>();
 
         v.sort();

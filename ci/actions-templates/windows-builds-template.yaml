@@ -6,9 +6,9 @@ jobs: # skip-main skip-pr skip-stable
   build-windows-main: # job-name skip-pr skip-stable
   build-windows-stable: # job-name skip-main skip-pr
     runs-on: ${{ matrix.os || 'windows-latest' }}
-    if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }} # skip-main skip-stable
-    if: ${{ (github.event_name == 'push' && github.ref_name == 'main') }} # skip-pr skip-stable
-    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || github.event_name == 'schedule' }} # skip-pr skip-main
+    if: ${{ contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }} # skip-main skip-stable
+    if: ${{ github.event_name == 'push' && (github.ref_name == 'main' || startsWith(github.ref_name, 'release/')) }} # skip-pr skip-stable
+    if: ${{ github.event_name == 'push' && github.ref_name == 'stable' || contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name) }} # skip-pr skip-main
     env:
       RUSTFLAGS: -Ctarget-feature=+crt-static
       RUST_MIN_STACK: 16777216
@@ -27,6 +27,7 @@ jobs: # skip-main skip-pr skip-stable
           - aarch64-pc-windows-msvc
           - x86_64-pc-windows-gnu
           - i686-pc-windows-gnu # skip-pr skip-main
+          - aarch64-pc-windows-gnullvm
         include:
           - target: x86_64-pc-windows-msvc
             run_tests: YES
@@ -39,12 +40,17 @@ jobs: # skip-main skip-pr skip-stable
             rustup_arch: aarch64
             os: windows-11-arm
             run_tests: YES
+          - target: aarch64-pc-windows-gnullvm
+            rustup_arch: aarch64
+            os: windows-11-arm
+            llvm_mingw_version: 20260616
+            gcc: aarch64-w64-mingw32-clang
           - target: i686-pc-windows-gnu # skip-pr skip-main
             arch: i686 # skip-pr skip-main
             mingwdir: mingw32 # skip-pr skip-main
             gcc: i686-w64-mingw32-gcc # skip-pr skip-main
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # v2 defaults to a shallow checkout, but we need at least to the previous tag
         with:
           fetch-depth: 0
@@ -64,15 +70,36 @@ jobs: # skip-main skip-pr skip-stable
         # Building `aws-lc-rs` for Windows MSVC depends on `NASM`.
         # See: https://aws.github.io/aws-lc-rs/requirements/windows.html
         uses: ilammy/setup-nasm@v1
-        if: matrix.mingwdir == ''
+        if: contains(matrix.target, 'msvc')
       - name: Install mingw
-        uses: bwoodsend/setup-winlibs-action@v1
+        uses: bwoodsend/setup-winlibs-action@v1.16
         if: matrix.mingwdir != ''
         with:
           architecture: ${{ matrix.arch }}
+      - name: Install llvm-mingw
+        shell: powershell
+        if: matrix.llvm_mingw_version != ''
+        run: |
+          $version = "${{ matrix.llvm_mingw_version }}"
+          $archive = "llvm-mingw-$version-ucrt-${{ matrix.rustup_arch }}.zip"
+          $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$version/$archive"
+          $destination = Join-Path $env:RUNNER_TEMP $archive
+          $installDir = Join-Path $env:RUNNER_TEMP "llvm-mingw-$version-ucrt-${{ matrix.rustup_arch }}"
+
+          Write-Host "Downloading $archive with aria2c"
+          & aria2c --max-connection-per-server=8 --split=8 --dir="$env:RUNNER_TEMP" --out="$archive" "$url"
+
+          Write-Host "Extracting $archive with 7-Zip"
+          & 7z x "$destination" "-o$env:RUNNER_TEMP" -y
+
+          $targetEnvUpper = "${{ matrix.target }}".Replace('-', '_').ToUpperInvariant()
+
+          "$installDir\bin" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+          "CC_${targetEnvUpper}=${{ matrix.gcc }}" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "CARGO_TARGET_${targetEnvUpper}_LINKER=${{ matrix.gcc }}" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
       - name: Verify mingw gcc installation
         shell: powershell
-        if: matrix.mingwdir != ''
+        if: matrix.gcc != ''
         run: |
           Get-Command ${{ matrix.gcc }}
           ${{ matrix.gcc }} --version
@@ -86,7 +113,7 @@ jobs: # skip-main skip-pr skip-stable
           echo "SKIP_TESTS=yes" >> $GITHUB_ENV
         shell: bash
       - name: Cache cargo registry and git trees
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -98,7 +125,7 @@ jobs: # skip-main skip-pr skip-stable
           echo "{rust_hash}={$(rustc -Vv | grep commit-hash | awk '{print $2}')}" >> $GITHUB_OUTPUT
         shell: bash
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ github.base_ref }}-${{ github.head_ref }}-${{ matrix.target }}-${{ matrix.mode }}-cargo-target-dir-${{ steps.cargo-target-cache.outputs.rust_hash }}-${{ hashFiles('**/Cargo.lock') }}
@@ -166,13 +193,13 @@ jobs: # skip-main skip-pr skip-stable
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
       - name: Configure AWS credentials
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
           aws-region: us-east-1
       - name: Deploy build to rustup-builds bucket for release team
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         run: |
           aws --debug s3 cp --recursive dist s3://rustup-builds/${{ github.sha }}/dist
         env:

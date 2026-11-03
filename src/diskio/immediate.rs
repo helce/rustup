@@ -14,27 +14,19 @@ use std::{
 use super::{CompletedIo, Executor, FileBuffer, Item};
 
 #[derive(Debug)]
-pub(crate) struct _IncrementalFileState {
+pub(crate) struct FileState {
     completed_chunks: Vec<usize>,
     err: Option<io::Result<()>>,
     item: Option<Item>,
     finished: bool,
 }
 
-pub(super) type IncrementalFileState = Arc<Mutex<Option<_IncrementalFileState>>>;
-
 #[derive(Default, Debug)]
-pub(crate) struct ImmediateUnpacker {
-    incremental_state: IncrementalFileState,
+pub(super) struct ImmediateUnpacker {
+    incremental_state: Arc<Mutex<Option<FileState>>>,
 }
 
 impl ImmediateUnpacker {
-    pub(crate) fn new() -> Self {
-        Self {
-            ..Default::default()
-        }
-    }
-
     fn deque(&self) -> Box<dyn Iterator<Item = CompletedIo>> {
         let mut guard = self.incremental_state.lock().unwrap();
         // incremental file in progress
@@ -118,7 +110,7 @@ impl Executor for ImmediateUnpacker {
         if state.is_some() {
             unreachable!();
         } else {
-            *state = Some(_IncrementalFileState {
+            *state = Some(FileState {
                 completed_chunks: vec![],
                 err: None,
                 item: None,
@@ -145,17 +137,17 @@ impl Executor for ImmediateUnpacker {
 /// The non-shared state for writing a file incrementally
 #[derive(Debug)]
 pub(super) struct IncrementalFileWriter {
-    state: IncrementalFileState,
+    state: Arc<Mutex<Option<FileState>>>,
     file: Option<File>,
     path_display: String,
 }
 
 impl IncrementalFileWriter {
     #[allow(unused_variables)]
-    pub(crate) fn new<P: AsRef<Path>>(
+    pub(super) fn new<P: AsRef<Path>>(
         path: P,
         mode: u32,
-        state: IncrementalFileState,
+        state: Arc<Mutex<Option<FileState>>>,
     ) -> Result<Self, io::Error> {
         let mut opts = OpenOptions::new();
         #[cfg(unix)]
@@ -169,14 +161,14 @@ impl IncrementalFileWriter {
             trace_scoped!("creat", "name": path_display);
             opts.write(true).create(true).truncate(true).open(path)?
         });
-        Ok(IncrementalFileWriter {
+        Ok(Self {
             state,
             file,
             path_display,
         })
     }
 
-    pub(crate) fn chunk_submit(&mut self, chunk: FileBuffer) -> bool {
+    pub(super) fn chunk_submit(&mut self, chunk: FileBuffer) -> bool {
         if (self.state.lock().unwrap()).is_none() {
             return false;
         }

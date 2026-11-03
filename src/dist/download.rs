@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::config::Cfg;
-use crate::dist::manifest::Manifest;
+use crate::dist::manifest::{Manifest, ManifestWithHash};
 use crate::dist::{Channel, DEFAULT_DIST_SERVER, ToolchainDesc, temp};
 use crate::download::{download_file, download_file_with_resume, is_network_failure};
 use crate::errors::RustupError;
@@ -102,7 +102,7 @@ impl<'a> DownloadCfg<'a> {
             };
         };
 
-        let actual_hash = format!("{:x}", hasher.finalize());
+        let actual_hash = faster_hex::hex_string(&hasher.finalize());
 
         if hash != actual_hash {
             // Incorrect hash
@@ -153,7 +153,7 @@ impl<'a> DownloadCfg<'a> {
         update_hash: Option<&Path>,
         toolchain: &ToolchainDesc,
         cfg: &Cfg<'_>,
-    ) -> Result<Option<(Manifest, String)>> {
+    ) -> Result<Option<ManifestWithHash>> {
         let manifest_url = toolchain.manifest_v2_url(&cfg.dist_root_url, self.process);
         match self
             .download_and_check(&manifest_url, update_hash, None, ".toml")
@@ -161,7 +161,7 @@ impl<'a> DownloadCfg<'a> {
         {
             Ok(manifest_dl) => {
                 // Downloaded ok!
-                let Some((manifest_file, manifest_hash)) = manifest_dl else {
+                let Some((manifest_file, hash)) = manifest_dl else {
                     return Ok(None);
                 };
                 let manifest_str = utils::read_file("manifest", &manifest_file)?;
@@ -171,7 +171,7 @@ impl<'a> DownloadCfg<'a> {
                         path: manifest_file.to_path_buf(),
                     })?;
 
-                Ok(Some((manifest, manifest_hash)))
+                Ok(Some(ManifestWithHash { manifest, hash }))
             }
             Err(any) => {
                 if let Some(err @ RustupError::ChecksumFailed { .. }) =
@@ -268,7 +268,7 @@ impl<'a> DownloadCfg<'a> {
 
         let mut hasher = Sha256::new();
         download_file(&url, &file, Some(&mut hasher), status, self.process).await?;
-        let actual_hash = format!("{:x}", hasher.finalize());
+        let actual_hash = faster_hex::hex_string(&hasher.finalize());
 
         if hash != actual_hash {
             // Incorrect hash
@@ -285,21 +285,26 @@ impl<'a> DownloadCfg<'a> {
         Ok(Some((file, partial_hash)))
     }
 
-    pub(crate) fn status_for(&self, component: impl Into<Cow<'static, str>>) -> DownloadStatus {
+    pub(crate) fn status_for(
+        &self,
+        component_name: impl Into<Cow<'static, str>>,
+        name_width: usize,
+    ) -> DownloadStatus {
         let progress = ProgressBar::hidden();
         progress.set_style(
-            ProgressStyle::with_template(
-                "{msg:>13.bold} downloading [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
+            DownloadStatus::progress_style(
+                name_width,
+                "downloading [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
             )
-            .unwrap()
             .progress_chars("## "),
         );
-        progress.set_message(component);
+        progress.set_prefix(component_name);
         self.tracker.multi_progress_bars.add(progress.clone());
 
         DownloadStatus {
             progress,
             retry_time: Mutex::new(None),
+            name_width,
         }
     }
 
@@ -327,7 +332,8 @@ impl DownloadTracker {
         } else {
             ProgressDrawTarget::hidden()
         });
-
+        // Help avoid flickering by moving the cursor instead of clearing the line.
+        multi_progress_bars.set_move_cursor(true);
         Self {
             multi_progress_bars,
         }
@@ -343,6 +349,8 @@ pub(crate) struct DownloadStatus {
     /// bar would reappear immediately, not allowing the user to correctly see the message,
     /// before the progress bar starts again.
     retry_time: Mutex<Option<Instant>>,
+    /// The dynamic maximum width of the component names for alignment
+    name_width: usize,
 }
 
 impl DownloadStatus {
@@ -360,43 +368,45 @@ impl DownloadStatus {
 
         *retry_time = None;
         self.progress.set_style(
-            ProgressStyle::with_template(
-                "{msg:>13.bold} downloading [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
+            Self::progress_style(
+                self.name_width,
+                "downloading [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
             )
-            .unwrap()
             .progress_chars("## "),
         );
     }
 
     pub(crate) fn finished(&self) {
-        self.progress.set_style(
-            ProgressStyle::with_template("{msg:>13.bold} pending installation {total_bytes:>20}")
-                .unwrap(),
-        );
+        self.progress.set_style(Self::progress_style(
+            self.name_width,
+            "pending installation {total_bytes:>20}",
+        ));
         self.progress.tick(); // A tick is needed for the new style to appear, as it is static.
     }
 
     pub(crate) fn failed(&self) {
-        self.progress.set_style(
-            ProgressStyle::with_template("{msg:>13.bold} download failed after {elapsed}").unwrap(),
-        );
+        self.progress.set_style(Self::progress_style(
+            self.name_width,
+            "download failed after {elapsed}",
+        ));
         self.progress.finish();
     }
 
     pub(crate) fn retrying(&self) {
         *self.retry_time.lock().unwrap() = Some(Instant::now());
-        self.progress.set_style(
-            ProgressStyle::with_template("{msg:>13.bold} retrying download...").unwrap(),
-        );
+        self.progress.set_style(Self::progress_style(
+            self.name_width,
+            "retrying download...",
+        ));
     }
 
     pub(crate) fn unpack<T: Read>(&self, inner: T) -> ProgressBarIter<T> {
         self.progress.reset();
         self.progress.set_style(
-            ProgressStyle::with_template(
-                "{msg:>13.bold} unpacking   [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
+            Self::progress_style(
+                self.name_width,
+                "unpacking   [{bar:15}] {total_bytes:>11} ({bytes_per_sec}, ETA: {eta})",
             )
-            .unwrap()
             .progress_chars("## "),
         );
         self.progress.wrap_read(inner)
@@ -404,20 +414,27 @@ impl DownloadStatus {
 
     pub(crate) fn installing(&self) {
         self.progress.set_style(
-            ProgressStyle::with_template(
-                "{msg:>13.bold} installing {spinner:.green} {total_bytes:>28}",
+            Self::progress_style(
+                self.name_width,
+                "installing {spinner:.green} {total_bytes:>28}",
             )
-            .unwrap()
             .tick_chars(r"|/-\ "),
         );
         self.progress.enable_steady_tick(Duration::from_millis(100));
     }
 
     pub(crate) fn installed(&self) {
-        self.progress.set_style(
-            ProgressStyle::with_template("{msg:>13.bold} installed {total_bytes:>31}").unwrap(),
-        );
+        self.progress.set_message("installed");
+        self.progress.set_style(Self::progress_style(
+            self.name_width,
+            "{msg:.green.bold} {total_bytes:>31}",
+        ));
         self.progress.finish();
+    }
+
+    fn progress_style(name_width: usize, suffix: &str) -> ProgressStyle {
+        let template = format!("{{prefix:>{name_width}.bold}} {suffix}");
+        ProgressStyle::with_template(&template).unwrap()
     }
 }
 
@@ -432,7 +449,7 @@ fn file_hash(path: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(faster_hex::hex_string(&hasher.finalize()))
 }
 
 pub(crate) struct File {

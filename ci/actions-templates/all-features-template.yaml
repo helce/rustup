@@ -9,7 +9,7 @@ jobs: # skip-all
   # templating and so on.
   build-all-features: # job-name
     runs-on: ${{ matrix.os }}
-    if: ${{ contains('["pull_request", "merge_group"]', github.event_name) }}
+    if: ${{ contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }}
     strategy:
       fail-fast: false
       matrix:
@@ -21,14 +21,9 @@ jobs: # skip-all
             target: x86_64-pc-windows-msvc
     steps:
       - name: Clone repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Install rustup stable
         run: rustup toolchain install stable --profile minimal
-      - name: Install Protoc
-        uses: arduino/setup-protoc@v1
-        with:
-          version: "3.x"
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install OpenSSL
         if: ${{ contains(matrix.os, 'windows') }}
         run: |

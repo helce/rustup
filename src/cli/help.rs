@@ -99,7 +99,7 @@ pub(crate) fn toolchain_help() -> String {
     {PLACEHOLDER}<versioned>     = <major.minor>|<major.minor.patch>{PLACEHOLDER:#}
     {PLACEHOLDER}<prerelease>    = beta[.<number>]{PLACEHOLDER:#}
     {PLACEHOLDER}<date>          = YYYY-MM-DD{PLACEHOLDER:#}
-    {PLACEHOLDER}<host>          = <target-triple>{PLACEHOLDER:#}
+    {PLACEHOLDER}<host>          = <target-tuple>{PLACEHOLDER:#}
 
   'channel' is a named release channel, a major and minor version
   number such as `1.42`, or a fully specified version number, such
@@ -212,7 +212,7 @@ pub(crate) fn run_help() -> String {
 
     {LITERAL}$ cargo +nightly build{LITERAL:#}
 
-    {LITERAL}$ rustup run nightly cargo build{LITERAL:#}"
+    {LITERAL}$ rustup run --install nightly cargo build{LITERAL:#}"
     )
 }
 
@@ -232,7 +232,11 @@ pub(crate) fn doc_help() -> String {
   the default browser.
 
   By default, it opens the documentation index. Use the various
-  flags to open specific pieces of documentation."
+  flags to open specific pieces of documentation.
+
+  If your browser is sandboxed (e.g. installed via Snap or Flatpak) it
+  may be unable to open `file://` URLs under `~/.rustup`. Pass `--serve`
+  to serve the documentation over a local HTTP server instead."
     )
 }
 

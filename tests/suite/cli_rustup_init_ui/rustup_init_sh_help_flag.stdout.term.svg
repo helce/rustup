@@ -16,7 +16,7 @@
   <rect width="100%" height="100%" y="0" rx="4.5" class="bg" />
 
   <text xml:space="preserve" class="container fg">
-    <tspan x="10px" y="28px"><tspan>rustup-init 1.29.0 (d243d7d4e 2026-03-04)</tspan>
+    <tspan x="10px" y="28px"><tspan>rustup-init 1.29.1 (3f5811cec 2026-08-12)</tspan>
 </tspan>
     <tspan x="10px" y="46px">
 </tspan>
@@ -38,13 +38,13 @@
 </tspan>
     <tspan x="10px" y="208px"><tspan>          Disable progress output, set log level to 'WARN' if 'RUSTUP_LOG' is unset</tspan>
 </tspan>
-    <tspan x="10px" y="226px"><tspan>  -y</tspan>
+    <tspan x="10px" y="226px"><tspan>  -y, --yes</tspan>
 </tspan>
     <tspan x="10px" y="244px"><tspan>          Disable confirmation prompt</tspan>
 </tspan>
     <tspan x="10px" y="262px"><tspan>      --default-host &lt;DEFAULT_HOST&gt;</tspan>
 </tspan>
-    <tspan x="10px" y="280px"><tspan>          Choose a default host triple</tspan>
+    <tspan x="10px" y="280px"><tspan>          Choose a default host tuple</tspan>
 </tspan>
     <tspan x="10px" y="298px"><tspan>      --default-toolchain &lt;DEFAULT_TOOLCHAIN&gt;</tspan>
 </tspan>

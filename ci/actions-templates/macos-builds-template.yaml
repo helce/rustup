@@ -21,7 +21,7 @@ jobs: # skip-x86_64 skip-aarch64
           - x86_64-apple-darwin # skip-aarch64
           - aarch64-apple-darwin # skip-x86_64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # v2 defaults to a shallow checkout, but we need at least to the previous tag
           fetch-depth: 0
@@ -46,7 +46,7 @@ jobs: # skip-x86_64 skip-aarch64
         run: |
           echo "SKIP_TESTS=yes" >> $GITHUB_ENV
       - name: Cache cargo registry and git trees
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -58,7 +58,7 @@ jobs: # skip-x86_64 skip-aarch64
           echo "{rust_hash}={$(rustc -Vv | grep commit-hash | awk '{print $2}')}" >> $GITHUB_OUTPUT
         shell: bash
       - name: Cache cargo build
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: target
           key: ${{ github.base_ref }}-${{ github.head_ref }}-${{ matrix.target }}-${{ matrix.mode }}-cargo-target-dir-${{ steps.cargo-target-cache.outputs.rust_hash }}-${{ hashFiles('**/Cargo.lock') }}
@@ -115,13 +115,13 @@ jobs: # skip-x86_64 skip-aarch64
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: us-west-1
       - name: Configure AWS credentials
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::890664054962:role/ci--rust-lang--rustup
           aws-region: us-east-1
       - name: Deploy build to rustup-builds bucket for release team
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.mode == 'release'
+        if: github.event_name == 'push' && matrix.mode == 'release' && (github.ref == 'refs/heads/stable' || github.ref == 'refs/heads/main')
         run: |
           aws --debug s3 cp --recursive deploy/ s3://rustup-builds/${{ github.sha }}
         env:

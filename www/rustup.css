@@ -58,7 +58,7 @@
     --platform-button-background-color: var(--gray);
     --platform-button-color: var(--white);
     --copy-button-text-color: var(--rustup-teal);
-    --rust-logo-filter: initital;
+    --rust-logo-filter: initial;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -214,11 +214,12 @@ hr {
 }
 
 div.copy-icon {
-    transform: translateX(3px);
+    transform: translateX(2px);
 }
 
 div.copy-icon svg {
     fill: var(--body-color);
+    display: block;
 }
 
 button.copy-button:hover svg {

@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use super::clitools::mock_bin;
-use super::{this_host_triple, topical_doc_data};
+use super::{this_host_tuple, topical_doc_data};
 
 // Mock of the on-disk structure of rust-installer installers
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
@@ -42,7 +42,7 @@ impl MockInstallerBuilder {
     pub(super) fn rustc(target: &str, version: &str, version_hash_: &str) -> Self {
         // For cross-host rustc's modify the version_hash so they can be identified from
         // test cases.
-        let this_host = this_host_triple();
+        let this_host = this_host_tuple();
         let version_hash = if this_host != target {
             format!("xxxx-{}", &version_hash_[5..])
         } else {
@@ -191,16 +191,16 @@ impl MockInstallerBuilder {
 }
 
 impl MockFile {
-    pub fn new<S: Into<String>>(path: S, contents: &[u8]) -> MockFile {
-        MockFile::_new(path.into(), Arc::new(contents.to_vec()))
+    pub fn new<S: Into<String>>(path: S, contents: &[u8]) -> Self {
+        Self::_new(path.into(), Arc::new(contents.to_vec()))
     }
 
-    pub fn new_arc<S: Into<String>>(path: S, contents: Arc<Vec<u8>>) -> MockFile {
-        MockFile::_new(path.into(), contents)
+    pub fn new_arc<S: Into<String>>(path: S, contents: Arc<Vec<u8>>) -> Self {
+        Self::_new(path.into(), contents)
     }
 
-    fn _new(path: String, contents: Arc<Vec<u8>>) -> MockFile {
-        MockFile {
+    fn _new(path: String, contents: Arc<Vec<u8>>) -> Self {
+        Self {
             path,
             contents: Contents::File(MockContents {
                 contents,
@@ -209,8 +209,8 @@ impl MockFile {
         }
     }
 
-    pub fn new_dir(path: &str, files: &[(&'static str, &'static [u8], bool)]) -> MockFile {
-        MockFile {
+    pub fn new_dir(path: &str, files: &[(&'static str, &'static [u8], bool)]) -> Self {
+        Self {
             path: path.to_string(),
             contents: Contents::Dir(
                 files

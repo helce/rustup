@@ -28,8 +28,11 @@ use crate::process;
 use crate::test as rustup_test;
 use crate::test::const_dist_dir;
 use crate::test::tempdir_in_with_prefix;
-use crate::test::this_host_triple;
+use crate::test::this_host_tuple;
 use crate::utils;
+
+#[cfg(windows)]
+use crate::{cli::self_update::RUSTUP_REGISTRY_TEST_ID, test::test_id};
 
 use super::{
     CROSS_ARCH1, CROSS_ARCH2, MULTI_ARCH1,
@@ -43,7 +46,7 @@ pub struct Config {
     /// Where we put the rustup / rustc / cargo bins
     pub exedir: PathBuf,
     /// The tempfile for the mutable distribution server
-    pub test_dist_dir: TempDir,
+    test_dist_dir: TempDir,
     /// The mutable distribution server; None if none is set.
     pub distdir: Option<PathBuf>,
     /// The const distribution server; None if none is set
@@ -57,11 +60,14 @@ pub struct Config {
     /// ~
     pub homedir: PathBuf,
     /// Root for updates to rustup itself aka RUSTUP_UPDATE_ROOT
-    pub rustup_update_root: Option<String>,
+    rustup_update_root: Option<String>,
     /// This is cwd for the test
     pub workdir: RefCell<PathBuf>,
     /// This is the test root for keeping stuff together
-    pub test_root_dir: PathBuf,
+    test_root_dir: PathBuf,
+    /// Per-test Windows registry ID.
+    #[cfg(windows)]
+    pub test_registry_id: String,
 }
 
 /// Helper type to simplify assertions of a command's output.
@@ -103,7 +109,7 @@ pub struct Config {
 /// [`assert_data_eq`]'s documentation for more info) with a list of
 /// rustup-specific values, including:
 /// - `[CURRENT_VERSION]`: The current rustup version.
-/// - `[HOST_TRIPLE]`: The return value of [`this_host_triple()`].
+/// - `[HOST_TUPLE]`: The return value of [`this_host_tuple()`].
 /// - `[CROSS_ARCH_I]`: The value of [`CROSS_ARCH1`].
 /// - `[CROSS_ARCH_II]`: The value of [`CROSS_ARCH2`].
 /// - `[MULTI_ARCH_I]`: The value of [`MULTI_ARCH1`].
@@ -129,10 +135,13 @@ impl Assert {
                     "[CURRENT_VERSION]",
                     Cow::Borrowed(env!("CARGO_PKG_VERSION")),
                 ),
-                ("[HOST_TRIPLE]", Cow::Owned(this_host_triple())),
+                ("[HOST_TUPLE]", Cow::Owned(this_host_tuple())),
                 ("[CROSS_ARCH_I]", Cow::Borrowed(CROSS_ARCH1)),
                 ("[CROSS_ARCH_II]", Cow::Borrowed(CROSS_ARCH2)),
                 ("[MULTI_ARCH_I]", Cow::Borrowed(MULTI_ARCH1)),
+                ("[CC_TOOL]", Cow::Borrowed("`cc`")),
+                ("[CC_TOOL]", Cow::Borrowed("`gcc`")),
+                ("[CC_TOOL]", Cow::Borrowed("`clang`")),
             ])
             .expect("invalid redactions detected");
         Self {
@@ -167,12 +176,6 @@ impl Assert {
     /// Sort stdout lines to gloss over platform-specific sort orders
     pub fn sort_stdout(&mut self, yes: bool) -> &mut Self {
         self.sort_stdout = yes;
-        self
-    }
-
-    /// Sort stderr lines to gloss over platform-specific sort orders
-    pub fn sort_stderr(&mut self, yes: bool) -> &mut Self {
-        self.sort_stderr = yes;
         self
     }
 
@@ -280,7 +283,7 @@ impl Config {
             format!("file://{}", distdir.to_string_lossy()),
         );
         cmd.env("CARGO_HOME", self.cargodir.to_string_lossy().to_string());
-        cmd.env("RUSTUP_OVERRIDE_HOST_TRIPLE", this_host_triple());
+        cmd.env("RUSTUP_OVERRIDE_HOST_TUPLE", this_host_tuple());
 
         // These are used in some installation tests that unset RUSTUP_HOME/CARGO_HOME
         cmd.env("HOME", self.homedir.to_string_lossy().to_string());
@@ -311,6 +314,12 @@ impl Config {
             "/bogus-config-file.toml",
         );
 
+        // Clear current recursion count to avoid messing up related logic
+        cmd.env("RUST_RECURSION_COUNT", "");
+
+        // Clear override for auto installation of active toolchain unless explicitly requested
+        cmd.env("RUSTUP_AUTO_INSTALL", "");
+
         // Pass `RUSTUP_CI` over to the test process in case it is required downstream
         if let Some(ci) = env::var_os("RUSTUP_CI") {
             cmd.env("RUSTUP_CI", ci);
@@ -319,6 +328,9 @@ impl Config {
         if let Some(root) = self.rustup_update_root.as_ref() {
             cmd.env("RUSTUP_UPDATE_ROOT", root);
         }
+
+        #[cfg(windows)]
+        cmd.env(RUSTUP_REGISTRY_TEST_ID, &self.test_registry_id);
     }
 
     /// Returns an [`Assert`] object to check the output of running the command
@@ -351,17 +363,6 @@ impl Config {
             )
             .await;
         Assert::new(output)
-    }
-
-    pub async fn expect_ok_contains(&self, args: &[&str], stdout: &str, stderr: &str) {
-        let out = self.run(args[0], &args[1..], &[]).await;
-        if out.status != Some(0) || !out.stdout.contains(stdout) || !out.stderr.contains(stderr) {
-            print_command(args, &out);
-            println!("expected.ok: true");
-            print_indented("expected.stdout.contains", stdout);
-            print_indented("expected.stderr.contains", stderr);
-            panic!();
-        }
     }
 
     pub async fn expect_ok_eq(&self, args1: &[&str], args2: &[&str]) {
@@ -425,12 +426,7 @@ impl Config {
     }
 
     #[tracing::instrument(level = "trace", skip_all)]
-    pub(crate) async fn run_inprocess<I, A>(
-        &self,
-        name: &str,
-        args: I,
-        env: &[(&str, &str)],
-    ) -> Output
+    async fn run_inprocess<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> Output
     where
         I: IntoIterator<Item = A>,
         A: AsRef<OsStr>,
@@ -475,7 +471,7 @@ impl Config {
     }
 
     #[track_caller]
-    pub fn run_subprocess<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> Output
+    fn run_subprocess<I, A>(&self, name: &str, args: I, env: &[(&str, &str)]) -> Output
     where
         I: IntoIterator<Item = A>,
         A: AsRef<OsStr>,
@@ -823,6 +819,8 @@ async fn setup_test_state(test_dist_dir: TempDir) -> (TempDir, Config) {
         rustup_update_root: None,
         workdir: RefCell::new(workdir),
         test_root_dir: test_dir.path().to_path_buf(),
+        #[cfg(windows)]
+        test_registry_id: test_id(),
     };
 
     let build_path = built_exe_dir.join(format!("rustup-init{EXE_SUFFIX}"));
@@ -871,11 +869,11 @@ async fn setup_test_state(test_dist_dir: TempDir) -> (TempDir, Config) {
     hard_link(&rustup_path, rls_path).unwrap();
     hard_link(&rustup_path, rust_lldb_path).unwrap();
 
-    // Make sure the host triple matches the build triple. Otherwise testing a 32-bit build of
+    // Make sure the host tuple matches the build tuple. Otherwise testing a 32-bit build of
     // rustup on a 64-bit machine will fail, because the tests do not have the host detection
     // functionality built in.
     config
-        .run("rustup", ["set", "default-host", &this_host_triple()], &[])
+        .run("rustup", ["set", "default-host", &this_host_tuple()], &[])
         .await;
 
     // Set the auto update mode to disable, as most tests do not want to update rustup itself during the test.
@@ -909,7 +907,7 @@ impl SelfUpdateTestContext {
         let root_url = create_local_update_server(self_dist, &cx.config.exedir, version);
         cx.config.rustup_update_root = Some(root_url);
 
-        let trip = this_host_triple();
+        let trip = this_host_tuple();
         let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
         let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
         let dist_tmp = dist_dir.join("rustup-init-tmp");
@@ -978,7 +976,7 @@ impl CliTestContext {
         let self_dist = self_dist_tmp.path();
 
         let root_url = create_local_update_server(self_dist, &self.config.exedir, version);
-        let trip = this_host_triple();
+        let trip = this_host_tuple();
         let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
         let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
         let dist_tmp = dist_dir.join("rustup-init-tmp");
@@ -1065,7 +1063,7 @@ impl Drop for DistDirGuard<'_> {
 }
 
 fn create_local_update_server(self_dist: &Path, exedir: &Path, version: &str) -> String {
-    let trip = this_host_triple();
+    let trip = this_host_tuple();
     let dist_dir = self_dist.join(format!("archive/{version}/{trip}"));
     let dist_exe = dist_dir.join(format!("rustup-init{EXE_SUFFIX}"));
     let rustup_bin = exedir.join(format!("rustup-init{EXE_SUFFIX}"));
@@ -1121,10 +1119,10 @@ pub fn print_indented(heading: &str, text: &str) {
     );
 }
 
-pub struct Output {
-    pub status: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
+struct Output {
+    status: Option<i32>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -1248,7 +1246,7 @@ fn create_custom_toolchains(customdir: &Path) {
     }
 }
 
-pub(crate) fn hard_link<A, B>(original: A, link: B) -> io::Result<()>
+pub(super) fn hard_link<A, B>(original: A, link: B) -> io::Result<()>
 where
     A: AsRef<Path>,
     B: AsRef<Path>,

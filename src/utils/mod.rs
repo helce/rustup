@@ -87,8 +87,22 @@ pub fn read_file(name: &'static str, path: &Path) -> Result<String> {
     })
 }
 
+pub(crate) fn read_locked_file(name: &'static str, path: &Path) -> Result<String> {
+    raw::read_locked_file(path).with_context(|| RustupError::ReadingFile {
+        name,
+        path: PathBuf::from(path),
+    })
+}
+
 pub fn write_file(name: &'static str, path: &Path, contents: &str) -> Result<()> {
     raw::write_file(path, contents).with_context(|| RustupError::WritingFile {
+        name,
+        path: PathBuf::from(path),
+    })
+}
+
+pub(crate) fn write_locked_file(name: &'static str, path: &Path, contents: &str) -> Result<()> {
+    raw::write_locked_file(path, contents).with_context(|| RustupError::WritingFile {
         name,
         path: PathBuf::from(path),
     })
@@ -402,14 +416,14 @@ fn copy_and_delete(name: &'static str, src: &Path, dest: &Path) -> Result<()> {
     // This uses std::fs::copy() instead of the faster std::fs::rename() to
     // avoid cross-device link errors.
     if src.is_dir() {
-        copy_dir(src, dest).and(remove_dir_all::remove_dir_all(src).with_context(|| {
-            RustupError::RemovingDirectory {
+        copy_dir(src, dest).and_then(|()| {
+            remove_dir_all::remove_dir_all(src).with_context(|| RustupError::RemovingDirectory {
                 name,
                 path: PathBuf::from(src),
-            }
-        }))
+            })
+        })
     } else {
-        copy_file(src, dest).and(remove_file(name, src))
+        copy_file(src, dest).and_then(|()| remove_file(name, src))
     }
 }
 

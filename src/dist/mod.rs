@@ -23,7 +23,7 @@ use crate::{
     config::Cfg,
     errors::{NIGHTLY_COMPONENT_NOTE, RustupError},
     process::Process,
-    toolchain::{DistributableToolchain, ToolchainName},
+    toolchain::DistributableToolchain,
     utils,
 };
 
@@ -34,7 +34,7 @@ pub mod download;
 use download::DownloadCfg;
 
 pub mod manifest;
-use manifest::{Component, Manifest as ManifestV2};
+use manifest::{Component, Manifest as ManifestV2, ManifestWithHash};
 
 pub mod manifestation;
 use manifestation::{Changes, Manifestation, UpdateStatus};
@@ -44,8 +44,8 @@ use prefix::InstallPrefix;
 
 pub mod temp;
 
-pub(crate) mod triple;
-pub(crate) use triple::*;
+pub(crate) mod target_tuple;
+pub(crate) use target_tuple::*;
 
 pub static DEFAULT_DIST_SERVER: &str = "https://dev.mcst.ru/rust";
 
@@ -137,20 +137,159 @@ struct ParsedToolchainDesc {
     target: Option<String>,
 }
 
+impl FromStr for ParsedToolchainDesc {
+    type Err = anyhow::Error;
+    fn from_str(desc: &str) -> Result<Self> {
+        // Note this regex gives you a guaranteed match of the channel (1)
+        // and an optional match of the date (2) and target (3)
+        static TOOLCHAIN_CHANNEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(&format!(
+                r"^({})(?:-([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}))?(?:-(.+))?$",
+                // The channel patterns we support
+                [
+                    "nightly",
+                    "beta",
+                    "stable",
+                    // Allow from 1.0.0 through to 9.999.99 with optional patch version
+                    // and optional beta tag
+                    r"[0-9]{1}\.(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]?))?(?:-beta(?:\.[0-9]{1,2})?)?",
+                ]
+                .join("|")
+            ))
+            .unwrap()
+        });
+
+        let d = TOOLCHAIN_CHANNEL_RE
+            .captures(desc)
+            .ok_or_else(|| RustupError::InvalidToolchainName(desc.to_string()))?;
+
+        // These versions don't have v2 manifests, but they don't have point releases either,
+        // so to make the two-part version numbers work for these versions, specially turn
+        // them into their corresponding ".0" version.
+        let channel = match d.get(1).unwrap().as_str() {
+            "1.0" => "1.0.0",
+            "1.1" => "1.1.0",
+            "1.2" => "1.2.0",
+            "1.3" => "1.3.0",
+            "1.4" => "1.4.0",
+            "1.5" => "1.5.0",
+            "1.6" => "1.6.0",
+            "1.7" => "1.7.0",
+            "1.8" => "1.8.0",
+            other => other,
+        };
+
+        fn non_empty_string(s: Option<Match<'_>>) -> Option<String> {
+            let s = s?.as_str();
+            (!s.is_empty()).then(|| s.to_owned())
+        }
+
+        Ok(Self {
+            channel: Channel::from_str(channel)?,
+            date: non_empty_string(d.get(2)),
+            target: non_empty_string(d.get(3)),
+        })
+    }
+}
+
 /// A toolchain descriptor from rustup's perspective. These contain
 /// 'partial target tuples', which allow toolchain names like
 /// 'stable-msvc' to work. Partial target tuples though are parsed
-/// from a hardcoded set of known triples, whereas target tuples
+/// from a hardcoded set of known tuples, whereas target tuples
 /// are nearly-arbitrary strings.
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
 pub struct PartialToolchainDesc {
     pub channel: Channel,
     pub date: Option<String>,
-    pub target: PartialTargetTriple,
+    pub target: PartialTargetTuple,
+}
+
+impl PartialToolchainDesc {
+    /// Create a toolchain desc using input_host to fill in missing fields
+    pub(crate) fn resolve(self, input_host: &TargetTuple) -> Result<ToolchainDesc> {
+        let host = PartialTargetTuple::new(&input_host.0).ok_or_else(|| {
+            anyhow!(format!(
+                "Provided host '{}' couldn't be converted to partial tuple",
+                input_host.0
+            ))
+        })?;
+        let host_arch = host.arch.ok_or_else(|| {
+            anyhow!(format!(
+                "Provided host '{}' did not specify a CPU architecture",
+                input_host.0
+            ))
+        })?;
+        let host_os = host.os.ok_or_else(|| {
+            anyhow!(format!(
+                "Provided host '{}' did not specify an operating system",
+                input_host.0
+            ))
+        })?;
+        let host_env = host.env;
+
+        // If OS was specified, don't default to host environment, even if the OS matches
+        // the host OS, otherwise cannot specify no environment.
+        let env = if self.target.os.is_some() {
+            self.target.env
+        } else {
+            self.target.env.or(host_env)
+        };
+        let arch = self.target.arch.unwrap_or(host_arch);
+        let os = self.target.os.unwrap_or(host_os);
+
+        let trip = if let Some(env) = env {
+            format!("{arch}-{os}-{env}")
+        } else {
+            format!("{arch}-{os}")
+        };
+
+        Ok(ToolchainDesc {
+            channel: self.channel,
+            date: self.date,
+            target: TargetTuple(trip),
+        })
+    }
+}
+
+impl FromStr for PartialToolchainDesc {
+    type Err = anyhow::Error;
+    fn from_str(name: &str) -> Result<Self> {
+        let parsed: ParsedToolchainDesc = name.parse()?;
+        let target = PartialTargetTuple::new(parsed.target.as_deref().unwrap_or(""));
+
+        target
+            .map(|target| Self {
+                channel: parsed.channel,
+                date: parsed.date,
+                target,
+            })
+            .ok_or_else(|| anyhow!(RustupError::InvalidToolchainName(name.to_string())))
+    }
+}
+
+impl fmt::Display for PartialToolchainDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.channel)?;
+
+        if let Some(date) = &self.date {
+            write!(f, "-{date}")?;
+        }
+        if let Some(arch) = &self.target.arch {
+            write!(f, "-{arch}")?;
+        }
+        if let Some(os) = &self.target.os {
+            write!(f, "-{os}")?;
+        }
+        if let Some(env) = &self.target.env {
+            write!(f, "-{env}")?;
+        }
+
+        Ok(())
+    }
 }
 
 /// Fully-resolved toolchain descriptors. These always have full target
-/// triples attached to them and are used for canonical identification,
+/// tuples attached to them and are used for canonical identification,
 /// such as naming their installation directory.
 ///
 /// As strings they look like stable-x86_64-pc-windows-msvc or
@@ -159,7 +298,78 @@ pub struct PartialToolchainDesc {
 pub struct ToolchainDesc {
     pub channel: Channel,
     pub date: Option<String>,
-    pub target: TargetTriple,
+    pub target: TargetTuple,
+}
+
+impl ToolchainDesc {
+    pub(crate) fn manifest_v1_url(&self, dist_root: &str, process: &Process) -> String {
+        let do_manifest_staging = process.var("RUSTUP_STAGED_MANIFEST").is_ok();
+        match (self.date.as_ref(), do_manifest_staging) {
+            (None, false) => format!("{}/channel-rust-{}", dist_root, self.channel),
+            (Some(date), false) => format!("{}/{}/channel-rust-{}", dist_root, date, self.channel),
+            (None, true) => format!("{}/staging/channel-rust-{}", dist_root, self.channel),
+            (Some(_), true) => panic!("not a real-world case"),
+        }
+    }
+
+    pub(crate) fn manifest_v2_url(&self, dist_root: &str, process: &Process) -> String {
+        format!("{}.toml", self.manifest_v1_url(dist_root, process))
+    }
+    /// Either "$channel" or "channel-$date"
+    pub fn manifest_name(&self) -> String {
+        match &self.date {
+            None => self.channel.to_string(),
+            Some(date) => format!("{}-{}", self.channel, date),
+        }
+    }
+
+    pub(crate) fn package_dir(&self, dist_root: &str) -> String {
+        match &self.date {
+            None => dist_root.to_string(),
+            Some(date) => format!("{dist_root}/{date}"),
+        }
+    }
+
+    /// Toolchain channels are considered 'tracking' if it is one of the named channels
+    /// such as `stable`, or is an incomplete version such as `1.48`, and the
+    /// date field is empty.
+    pub(crate) fn is_tracking(&self) -> bool {
+        match &self.channel {
+            _ if self.date.is_some() => false,
+            Channel::Stable | Channel::Beta | Channel::Nightly => true,
+            Channel::Version(ver) => ver.patch.is_none() || &*ver.pre == "beta",
+        }
+    }
+}
+
+impl FromStr for ToolchainDesc {
+    type Err = anyhow::Error;
+    fn from_str(name: &str) -> Result<Self> {
+        let parsed: ParsedToolchainDesc = name.parse()?;
+
+        if parsed.target.is_none() {
+            return Err(anyhow!(RustupError::InvalidToolchainName(name.to_string())));
+        }
+
+        Ok(Self {
+            channel: parsed.channel,
+            date: parsed.date,
+            target: TargetTuple(parsed.target.unwrap()),
+        })
+    }
+}
+
+impl fmt::Display for ToolchainDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.channel)?;
+
+        if let Some(date) = &self.date {
+            write!(f, "-{date}")?;
+        }
+        write!(f, "-{}", self.target)?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, PartialOrd, Ord)]
@@ -247,138 +457,18 @@ impl FromStr for PartialVersion {
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize)]
 #[serde(transparent)]
-pub struct TargetTriple(String);
+pub struct TargetTuple(String);
 
-// Linux hosts don't indicate clib in uname, however binaries only
-// run on boxes with the same clib, as expected.
-#[cfg(all(not(windows), not(target_env = "musl")))]
-const TRIPLE_X86_64_UNKNOWN_LINUX: &str = "x86_64-unknown-linux-gnu";
-#[cfg(all(not(windows), target_env = "musl"))]
-const TRIPLE_X86_64_UNKNOWN_LINUX: &str = "x86_64-unknown-linux-musl";
-#[cfg(all(not(windows), not(target_env = "musl")))]
-const TRIPLE_AARCH64_UNKNOWN_LINUX: &str = "aarch64-unknown-linux-gnu";
-#[cfg(all(not(windows), target_env = "musl"))]
-const TRIPLE_AARCH64_UNKNOWN_LINUX: &str = "aarch64-unknown-linux-musl";
-#[cfg(all(not(windows), not(target_env = "musl")))]
-const TRIPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-gnu";
-#[cfg(all(not(windows), target_env = "musl"))]
-const TRIPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-musl";
-#[cfg(all(not(windows), not(target_env = "musl")))]
-const TRIPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-gnu";
-#[cfg(all(not(windows), target_env = "musl"))]
-const TRIPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-musl";
-#[cfg(all(not(windows), not(target_env = "musl")))]
-const TRIPLE_POWERPC64LE_UNKNOWN_LINUX: &str = "powerpc64le-unknown-linux-gnu";
-#[cfg(all(not(windows), target_env = "musl"))]
-const TRIPLE_POWERPC64LE_UNKNOWN_LINUX: &str = "powerpc64le-unknown-linux-musl";
-
-// MIPS platforms don't indicate endianness in uname, however binaries only
-// run on boxes with the same endianness, as expected.
-// Hence we could distinguish between the variants with compile-time cfg()
-// attributes alone.
-#[cfg(all(not(windows), target_endian = "big"))]
-static TRIPLE_MIPS_UNKNOWN_LINUX_GNU: &str = "mips-unknown-linux-gnu";
-#[cfg(all(not(windows), target_endian = "little"))]
-static TRIPLE_MIPS_UNKNOWN_LINUX_GNU: &str = "mipsel-unknown-linux-gnu";
-
-#[cfg(all(not(windows), target_endian = "big"))]
-static TRIPLE_MIPS64_UNKNOWN_LINUX_GNUABI64: &str = "mips64-unknown-linux-gnuabi64";
-#[cfg(all(not(windows), target_endian = "little"))]
-static TRIPLE_MIPS64_UNKNOWN_LINUX_GNUABI64: &str = "mips64el-unknown-linux-gnuabi64";
-
-impl FromStr for ParsedToolchainDesc {
-    type Err = anyhow::Error;
-    fn from_str(desc: &str) -> Result<Self> {
-        // Note this regex gives you a guaranteed match of the channel (1)
-        // and an optional match of the date (2) and target (3)
-        static TOOLCHAIN_CHANNEL_RE: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(&format!(
-                r"^({})(?:-([0-9]{{4}}-[0-9]{{2}}-[0-9]{{2}}))?(?:-(.+))?$",
-                // The channel patterns we support
-                [
-                    "nightly",
-                    "beta",
-                    "stable",
-                    // Allow from 1.0.0 through to 9.999.99 with optional patch version
-                    // and optional beta tag
-                    r"[0-9]{1}\.(?:0|[1-9][0-9]{0,2})(?:\.(?:0|[1-9][0-9]?))?(?:-beta(?:\.[0-9]{1,2})?)?",
-                ]
-                .join("|")
-            ))
-            .unwrap()
-        });
-
-        let d = TOOLCHAIN_CHANNEL_RE
-            .captures(desc)
-            .ok_or_else(|| RustupError::InvalidToolchainName(desc.to_string()))?;
-
-        // These versions don't have v2 manifests, but they don't have point releases either,
-        // so to make the two-part version numbers work for these versions, specially turn
-        // them into their corresponding ".0" version.
-        let channel = match d.get(1).unwrap().as_str() {
-            "1.0" => "1.0.0",
-            "1.1" => "1.1.0",
-            "1.2" => "1.2.0",
-            "1.3" => "1.3.0",
-            "1.4" => "1.4.0",
-            "1.5" => "1.5.0",
-            "1.6" => "1.6.0",
-            "1.7" => "1.7.0",
-            "1.8" => "1.8.0",
-            other => other,
-        };
-
-        fn non_empty_string(s: Option<Match<'_>>) -> Option<String> {
-            let s = s?.as_str();
-            (!s.is_empty()).then(|| s.to_owned())
-        }
-
-        Ok(Self {
-            channel: Channel::from_str(channel)?,
-            date: non_empty_string(d.get(2)),
-            target: non_empty_string(d.get(3)),
-        })
-    }
-}
-
-impl Deref for TargetTriple {
-    type Target = str;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-/// Check if /bin/sh is a 32-bit binary. If it doesn't exist, fall back to
-/// checking if _we_ are a 32-bit binary.
-/// rustup-init.sh also relies on checking /bin/sh for bitness.
-#[cfg(not(windows))]
-fn is_32bit_userspace() -> bool {
-    use std::fs;
-    use std::io::{self, Read};
-
-    // inner function is to simplify error handling.
-    fn inner() -> io::Result<bool> {
-        let mut f = fs::File::open("/bin/sh")?;
-        let mut buf = [0; 5];
-        f.read_exact(&mut buf)?;
-
-        // ELF files start out "\x7fELF", and the following byte is
-        //   0x01 for 32-bit and
-        //   0x02 for 64-bit.
-        Ok(&buf == b"\x7fELF\x01")
-    }
-
-    inner().unwrap_or(cfg!(target_pointer_width = "32"))
-}
-
-impl TargetTriple {
+impl TargetTuple {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
     }
 
     pub(crate) fn from_build() -> Self {
-        if let Some(triple) = option_env!("RUSTUP_OVERRIDE_BUILD_TRIPLE") {
-            Self::new(triple)
+        if let Some(tuple) = option_env!("RUSTUP_OVERRIDE_BUILD_TUPLE") {
+            Self::new(tuple)
+        } else if let Some(tuple) = option_env!("RUSTUP_OVERRIDE_BUILD_TRIPLE") {
+            Self::new(tuple)
         } else {
             Self::new(env!("TARGET"))
         }
@@ -408,7 +498,7 @@ impl TargetTriple {
 
     pub(crate) fn from_host(process: &Process) -> Option<Self> {
         #[cfg(windows)]
-        fn inner() -> Option<TargetTriple> {
+        fn inner() -> Option<TargetTuple> {
             use std::mem;
 
             /// Get the host architecture using `IsWow64Process2`. This function
@@ -479,12 +569,12 @@ impl TargetTriple {
 
             // Default to msvc
             let arch = arch_primary().or_else(arch_fallback)?;
-            let msvc_triple = format!("{arch}-pc-windows-msvc");
-            Some(TargetTriple(msvc_triple))
+            let msvc_tuple = format!("{arch}-pc-windows-msvc");
+            Some(TargetTuple(msvc_tuple))
         }
 
         #[cfg(not(windows))]
-        fn inner() -> Option<TargetTriple> {
+        fn inner() -> Option<TargetTuple> {
             use std::ffi::CStr;
             use std::mem;
 
@@ -502,26 +592,28 @@ impl TargetTriple {
             };
 
             #[cfg(not(target_os = "android"))]
-            let host_triple = match (sysname, machine) {
-                (b"Linux", b"x86_64") => Some(TRIPLE_X86_64_UNKNOWN_LINUX),
+            let host_tuple = match (sysname, machine) {
+                (b"Linux", b"x86_64") => Some(TUPLE_X86_64_UNKNOWN_LINUX),
                 (b"Linux", b"i686") => Some("i686-unknown-linux-gnu"),
-                (b"Linux", b"mips") => Some(TRIPLE_MIPS_UNKNOWN_LINUX_GNU),
-                (b"Linux", b"mips64") => Some(TRIPLE_MIPS64_UNKNOWN_LINUX_GNUABI64),
+                (b"Linux", b"mips") => Some(TUPLE_MIPS_UNKNOWN_LINUX_GNU),
+                (b"Linux", b"mips64") => Some(TUPLE_MIPS64_UNKNOWN_LINUX_GNUABI64),
                 (b"Linux", b"arm") => Some("arm-unknown-linux-gnueabi"),
                 (b"Linux", b"armv7l") => Some("armv7-unknown-linux-gnueabihf"),
                 (b"Linux", b"armv8l") => Some("armv7-unknown-linux-gnueabihf"),
                 (b"Linux", b"aarch64") => Some(if is_32bit_userspace() {
                     "armv7-unknown-linux-gnueabihf"
                 } else {
-                    TRIPLE_AARCH64_UNKNOWN_LINUX
+                    TUPLE_AARCH64_UNKNOWN_LINUX
                 }),
-                (b"Linux", b"loongarch64") => Some(TRIPLE_LOONGARCH64_UNKNOWN_LINUX),
-                (b"Linux", b"ppc64") => Some(TRIPLE_POWERPC64_UNKNOWN_LINUX),
-                (b"Linux", b"ppc64le") => Some(TRIPLE_POWERPC64LE_UNKNOWN_LINUX),
+                (b"Linux", b"loongarch64") => Some(TUPLE_LOONGARCH64_UNKNOWN_LINUX),
+                (b"Linux", b"ppc64") => Some(TUPLE_POWERPC64_UNKNOWN_LINUX),
+                (b"Linux", b"ppc64le") => Some(TUPLE_POWERPC64LE_UNKNOWN_LINUX),
+                (b"Linux", b"riscv64") => Some(TUPLE_RISCV64GC_UNKNOWN_LINUX),
                 (b"Darwin", b"x86_64") => Some("x86_64-apple-darwin"),
                 (b"Darwin", b"i686") => Some("i686-apple-darwin"),
                 (b"FreeBSD", b"x86_64") => Some("x86_64-unknown-freebsd"),
                 (b"FreeBSD", b"i686") => Some("i686-unknown-freebsd"),
+                (b"FreeBSD", b"aarch64") => Some("aarch64-unknown-freebsd"),
                 (b"OpenBSD", b"x86_64") => Some("x86_64-unknown-openbsd"),
                 (b"OpenBSD", b"i686") => Some("i686-unknown-openbsd"),
                 (b"NetBSD", b"x86_64") => Some("x86_64-unknown-netbsd"),
@@ -536,7 +628,7 @@ impl TargetTriple {
             };
 
             #[cfg(target_os = "android")]
-            let host_triple = match (sysname, machine) {
+            let host_tuple = match (sysname, machine) {
                 (_, b"arm") => Some("arm-linux-androideabi"),
                 (_, b"armv7l") => Some("armv7-linux-androideabi"),
                 (_, b"armv8l") => Some("armv7-linux-androideabi"),
@@ -546,11 +638,13 @@ impl TargetTriple {
                 _ => None,
             };
 
-            host_triple.map(TargetTriple::new)
+            host_tuple.map(TargetTuple::new)
         }
 
-        if let Ok(triple) = process.var("RUSTUP_OVERRIDE_HOST_TRIPLE") {
-            Some(Self(triple))
+        if let Ok(tuple) = process.var("RUSTUP_OVERRIDE_HOST_TUPLE") {
+            Some(Self(tuple))
+        } else if let Ok(tuple) = process.var("RUSTUP_OVERRIDE_HOST_TRIPLE") {
+            Some(Self(tuple))
         } else {
             inner()
         }
@@ -560,27 +654,22 @@ impl TargetTriple {
         Self::from_host(process).unwrap_or_else(Self::from_build)
     }
 
-    pub(crate) fn can_run(&self, other: &TargetTriple) -> Result<bool> {
+    pub(crate) fn can_run(&self, other: &Self) -> Result<bool> {
         // Most trivial shortcut of all
         if self == other {
             return Ok(true);
         }
         // Otherwise we need to parse things
-        let partial_self = PartialTargetTriple::new(&self.0)
+        let partial_self = PartialTargetTuple::new(&self.0)
             .ok_or_else(|| anyhow!(format!("Unable to parse target tuple: {}", self.0)))?;
-        let partial_other = PartialTargetTriple::new(&other.0)
+        let partial_other = PartialTargetTuple::new(&other.0)
             .ok_or_else(|| anyhow!(format!("Unable to parse target tuple: {}", other.0)))?;
         // First obvious check is OS, if that doesn't match there's no chance
         let ret = if partial_self.os != partial_other.os {
             false
         } else if partial_self.os.as_deref() == Some("pc-windows") {
-            // Windows is a special case here: we can run gnu and msvc on the same system,
-            // x86_64 can run i686, and aarch64 can run i686 through emulation
-            (partial_self.arch == partial_other.arch)
-                || (partial_self.arch.as_deref() == Some("x86_64")
-                    && partial_other.arch.as_deref() == Some("i686"))
-                || (partial_self.arch.as_deref() == Some("aarch64")
-                    && partial_other.arch.as_deref() == Some("i686"))
+            // Windows is a special case here: we can run gnu and msvc on the same system.
+            partial_self.arch == partial_other.arch
         } else {
             // For other OSes, for now, we assume other toolchains won't run
             false
@@ -589,140 +678,81 @@ impl TargetTriple {
     }
 }
 
-impl FromStr for PartialToolchainDesc {
-    type Err = anyhow::Error;
-    fn from_str(name: &str) -> Result<Self> {
-        let parsed: ParsedToolchainDesc = name.parse()?;
-        let target = PartialTargetTriple::new(parsed.target.as_deref().unwrap_or(""));
-
-        target
-            .map(|target| Self {
-                channel: parsed.channel,
-                date: parsed.date,
-                target,
-            })
-            .ok_or_else(|| anyhow!(RustupError::InvalidToolchainName(name.to_string())))
+impl fmt::Display for TargetTuple {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
-impl PartialToolchainDesc {
-    /// Create a toolchain desc using input_host to fill in missing fields
-    pub(crate) fn resolve(self, input_host: &TargetTriple) -> Result<ToolchainDesc> {
-        let host = PartialTargetTriple::new(&input_host.0).ok_or_else(|| {
-            anyhow!(format!(
-                "Provided host '{}' couldn't be converted to partial triple",
-                input_host.0
-            ))
-        })?;
-        let host_arch = host.arch.ok_or_else(|| {
-            anyhow!(format!(
-                "Provided host '{}' did not specify a CPU architecture",
-                input_host.0
-            ))
-        })?;
-        let host_os = host.os.ok_or_else(|| {
-            anyhow!(format!(
-                "Provided host '{}' did not specify an operating system",
-                input_host.0
-            ))
-        })?;
-        let host_env = host.env;
-
-        // If OS was specified, don't default to host environment, even if the OS matches
-        // the host OS, otherwise cannot specify no environment.
-        let env = if self.target.os.is_some() {
-            self.target.env
-        } else {
-            self.target.env.or(host_env)
-        };
-        let arch = self.target.arch.unwrap_or(host_arch);
-        let os = self.target.os.unwrap_or(host_os);
-
-        let trip = if let Some(env) = env {
-            format!("{arch}-{os}-{env}")
-        } else {
-            format!("{arch}-{os}")
-        };
-
-        Ok(ToolchainDesc {
-            channel: self.channel,
-            date: self.date,
-            target: TargetTriple(trip),
-        })
-    }
-
-    pub(crate) fn has_triple(&self) -> bool {
-        self.target.arch.is_some() || self.target.os.is_some() || self.target.env.is_some()
+impl Deref for TargetTuple {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-impl FromStr for ToolchainDesc {
-    type Err = anyhow::Error;
-    fn from_str(name: &str) -> Result<Self> {
-        let parsed: ParsedToolchainDesc = name.parse()?;
+// Linux hosts don't indicate clib in uname, however binaries only
+// run on boxes with the same clib, as expected.
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_X86_64_UNKNOWN_LINUX: &str = "x86_64-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_X86_64_UNKNOWN_LINUX: &str = "x86_64-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_AARCH64_UNKNOWN_LINUX: &str = "aarch64-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_AARCH64_UNKNOWN_LINUX: &str = "aarch64-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_LOONGARCH64_UNKNOWN_LINUX: &str = "loongarch64-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_POWERPC64_UNKNOWN_LINUX: &str = "powerpc64-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_POWERPC64LE_UNKNOWN_LINUX: &str = "powerpc64le-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_POWERPC64LE_UNKNOWN_LINUX: &str = "powerpc64le-unknown-linux-musl";
+#[cfg(all(not(windows), not(target_env = "musl")))]
+const TUPLE_RISCV64GC_UNKNOWN_LINUX: &str = "riscv64gc-unknown-linux-gnu";
+#[cfg(all(not(windows), target_env = "musl"))]
+const TUPLE_RISCV64GC_UNKNOWN_LINUX: &str = "riscv64gc-unknown-linux-musl";
 
-        if parsed.target.is_none() {
-            return Err(anyhow!(RustupError::InvalidToolchainName(name.to_string())));
-        }
+// MIPS platforms don't indicate endianness in uname, however binaries only
+// run on boxes with the same endianness, as expected.
+// Hence we could distinguish between the variants with compile-time cfg()
+// attributes alone.
+#[cfg(all(not(windows), target_endian = "big"))]
+static TUPLE_MIPS_UNKNOWN_LINUX_GNU: &str = "mips-unknown-linux-gnu";
+#[cfg(all(not(windows), target_endian = "little"))]
+static TUPLE_MIPS_UNKNOWN_LINUX_GNU: &str = "mipsel-unknown-linux-gnu";
 
-        Ok(Self {
-            channel: parsed.channel,
-            date: parsed.date,
-            target: TargetTriple(parsed.target.unwrap()),
-        })
+#[cfg(all(not(windows), target_endian = "big"))]
+static TUPLE_MIPS64_UNKNOWN_LINUX_GNUABI64: &str = "mips64-unknown-linux-gnuabi64";
+#[cfg(all(not(windows), target_endian = "little"))]
+static TUPLE_MIPS64_UNKNOWN_LINUX_GNUABI64: &str = "mips64el-unknown-linux-gnuabi64";
+
+/// Check if /bin/sh is a 32-bit binary. If it doesn't exist, fall back to
+/// checking if _we_ are a 32-bit binary.
+/// rustup-init.sh also relies on checking /bin/sh for bitness.
+#[cfg(not(windows))]
+fn is_32bit_userspace() -> bool {
+    use std::fs;
+    use std::io::{self, Read};
+
+    // inner function is to simplify error handling.
+    fn inner() -> io::Result<bool> {
+        let mut f = fs::File::open("/bin/sh")?;
+        let mut buf = [0; 5];
+        f.read_exact(&mut buf)?;
+
+        // ELF files start out "\x7fELF", and the following byte is
+        //   0x01 for 32-bit and
+        //   0x02 for 64-bit.
+        Ok(&buf == b"\x7fELF\x01")
     }
-}
 
-impl ToolchainDesc {
-    pub(crate) fn manifest_v1_url(&self, dist_root: &str, process: &Process) -> String {
-        let do_manifest_staging = process.var("RUSTUP_STAGED_MANIFEST").is_ok();
-        match (self.date.as_ref(), do_manifest_staging) {
-            (None, false) => format!("{}/channel-rust-{}", dist_root, self.channel),
-            (Some(date), false) => format!("{}/{}/channel-rust-{}", dist_root, date, self.channel),
-            (None, true) => format!("{}/staging/channel-rust-{}", dist_root, self.channel),
-            (Some(_), true) => panic!("not a real-world case"),
-        }
-    }
-
-    pub(crate) fn manifest_v2_url(&self, dist_root: &str, process: &Process) -> String {
-        format!("{}.toml", self.manifest_v1_url(dist_root, process))
-    }
-    /// Either "$channel" or "channel-$date"
-    pub fn manifest_name(&self) -> String {
-        match &self.date {
-            None => self.channel.to_string(),
-            Some(date) => format!("{}-{}", self.channel, date),
-        }
-    }
-
-    pub(crate) fn package_dir(&self, dist_root: &str) -> String {
-        match &self.date {
-            None => dist_root.to_string(),
-            Some(date) => format!("{dist_root}/{date}"),
-        }
-    }
-
-    /// Toolchain channels are considered 'tracking' if it is one of the named channels
-    /// such as `stable`, or is an incomplete version such as `1.48`, and the
-    /// date field is empty.
-    pub(crate) fn is_tracking(&self) -> bool {
-        match &self.channel {
-            _ if self.date.is_some() => false,
-            Channel::Stable | Channel::Beta | Channel::Nightly => true,
-            Channel::Version(ver) => ver.patch.is_none() || &*ver.pre == "beta",
-        }
-    }
-}
-
-impl TryFrom<&ToolchainName> for ToolchainDesc {
-    type Error = DistError;
-
-    fn try_from(value: &ToolchainName) -> std::result::Result<Self, Self::Error> {
-        match value {
-            ToolchainName::Custom(n) => Err(DistError::InvalidOfficialName(n.to_string())),
-            ToolchainName::Official(n) => Ok(n.clone()),
-        }
-    }
+    inner().unwrap_or(cfg!(target_pointer_width = "32"))
 }
 
 #[derive(
@@ -748,7 +778,7 @@ impl Profile {
 
 impl ValueEnum for Profile {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Profile::Minimal, Profile::Default, Profile::Complete]
+        &[Self::Minimal, Self::Default, Self::Complete]
     }
 
     fn to_possible_value(&self) -> Option<PossibleValue> {
@@ -774,6 +804,12 @@ impl FromStr for Profile {
                 Self::value_variants().iter().join(", ")
             ))),
         }
+    }
+}
+
+impl fmt::Display for Profile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
     }
 }
 
@@ -827,52 +863,6 @@ impl FromStr for AutoInstallMode {
 impl fmt::Display for AutoInstallMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
-    }
-}
-
-impl fmt::Display for TargetTriple {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-impl fmt::Display for PartialToolchainDesc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.channel)?;
-
-        if let Some(date) = &self.date {
-            write!(f, "-{date}")?;
-        }
-        if let Some(arch) = &self.target.arch {
-            write!(f, "-{arch}")?;
-        }
-        if let Some(os) = &self.target.os {
-            write!(f, "-{os}")?;
-        }
-        if let Some(env) = &self.target.env {
-            write!(f, "-{env}")?;
-        }
-
-        Ok(())
-    }
-}
-
-impl fmt::Display for ToolchainDesc {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", &self.channel)?;
-
-        if let Some(date) = &self.date {
-            write!(f, "-{date}")?;
-        }
-        write!(f, "-{}", self.target)?;
-
-        Ok(())
-    }
-}
-
-impl fmt::Display for Profile {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
     }
 }
 
@@ -951,7 +941,11 @@ impl<'cfg, 'a> DistOptions<'cfg, 'a> {
     //
     // Returns the manifest's hash if anything changed.
     #[tracing::instrument(level = "trace", err(level = "trace"), skip_all, fields(profile = ?self.profile, prefix = %prefix.path().display()))]
-    pub(crate) async fn install_into(&self, prefix: &InstallPrefix) -> Result<Option<String>> {
+    pub(crate) async fn install_into(
+        &self,
+        prefix: &InstallPrefix,
+        manifest: Option<ManifestWithHash>,
+    ) -> Result<Option<String>> {
         let fresh_install = !prefix.path().exists();
         // fresh_install means the toolchain isn't present, but hash_exists means there is a stray hash file
         if fresh_install && self.update_hash.exists() {
@@ -1009,6 +1003,7 @@ impl<'cfg, 'a> DistOptions<'cfg, 'a> {
         };
 
         let mut toolchain = self.toolchain.clone();
+        let mut prefetched_manifest = manifest;
         let res = loop {
             let result = try_update_from_dist_(
                 &self.dl_cfg,
@@ -1024,6 +1019,7 @@ impl<'cfg, 'a> DistOptions<'cfg, 'a> {
                 self.targets,
                 &mut fetched,
                 self.cfg,
+                prefetched_manifest.take(),
             )
             .await;
 
@@ -1122,28 +1118,32 @@ async fn try_update_from_dist_(
     targets: &[&str],
     fetched: &mut String,
     cfg: &Cfg<'_>,
+    prefetched_manifest: Option<ManifestWithHash>,
 ) -> Result<Option<String>> {
     let toolchain_str = toolchain.to_string();
     let manifestation = Manifestation::open(prefix.clone(), toolchain.target.clone())?;
 
     // TODO: Add a notification about which manifest version is going to be used
     info!("syncing channel updates for {toolchain_str}");
-    match download
-        .dl_v2_manifest(
-            // Even if manifest has not changed, we must continue to install requested components.
-            // So if components or targets is not empty, we skip passing `update_hash` so that
-            // we essentially degenerate to `rustup component add` / `rustup target add`
-            if components.is_empty() && targets.is_empty() {
-                Some(update_hash)
-            } else {
-                None
-            },
-            toolchain,
-            cfg,
-        )
-        .await
-    {
-        Ok(Some((m, hash))) => {
+    let manifest_result = if prefetched_manifest.is_some() {
+        Ok(prefetched_manifest)
+    } else {
+        download
+            .dl_v2_manifest(
+                // Skip the update hash when the installed manifest is missing or when components
+                // or targets were requested, since either case still requires the channel manifest.
+                if prefix.dist_manifest().is_some() && components.is_empty() && targets.is_empty() {
+                    Some(update_hash)
+                } else {
+                    None
+                },
+                toolchain,
+                cfg,
+            )
+            .await
+    };
+    match manifest_result {
+        Ok(Some(ManifestWithHash { manifest: m, hash })) => {
             match m.get_rust_version() {
                 Ok(version) => info!("latest update on {} for version {version}", m.date),
                 Err(_) => info!("latest update on {}", m.date),
@@ -1171,7 +1171,7 @@ async fn try_update_from_dist_(
                 if let Some(c) = rust_target_package
                     .components
                     .iter()
-                    .find(|c| c.short_name_in_manifest() == component.short_name_in_manifest())
+                    .find(|c| c.short_name() == component.short_name())
                     && c.target.is_none()
                 {
                     component = component.wildcard();
@@ -1180,8 +1180,8 @@ async fn try_update_from_dist_(
             }
 
             for &target in targets {
-                let triple = TargetTriple::new(target);
-                all_components.insert(Component::new("rust-std".to_string(), Some(triple), false));
+                let tuple = TargetTuple::new(target);
+                all_components.insert(Component::new("rust-std".to_string(), Some(tuple), false));
             }
 
             let mut explicit_add_components: Vec<_> = all_components.into_iter().collect();
@@ -1195,30 +1195,30 @@ async fn try_update_from_dist_(
             fetched.clone_from(&m.date);
 
             return match manifestation
-                .update(
-                    m,
-                    changes,
-                    force_update,
-                    download,
-                    toolchain.manifest_name(),
-                    true,
-                )
+                .update(m, changes, force_update, download, toolchain, true)
                 .await
             {
                 Ok(status) => match status {
                     UpdateStatus::Unchanged => Ok(None),
                     UpdateStatus::Changed => Ok(Some(hash)),
                 },
+                // Check for the variant by reference before we downcast with ownership,
+                // otherwise we'll drop implicit context bundled up in the original anyhow::Error.
                 Err(err) => match err.downcast_ref::<RustupError>() {
-                    Some(RustupError::RequestedComponentsUnavailable {
-                        components,
-                        manifest,
-                        toolchain,
-                    }) => Err(anyhow!(DistError::ToolchainComponentsMissing(
-                        components.to_owned(),
-                        Box::new(manifest.to_owned()),
-                        toolchain.to_owned(),
-                    ))),
+                    Some(RustupError::RequestedComponentsUnavailable { .. }) => {
+                        let Ok(RustupError::RequestedComponentsUnavailable {
+                            components,
+                            manifest,
+                            toolchain,
+                        }) = err.downcast::<RustupError>()
+                        else {
+                            unreachable!()
+                        };
+
+                        Err(anyhow!(DistError::ToolchainComponentsMissing(
+                            components, manifest, toolchain,
+                        )))
+                    }
                     Some(_) | None => Err(err),
                 },
             };
@@ -1226,11 +1226,15 @@ async fn try_update_from_dist_(
         Ok(None) => return Ok(None),
         Err(err) => {
             match err.downcast_ref::<RustupError>() {
-                Some(RustupError::ChecksumFailed { .. }) => return Ok(None),
                 Some(RustupError::DownloadNotExists { .. }) => {
                     // Proceed to try v1 as a fallback
                     debug!("manifest not found; trying legacy manifest");
                 }
+                // Includes `ChecksumFailed`: if the v2 manifest exists but its
+                // contents do not match the published `.sha256`, surface the
+                // integrity failure as an error rather than silently treating
+                // the toolchain as up to date. The v1 fallback path below
+                // already does the same.
                 _ => return Err(err),
             }
         }
@@ -1449,7 +1453,7 @@ mod tests {
     }
 
     #[test]
-    fn compatible_host_triples() {
+    fn compatible_host_tuples() {
         static CASES: &[(&str, &[&str], &[&str])] = &[
             (
                 // 64bit linux
@@ -1460,31 +1464,33 @@ mod tests {
                 &["i686-unknown-linux-gnu"],
             ),
             (
-                // On the other hand, 64 bit Windows
+                // On the other hand, Windows msvc
                 "x86_64-pc-windows-msvc",
-                // is compatible with 32 bit windows, and even gnu
-                &[
-                    "i686-pc-windows-msvc",
-                    "x86_64-pc-windows-gnu",
-                    "i686-pc-windows-gnu",
-                ],
+                // is compatible with Windows gnu
+                &["x86_64-pc-windows-gnu"],
                 // But is not compatible with Linux
-                &["x86_64-unknown-linux-gnu"],
-            ),
-            (
-                // Indeed, 64bit windows with the gnu toolchain
-                "x86_64-pc-windows-gnu",
-                // is compatible with the other windows platforms
                 &[
+                    "x86_64-unknown-linux-gnu",
+                    // or 32-bit Windows
                     "i686-pc-windows-msvc",
-                    "x86_64-pc-windows-gnu",
                     "i686-pc-windows-gnu",
                 ],
-                // But is not compatible with Linux despite also being gnu
-                &["x86_64-unknown-linux-gnu"],
             ),
             (
-                // However, 32bit Windows is not expected to be able to run
+                // And the Windows gnu toolchain
+                "x86_64-pc-windows-gnu",
+                // is compatible with Windows msvc
+                &["x86_64-pc-windows-msvc"],
+                // But is not compatible with Linux despite also being gnu
+                &[
+                    "x86_64-unknown-linux-gnu",
+                    // And is not compatible with 32-bit Windows
+                    "i686-pc-windows-msvc",
+                    "i686-pc-windows-gnu",
+                ],
+            ),
+            (
+                // 32bit Windows is not expected to be able to run
                 // 64bit windows
                 "i686-pc-windows-msvc",
                 &["i686-pc-windows-gnu"],
@@ -1494,11 +1500,11 @@ mod tests {
 
         for &(host, compatible, incompatible) in CASES {
             println!("host={host}");
-            let host = TargetTriple::new(host);
+            let host = TargetTuple::new(host);
             assert!(host.can_run(&host).unwrap(), "host wasn't self-compatible");
             for &other in compatible.iter() {
                 println!("compatible with {other}");
-                let other = TargetTriple::new(other);
+                let other = TargetTuple::new(other);
                 assert!(
                     host.can_run(&other).unwrap(),
                     "host and other were unexpectedly incompatible"
@@ -1506,7 +1512,7 @@ mod tests {
             }
             for &other in incompatible.iter() {
                 println!("incompatible with {other}");
-                let other = TargetTriple::new(other);
+                let other = TargetTuple::new(other);
                 assert!(
                     !host.can_run(&other).unwrap(),
                     "host and other were unexpectedly compatible"

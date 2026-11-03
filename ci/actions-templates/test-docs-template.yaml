@@ -8,18 +8,18 @@ jobs: # skip-all
   doc: # job-name
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install mdbook
         uses: taiki-e/install-action@v2
         env:
           # renovate: datasource=crate depName=mdbook
-          MDBOOK_VERSION: "0.4.43"
+          MDBOOK_VERSION: "0.5.2"
         with:
           tool: mdbook@${{ env.MDBOOK_VERSION }}
       - name: Build user-guide (stable)
-        if: ${{ !contains('["pull_request", "merge_group"]', github.event_name) }}
+        if: ${{ !contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) }}
         run: |
           git checkout stable
           # Support both old and new directory structure during the transition
@@ -41,7 +41,7 @@ jobs: # skip-all
           mkdir -p ${{ runner.temp }}/book
           mv book ${{ runner.temp }}/book/dev-guide
       - name: Deploy to GitHub
-        if: ${{ !contains('["pull_request", "merge_group"]', github.event_name) }}
+        if: ${{ !contains(fromJSON('["pull_request", "merge_group"]'), github.event_name) && !startsWith(github.ref_name, 'release/') }}
         run: |
           cd ${{ runner.temp }}/book
           git config --global init.defaultBranch main

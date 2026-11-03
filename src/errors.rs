@@ -1,7 +1,7 @@
 #![allow(clippy::large_enum_variant)]
 
 use std::ffi::OsString;
-use std::fmt::Debug;
+use std::fmt::{Debug, Write as FmtWrite};
 use std::io;
 use std::io::Write;
 use std::path::PathBuf;
@@ -12,16 +12,25 @@ use url::Url;
 
 use crate::{
     dist::{
-        Channel, TargetTriple, ToolchainDesc,
+        Channel, TargetTuple, ToolchainDesc,
         manifest::{Component, Manifest},
     },
     toolchain::{PathBasedToolchainName, ToolchainName},
 };
 
+pub(crate) const DEFAULT_STABLE_HINT: &str = "help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain.";
+
 /// A type erasing thunk for the retry crate to permit use with anyhow. See <https://github.com/dtolnay/anyhow/issues/149>
 #[derive(Debug, ThisError)]
 #[error(transparent)]
 pub struct OperationError(pub anyhow::Error);
+
+#[derive(Debug, Clone)]
+pub struct UnknownComponentInfo {
+    pub name: String,
+    pub description: String,
+    pub suggestion: Option<String>,
+}
 
 #[derive(ThisError, Debug)]
 pub enum RustupError {
@@ -64,7 +73,11 @@ pub enum RustupError {
     DownloadingFile { url: Url, path: PathBuf },
     #[error("could not download file from '{url}' to '{}'", .path.display())]
     DownloadNotExists { url: Url, path: PathBuf },
-    #[error("Missing manifest in toolchain '{}'", .0)]
+    #[error(
+        "missing manifest in toolchain '{0}'\n\
+     help: this may happen if the toolchain installation was interrupted\n\
+     help: try reinstalling or updating the toolchain"
+    )]
     MissingManifest(ToolchainDesc),
     #[error("server sent a broken manifest: missing package for component {0}")]
     MissingPackageForComponent(String),
@@ -88,19 +101,19 @@ pub enum RustupError {
     #[error("{}", component_unavailable_msg(.components, .manifest, .toolchain))]
     RequestedComponentsUnavailable {
         components: Vec<Component>,
-        manifest: Manifest,
+        manifest: Box<Manifest>,
         toolchain: String,
     },
     #[error("command failed: '{}'", PathBuf::from(.name).display())]
     RunningCommand { name: OsString },
     #[error(
         "toolchain '{toolchain}' may not be able to run on this system\n\
-        note: to build software for that platform, try `rustup target add {target_triple}` instead\n\
+        note: to build software for that platform, try `rustup target add {target_tuple}` instead\n\
         note: add the `--force-non-host` flag to install the toolchain anyway"
     )]
     ToolchainIncompatible {
         toolchain: String,
-        target_triple: TargetTriple,
+        target_tuple: TargetTuple,
     },
     #[error("toolchain '{0}' is not installable")]
     ToolchainNotInstallable(String),
@@ -120,19 +133,14 @@ pub enum RustupError {
     #[error("path '{0}' not found")]
     PathToolchainNotInstalled(PathBasedToolchainName),
     #[error(
-        "rustup could not choose a version of {0} to run, because one wasn't specified explicitly, and no default is configured.\n\
-        help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain."
+        "rustup could not choose a version of {0} to run, because one wasn't specified explicitly, and no default is configured.\n{hint}",
+        hint = DEFAULT_STABLE_HINT
     )]
     ToolchainNotSelected(String),
-    #[error("toolchain '{}' does not contain component {}{}{}", .desc, .component, suggest_message(.suggestion), if .component.contains("rust-std") {
-        format!("\nnote: not all platforms have the standard library pre-compiled: https://doc.rust-lang.org/nightly/rustc/platform-support.html{}",
-            if desc.channel == Channel::Nightly { "\nhelp: consider using `cargo build -Z build-std` instead" } else { "" }
-        )
-    } else { "".to_string() })]
-    UnknownComponent {
+    #[error("{}", unknown_components_msg(.desc, .components))]
+    UnknownComponents {
         desc: ToolchainDesc,
-        component: String,
-        suggestion: Option<String>,
+        components: Vec<UnknownComponentInfo>,
     },
     #[error(
         "toolchain '{desc}' has no prebuilt artifacts available for target '{platform}'\n\
@@ -148,15 +156,15 @@ pub enum RustupError {
     note: if you are adding support for a new target to rustc itself, see https://rustc-dev-guide.rust-lang.org/building/new-target.html", .desc, .target,
     suggest_message(.suggestion))]
     UnknownTarget {
-        desc: ToolchainDesc,
-        target: TargetTriple,
+        desc: Box<ToolchainDesc>,
+        target: TargetTuple,
         suggestion: Option<String>,
     },
     #[error("toolchain '{}' does not have target '{}' installed{}\n", .desc, .target,
     suggest_message(.suggestion))]
     TargetNotInstalled {
-        desc: ToolchainDesc,
-        target: TargetTriple,
+        desc: Box<ToolchainDesc>,
+        target: TargetTuple,
         suggestion: Option<String>,
     },
     #[error(
@@ -241,4 +249,50 @@ fn component_unavailable_msg(cs: &[Component], manifest: &Manifest, toolchain: &
     }
 
     String::from_utf8(buf).unwrap()
+}
+
+fn unknown_components_msg(desc: &ToolchainDesc, components: &[UnknownComponentInfo]) -> String {
+    let mut buf = String::new();
+
+    match components {
+        [] => panic!("`unknown_components_msg` should not be called with an empty collection"),
+        [component] => {
+            let _ = write!(
+                buf,
+                "toolchain '{desc}' does not contain component {}",
+                component.description,
+            );
+
+            if let Some(suggestion) = &component.suggestion {
+                let _ = write!(buf, "\nhelp: did you mean '{suggestion}'?");
+            }
+
+            if component.description.contains("rust-std") {
+                let _ = write!(
+                    buf,
+                    "\nnote: not all platforms have the standard library pre-compiled: https://doc.rust-lang.org/nightly/rustc/platform-support.html"
+                );
+
+                if desc.channel == Channel::Nightly {
+                    let _ = write!(
+                        buf,
+                        "\nhelp: consider using `cargo build -Z build-std` instead"
+                    );
+                }
+            }
+        }
+        components => {
+            let _ = writeln!(buf, "toolchain '{desc}' does not contain these components:");
+
+            for component in components {
+                let _ = writeln!(buf, "  - '{}'", component.name);
+
+                if let Some(suggestion) = &component.suggestion {
+                    let _ = writeln!(buf, "    help: did you mean '{suggestion}'?");
+                }
+            }
+        }
+    }
+
+    buf
 }

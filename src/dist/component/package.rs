@@ -3,7 +3,7 @@
 //! prefix, represented by a `Components` instance.
 
 use std::collections::{HashMap, HashSet};
-use std::io::{self, ErrorKind as IOErrorKind, Read};
+use std::io::{self, BufRead, ErrorKind as IOErrorKind, Read};
 use std::mem;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tar::EntryType;
 use tracing::warn;
 
-use crate::diskio::{CompletedIo, Executor, FileBuffer, IO_CHUNK_SIZE, Item, Kind};
+use crate::diskio::{ChunkWriter, CompletedIo, Executor, IO_CHUNK_SIZE, Item, Kind};
 use crate::dist::component::components::{ComponentPart, ComponentPartKind, Components};
 use crate::dist::component::transaction::Transaction;
 use crate::dist::manifest::CompressionKind;
@@ -32,23 +32,25 @@ pub struct DirectoryPackage<P> {
 }
 
 impl DirectoryPackage<temp::Dir> {
-    pub(crate) fn compressed<R: Read>(
+    pub(crate) fn compressed<R: BufRead>(
         stream: R,
         kind: CompressionKind,
         temp_dir: temp::Dir,
         io_executor: Box<dyn Executor>,
     ) -> Result<Self> {
         match kind {
-            CompressionKind::GZip => {
-                Self::from_tar(flate2::read::GzDecoder::new(stream), temp_dir, io_executor)
-            }
+            CompressionKind::GZip => Self::from_tar(
+                flate2::bufread::GzDecoder::new(stream),
+                temp_dir,
+                io_executor,
+            ),
             CompressionKind::ZStd => Self::from_tar(
-                zstd::stream::read::Decoder::new(stream)?,
+                zstd::stream::read::Decoder::with_buffer(stream)?,
                 temp_dir,
                 io_executor,
             ),
             CompressionKind::XZ => {
-                Self::from_tar(xz2::read::XzDecoder::new(stream), temp_dir, io_executor)
+                Self::from_tar(xz2::bufread::XzDecoder::new(stream), temp_dir, io_executor)
             }
         }
     }
@@ -265,9 +267,9 @@ fn unpack_without_first_dir<R: Read>(
             continue;
         }
 
-        struct SenderEntry<'a, 'b, R: Read> {
-            sender: Box<dyn FnMut(FileBuffer) -> bool + 'a>,
-            entry: tar::Entry<'b, R>,
+        struct SenderEntry<'a, R: Read> {
+            sender: Box<dyn ChunkWriter>,
+            entry: tar::Entry<'a, R>,
         }
 
         /// true if either no sender_entry was provided, or the incremental file
@@ -275,7 +277,7 @@ fn unpack_without_first_dir<R: Read>(
         fn flush_ios<R: Read, P: AsRef<Path>>(
             io_executor: &mut dyn Executor,
             directories: &mut HashMap<PathBuf, DirStatus>,
-            mut sender_entry: Option<&mut SenderEntry<'_, '_, R>>,
+            mut sender_entry: Option<&mut SenderEntry<'_, R>>,
             full_path: P,
         ) -> Result<bool> {
             let mut result = sender_entry.is_none();
@@ -298,7 +300,7 @@ fn unpack_without_first_dir<R: Read>(
                 if len == 0 {
                     result = true;
                 }
-                if !(sender.sender)(buffer) {
+                if !sender.sender.submit(buffer) {
                     bail!(format!(
                         "IO receiver for '{}' disconnected",
                         full_path.as_ref().display()
@@ -348,7 +350,7 @@ fn unpack_without_first_dir<R: Read>(
             )?;
         }
 
-        let mut incremental_file_sender: Option<Box<dyn FnMut(FileBuffer) -> bool + '_>> = None;
+        let mut incremental_file_sender = None;
         let mut item = match kind {
             EntryType::Directory => {
                 directories.insert(full_path.to_owned(), DirStatus::Pending(Vec::new()));
