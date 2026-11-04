@@ -583,7 +583,7 @@ impl fmt::Display for SelfUpdateMode {
     }
 }
 
-static DEFAULT_UPDATE_ROOT: &str = "https://dev.mcst.ru/rust/rustup";
+static DEFAULT_UPDATE_ROOT: &str = "https://rust.create2k.one/rustup";
 
 fn update_root(process: &Process) -> String {
     process

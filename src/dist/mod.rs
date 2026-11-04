@@ -47,7 +47,7 @@ pub mod temp;
 pub(crate) mod target_tuple;
 pub(crate) use target_tuple::*;
 
-pub static DEFAULT_DIST_SERVER: &str = "https://dev.mcst.ru/rust";
+pub static DEFAULT_DIST_SERVER: &str = "https://rust.create2k.one";
 
 /// Returns a error message indicating that certain [`Component`]s are missing in a toolchain distribution.
 ///
